@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 from abc import ABC, abstractmethod
-from datetime import datetime
 from typing import Any
 
+from monai.agents.memory import SharedMemory
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.llm import LLM
@@ -20,6 +22,7 @@ class BaseAgent(ABC):
     Every agent follows the same rules:
     - Plan before acting
     - Track everything (actions, spending, revenue)
+    - Collaborate: share knowledge, communicate, learn from mistakes
     - Verify results before marking done
     - Log all decisions for audit trail
     """
@@ -31,7 +34,11 @@ class BaseAgent(ABC):
         self.config = config
         self.db = db
         self.llm = llm
+        self.memory = SharedMemory(db)
         self.logger = logging.getLogger(f"monai.{self.name}")
+        self._cycle: int = 0
+
+    # ── Core Actions ────────────────────────────────────────────
 
     def log_action(self, action: str, details: str = "", result: str = ""):
         self.db.execute_insert(
@@ -56,29 +63,33 @@ class BaseAgent(ABC):
             (strategy_id, project_id, category, amount, description),
         )
 
+    # ── Thinking (LLM-powered reasoning) ───────────────────────
+
     def think(self, prompt: str, context: str = "") -> str:
-        """Use LLM to reason about a decision. Logs the thought for audit."""
-        system = (
-            f"You are {self.name}, an autonomous AI agent part of the monAI system. "
-            f"Your role: {self.description}. "
-            "Think step by step. Be practical and profit-focused. "
-            "Consider risks and expected returns before any action."
-        )
+        """Use LLM to reason about a decision. Enriched with lessons + knowledge."""
+        system = self._build_system_prompt()
         if context:
             prompt = f"Context:\n{context}\n\nQuestion:\n{prompt}"
+
+        # Inject relevant lessons and recent knowledge
+        enrichment = self._get_context_enrichment(prompt)
+        if enrichment:
+            prompt = f"{enrichment}\n\n{prompt}"
+
         response = self.llm.quick(prompt, system=system)
         self.log_action("think", prompt[:200], response[:500])
         return response
 
     def think_json(self, prompt: str, context: str = "") -> dict:
         """Use LLM to reason and return structured JSON."""
-        system = (
-            f"You are {self.name}, an autonomous AI agent part of the monAI system. "
-            f"Your role: {self.description}. "
-            "Think step by step. Respond with valid JSON only."
-        )
+        system = self._build_system_prompt() + "\nRespond with valid JSON only."
         if context:
             prompt = f"Context:\n{context}\n\nQuestion:\n{prompt}"
+
+        enrichment = self._get_context_enrichment(prompt)
+        if enrichment:
+            prompt = f"{enrichment}\n\n{prompt}"
+
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
@@ -86,6 +97,172 @@ class BaseAgent(ABC):
         response = self.llm.chat_json(messages)
         self.log_action("think_json", prompt[:200], str(response)[:500])
         return response
+
+    def _build_system_prompt(self) -> str:
+        """Build system prompt with identity, role, and active rules."""
+        rules = self.memory.get_rules_for_agent(self.name)
+        rules_text = ""
+        if rules:
+            rules_text = "\n\nRULES YOU MUST FOLLOW:\n" + "\n".join(f"- {r}" for r in rules)
+
+        return (
+            f"You are {self.name}, an autonomous AI agent part of the monAI system. "
+            f"Your role: {self.description}. "
+            "Think step by step. Be practical and profit-focused. "
+            "Consider risks and expected returns before any action. "
+            "You collaborate with other agents — share discoveries and ask for help when needed."
+            f"{rules_text}"
+        )
+
+    def _get_context_enrichment(self, prompt: str) -> str:
+        """Pull relevant knowledge and lessons to enrich LLM context."""
+        parts = []
+
+        # Get lessons for this agent
+        lessons = self.memory.get_lessons(self.name, include_shared=True)
+        if lessons:
+            lesson_text = "\n".join(
+                f"- [{l['category']}] {l['lesson']}" + (f" Rule: {l['rule']}" if l.get('rule') else "")
+                for l in lessons[:10]  # Cap at 10 most relevant
+            )
+            parts.append(f"LESSONS LEARNED:\n{lesson_text}")
+
+        # Get recent activity from other agents (situational awareness)
+        recent = self.memory.get_recent_activity(limit=5)
+        other_activity = [a for a in recent if a["agent_name"] != self.name]
+        if other_activity:
+            activity_text = "\n".join(
+                f"- [{a['agent_name']}] {a['summary']}"
+                for a in other_activity
+            )
+            parts.append(f"RECENT ACTIVITY FROM OTHER AGENTS:\n{activity_text}")
+
+        # Check for unread messages
+        messages = self.memory.get_messages(self.name, unread_only=True, limit=5)
+        if messages:
+            msg_text = "\n".join(
+                f"- From {m['from_agent']} ({m['msg_type']}): {m['subject']} — {m['body'][:100]}"
+                for m in messages
+            )
+            parts.append(f"UNREAD MESSAGES:\n{msg_text}")
+
+        return "\n\n".join(parts) if parts else ""
+
+    # ── Collaboration ───────────────────────────────────────────
+
+    def share_knowledge(self, category: str, topic: str, content: str,
+                        confidence: float = 1.0, tags: list[str] | None = None):
+        """Share a discovery or insight with all agents."""
+        self.memory.store_knowledge(
+            category=category,
+            topic=topic,
+            content=content,
+            source_agent=self.name,
+            confidence=confidence,
+            tags=tags,
+        )
+        self.logger.info(f"[{self.name}] Shared knowledge: {topic}")
+
+    def ask_knowledge(self, topic: str = "", category: str = "",
+                      tags: list[str] | None = None) -> list[dict[str, Any]]:
+        """Query the shared knowledge base."""
+        results = self.memory.query_knowledge(topic, category, tags)
+        # Mark as referenced
+        for r in results:
+            self.memory.mark_knowledge_used(r["id"])
+        return results
+
+    def send_to_agent(self, to_agent: str, msg_type: str, subject: str,
+                      body: str, priority: int = 5, metadata: dict | None = None) -> int:
+        """Send a message to another agent."""
+        msg_id = self.memory.send_message(
+            self.name, to_agent, msg_type, subject, body, priority, metadata=metadata,
+        )
+        self.logger.info(f"[{self.name}] → [{to_agent}] {msg_type}: {subject}")
+        return msg_id
+
+    def broadcast(self, msg_type: str, subject: str, body: str, priority: int = 5) -> int:
+        """Broadcast a message to all agents."""
+        return self.memory.broadcast(self.name, msg_type, subject, body, priority)
+
+    def check_messages(self) -> list[dict[str, Any]]:
+        """Check for new messages from other agents."""
+        messages = self.memory.get_messages(self.name, unread_only=True)
+        for msg in messages:
+            self.memory.mark_message_read(msg["id"])
+        return messages
+
+    def request_help(self, task: str, from_agent: str = "orchestrator") -> int:
+        """Request help from another agent (typically the orchestrator)."""
+        return self.send_to_agent(
+            from_agent, "request",
+            f"Help needed: {task[:50]}",
+            task,
+            priority=3,
+        )
+
+    def handoff(self, to_agent: str, task: str, context: dict | None = None) -> int:
+        """Hand off a task to another agent with full context."""
+        return self.send_to_agent(
+            to_agent, "handoff",
+            f"Handoff: {task[:50]}",
+            json.dumps({"task": task, "context": context or {}}, default=str),
+            priority=2,
+        )
+
+    # ── Learning ────────────────────────────────────────────────
+
+    def learn(self, category: str, situation: str, lesson: str,
+              rule: str = "", severity: str = "medium"):
+        """Record a lesson learned. Automatically shared with all agents."""
+        self.memory.record_lesson(
+            self.name, category, situation, lesson, rule, severity,
+        )
+
+    def learn_from_error(self, error: Exception, context: str = ""):
+        """Automatically extract a lesson from an error."""
+        lesson = self.llm.quick(
+            f"An error occurred:\nError: {error}\nContext: {context}\n\n"
+            "Extract a concise lesson and a concrete rule to prevent this. "
+            "Reply in format: LESSON: ...\nRULE: ...",
+            system="You analyze errors and extract actionable lessons.",
+        )
+        # Parse the response
+        lesson_text = lesson.split("RULE:")[0].replace("LESSON:", "").strip()
+        rule_text = lesson.split("RULE:")[-1].strip() if "RULE:" in lesson else ""
+
+        self.learn(
+            category="mistake",
+            situation=f"Error: {error}",
+            lesson=lesson_text,
+            rule=rule_text,
+            severity="high",
+        )
+
+    def get_my_lessons(self) -> list[dict[str, Any]]:
+        """Get all lessons relevant to this agent."""
+        return self.memory.get_lessons(self.name, include_shared=True)
+
+    # ── Journal ─────────────────────────────────────────────────
+
+    def journal(self, action_type: str, summary: str,
+                details: dict | None = None, outcome: str = ""):
+        """Write a journal entry — what I did and why."""
+        self.memory.journal_entry(
+            self.name, action_type, summary, details, outcome, self._cycle,
+        )
+
+    # ── Lifecycle ───────────────────────────────────────────────
+
+    def start_cycle(self, cycle: int):
+        """Called at the start of each orchestration cycle."""
+        self._cycle = cycle
+        # Process any pending messages
+        messages = self.check_messages()
+        if messages:
+            self.journal("collaborate",
+                         f"Received {len(messages)} messages",
+                         {"messages": [m["subject"] for m in messages]})
 
     @abstractmethod
     def run(self, **kwargs: Any) -> dict[str, Any]:

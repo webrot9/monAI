@@ -88,8 +88,18 @@ class Orchestrator(BaseAgent):
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         """Execute one full autonomous orchestration cycle."""
-        self.log_action("cycle_start", f"Cycle at {datetime.now()}")
+        self._cycle += 1
+        self.log_action("cycle_start", f"Cycle {self._cycle} at {datetime.now()}")
+        self.journal("plan", f"Starting cycle {self._cycle}")
         cycle_result = {}
+
+        # Phase 0: Start cycle for all registered agents (process messages, load lessons)
+        for agent in self._strategy_agents.values():
+            agent.start_cycle(self._cycle)
+        self.start_cycle(self._cycle)
+
+        # Phase 0.5: Process inter-agent requests (help requests, handoffs)
+        cycle_result["collaboration"] = self._process_agent_requests()
 
         # Phase 1: Self-check — do I have what I need?
         cycle_result["provisioning"] = self._ensure_infrastructure()
@@ -136,10 +146,25 @@ class Orchestrator(BaseAgent):
         # Phase 6: Run registered strategy agents
         cycle_result["strategy_results"] = self._run_strategies()
 
-        # Phase 7: Summary
+        # Phase 7: Reflect and learn
         cycle_result["timestamp"] = datetime.now().isoformat()
         cycle_result["net_profit"] = self.finance.get_net_profit()
+        self._reflect_on_cycle(cycle_result)
 
+        # Phase 8: Share cycle summary with all agents
+        self.broadcast(
+            "info",
+            f"Cycle {self._cycle} complete",
+            json.dumps({
+                "net_profit": cycle_result["net_profit"],
+                "active_strategies": cycle_result.get("health", {}).get("active_strategies", 0),
+                "actions_taken": len(action_results),
+            }, default=str),
+        )
+
+        self.journal("execute", f"Cycle {self._cycle} complete",
+                     {"net_profit": cycle_result["net_profit"]},
+                     outcome="success")
         self.log_action("cycle_complete", json.dumps(cycle_result, default=str)[:1000])
         return cycle_result
 
@@ -267,6 +292,81 @@ class Orchestrator(BaseAgent):
         self.log_action("marketing", action)
         return f"Marketing action queued: {action}"
 
+    def _process_agent_requests(self) -> dict[str, Any]:
+        """Process help requests, handoffs, and alerts from other agents."""
+        messages = self.check_messages()
+        processed = []
+
+        for msg in messages:
+            if msg["msg_type"] == "request":
+                # Another agent needs help — delegate to a sub-agent or handle directly
+                self.journal("collaborate", f"Processing request from {msg['from_agent']}: {msg['subject']}")
+                processed.append({
+                    "from": msg["from_agent"],
+                    "type": msg["msg_type"],
+                    "subject": msg["subject"],
+                    "action": "acknowledged",
+                })
+                self.memory.mark_message_acted_on(msg["id"])
+
+            elif msg["msg_type"] == "handoff":
+                # Task being handed off — route to appropriate agent
+                self.journal("collaborate", f"Received handoff from {msg['from_agent']}")
+                processed.append({
+                    "from": msg["from_agent"],
+                    "type": "handoff",
+                    "subject": msg["subject"],
+                    "action": "routed",
+                })
+                self.memory.mark_message_acted_on(msg["id"])
+
+            elif msg["msg_type"] == "alert":
+                # Urgent — log and potentially pause affected strategy
+                self.journal("collaborate", f"ALERT from {msg['from_agent']}: {msg['subject']}")
+                self.learn(
+                    "alert", msg["subject"], msg["body"][:200],
+                    severity="high",
+                )
+                processed.append({
+                    "from": msg["from_agent"],
+                    "type": "alert",
+                    "subject": msg["subject"],
+                    "action": "escalated",
+                })
+                self.memory.mark_message_acted_on(msg["id"])
+
+        return {"processed": len(processed), "details": processed}
+
+    def _reflect_on_cycle(self, cycle_result: dict):
+        """Reflect on the cycle and extract lessons."""
+        # Check for errors in strategy results
+        strategy_results = cycle_result.get("strategy_results", {})
+        for name, result in strategy_results.items():
+            if result.get("status") == "error":
+                self.learn(
+                    category="mistake",
+                    situation=f"Strategy {name} failed: {result.get('error', 'unknown')}",
+                    lesson=f"Strategy {name} encountered an error during execution",
+                    rule=f"Monitor {name} closely and check prerequisites before running",
+                    severity="high",
+                )
+
+        # Share performance insights
+        health = cycle_result.get("health", {})
+        if health.get("losing_strategies", 0) > health.get("profitable_strategies", 0):
+            self.share_knowledge(
+                category="warning",
+                topic="portfolio_imbalance",
+                content=f"More losing ({health.get('losing_strategies')}) than profitable "
+                        f"({health.get('profitable_strategies')}) strategies. Need rebalancing.",
+                tags=["performance", "risk"],
+            )
+
+        # Log knowledge base stats
+        kb_stats = self.memory.get_knowledge_summary()
+        if kb_stats:
+            self.journal("learn", f"Knowledge base: {json.dumps(kb_stats)}")
+
     def _run_strategies(self) -> dict[str, Any]:
         results = {}
         active = self.db.execute("SELECT name FROM strategies WHERE status = 'active'")
@@ -277,7 +377,16 @@ class Orchestrator(BaseAgent):
                 try:
                     result = agent.run()
                     results[name] = {"status": "ok", "result": result}
+                    # Share success insights
+                    agent.share_knowledge(
+                        category="insight",
+                        topic=f"{name}_cycle_result",
+                        content=json.dumps(result, default=str)[:500],
+                        tags=[name, "strategy_result"],
+                    )
                 except Exception as e:
                     logger.error(f"Strategy {name} failed: {e}")
                     results[name] = {"status": "error", "error": str(e)}
+                    # Auto-learn from failure
+                    agent.learn_from_error(e, context=f"Running strategy {name}")
         return results
