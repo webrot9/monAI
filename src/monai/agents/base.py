@@ -8,6 +8,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any
 
+from monai.agents.ethics import CORE_DIRECTIVES, get_directives_for_context, is_action_blocked
 from monai.agents.memory import SharedMemory
 from monai.config import Config
 from monai.db.database import Database
@@ -37,6 +38,20 @@ class BaseAgent(ABC):
         self.memory = SharedMemory(db)
         self.logger = logging.getLogger(f"monai.{self.name}")
         self._cycle: int = 0
+        self._coder = None  # Lazy-loaded
+
+    @property
+    def coder(self):
+        """Lazy-load coder — any agent can write code when needed."""
+        if self._coder is None:
+            from monai.agents.coder import Coder
+            self._coder = Coder(self.config, self.db, self.llm)
+        return self._coder
+
+    def write_code(self, spec: str, project_dir: str | None = None,
+                   language: str = "python") -> dict:
+        """Write tested code. Returns only if tests pass."""
+        return self.coder.generate_module(spec, project_dir, language)
 
     # ── Core Actions ────────────────────────────────────────────
 
@@ -99,19 +114,22 @@ class BaseAgent(ABC):
         return response
 
     def _build_system_prompt(self) -> str:
-        """Build system prompt with identity, role, and active rules."""
-        rules = self.memory.get_rules_for_agent(self.name)
-        rules_text = ""
-        if rules:
-            rules_text = "\n\nRULES YOU MUST FOLLOW:\n" + "\n".join(f"- {r}" for r in rules)
+        """Build system prompt with ethics, identity, role, and learned rules."""
+        # Ethics are ALWAYS first — non-negotiable
+        learned_rules = self.memory.get_rules_for_agent(self.name)
+        learned_text = ""
+        if learned_rules:
+            learned_text = "\n\nLEARNED RULES:\n" + "\n".join(f"- {r}" for r in learned_rules)
 
         return (
+            f"{CORE_DIRECTIVES}\n\n"
             f"You are {self.name}, an autonomous AI agent part of the monAI system. "
             f"Your role: {self.description}. "
             "Think step by step. Be practical and profit-focused. "
             "Consider risks and expected returns before any action. "
-            "You collaborate with other agents — share discoveries and ask for help when needed."
-            f"{rules_text}"
+            "You collaborate with other agents — share discoveries and ask for help when needed. "
+            "Everything you produce must be HIGH QUALITY — no AI slop, no shortcuts, no filler."
+            f"{learned_text}"
         )
 
     def _get_context_enrichment(self, prompt: str) -> str:

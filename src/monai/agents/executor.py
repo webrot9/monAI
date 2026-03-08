@@ -21,6 +21,7 @@ from typing import Any
 
 import httpx
 
+from monai.agents.ethics import CORE_DIRECTIVES, is_action_blocked, requires_risk_check
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.browser import Browser
@@ -43,9 +44,11 @@ Available tools:
 10. shell(command) — Run a shell command and return output
 11. write_file(path, content) — Write content to a file
 12. read_file(path) — Read a file's content
-13. wait(seconds) — Wait for a specified time
-14. done(result) — Signal task completion with a result
-15. fail(reason) — Signal task failure with a reason
+13. write_code(spec, filename) — Generate a tested code module from a specification
+14. run_tests(path) — Run tests for a code file
+15. wait(seconds) — Wait for a specified time
+16. done(result) — Signal task completion with a result
+17. fail(reason) — Signal task failure with a reason
 """
 
 
@@ -140,10 +143,13 @@ class AutonomousExecutor:
         response = self.llm.chat_json(
             [
                 {"role": "system", "content": (
+                    f"{CORE_DIRECTIVES}\n\n"
                     "You are an autonomous AI executor. You complete tasks by using tools. "
                     "Think step by step. Be resourceful and creative. "
                     "When registering on platforms, use the provided identity info. "
-                    "Always check results before proceeding. Take screenshots when unsure."
+                    "Always check results before proceeding. Take screenshots when unsure. "
+                    "When writing code, use write_code tool — it generates AND tests code. "
+                    "NEVER produce sloppy work. Everything must be production quality."
                 )},
                 {"role": "user", "content": prompt},
             ],
@@ -152,7 +158,16 @@ class AutonomousExecutor:
         return response
 
     async def _act(self, tool: str, args: dict) -> Any:
-        """Execute a tool action."""
+        """Execute a tool action with ethics guardrails."""
+        # Guardrail: block dangerous actions
+        action_str = f"{tool} {json.dumps(args)}"
+        if is_action_blocked(action_str):
+            return "BLOCKED by ethics guardrails: dangerous action"
+
+        # Guardrail: flag risky actions
+        if requires_risk_check(action_str):
+            self._log_task(f"RISK FLAG: {tool}", "risk_check", action_str)
+
         try:
             if tool == "browse":
                 await self.browser.navigate(args.get("url", ""))
@@ -222,6 +237,27 @@ class AutonomousExecutor:
                 if path.exists():
                     return path.read_text()[:5000]
                 return "File not found"
+
+            elif tool == "write_code":
+                from monai.agents.coder import Coder
+                coder = Coder(self.config, self.db, self.llm)
+                result = coder.generate_module(
+                    spec=args.get("spec", ""),
+                    project_dir=args.get("project_dir"),
+                    language=args.get("language", "python"),
+                )
+                return result
+
+            elif tool == "run_tests":
+                test_path = args.get("path", "")
+                result = subprocess.run(
+                    ["python", "-m", "pytest", test_path, "-v", "--tb=short"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                return {
+                    "passed": result.returncode == 0,
+                    "output": result.stdout + result.stderr,
+                }
 
             elif tool == "wait":
                 seconds = min(args.get("seconds", 1), 30)  # Cap at 30s
