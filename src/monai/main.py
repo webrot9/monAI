@@ -17,6 +17,7 @@ from datetime import datetime
 
 from monai.agents.identity import IdentityManager
 from monai.agents.orchestrator import Orchestrator
+from monai.business.commercialista import Commercialista
 from monai.business.finance import Finance
 from monai.business.risk import RiskManager
 from monai.config import Config
@@ -69,7 +70,8 @@ def init_strategies(db: Database):
 def create_orchestrator(config: Config) -> tuple[Orchestrator, Database]:
     """Create and wire up the full autonomous system."""
     db = Database()
-    llm = LLM(config)
+    llm = LLM(config, caller="orchestrator")
+    llm.set_db(db)  # Enable persistent cost logging
 
     init_strategies(db)
 
@@ -80,9 +82,14 @@ def create_orchestrator(config: Config) -> tuple[Orchestrator, Database]:
 
     orchestrator = Orchestrator(config, db, llm)
 
-    # Register built-in strategy agents
-    orchestrator.register_strategy(FreelanceWritingAgent(config, db, llm))
-    orchestrator.register_strategy(DigitalProductsAgent(config, db, llm))
+    # Register built-in strategy agents — each with its own caller tag for cost tracking
+    fw_llm = LLM(config, caller="freelance_writing")
+    fw_llm.set_db(db)
+    orchestrator.register_strategy(FreelanceWritingAgent(config, db, fw_llm))
+
+    dp_llm = LLM(config, caller="digital_products")
+    dp_llm.set_db(db)
+    orchestrator.register_strategy(DigitalProductsAgent(config, db, dp_llm))
 
     return orchestrator, db
 
@@ -136,14 +143,18 @@ def run_once(config: Config):
 
 
 def show_status(config: Config):
-    """Show current system status."""
+    """Show current system status with full financial report."""
     db = Database()
     finance = Finance(db)
     risk = RiskManager(config, db)
-    identity = IdentityManager(config, db, LLM(config))
+    llm = LLM(config, caller="status")
+    identity = IdentityManager(config, db, llm)
+    commercialista = Commercialista(config, db)
+
     health = risk.get_portfolio_health()
     agent_identity = identity.get_identity()
     accounts = identity.get_all_accounts()
+    budget = commercialista.get_budget()
 
     print(f"\n{'='*60}")
     print(f"  {agent_identity.get('name', 'monAI')} — Status")
@@ -152,14 +163,40 @@ def show_status(config: Config):
     print(f"  Accounts:            {len(accounts)}")
     print(f"  Active strategies:   {health['active_strategies']}")
     print(f"  Diversification OK:  {health['diversification_ok']}")
-    print(f"  Total net profit:    ${health['total_net_profit']:.2f}")
-    print(f"  Monthly costs:       ${identity.get_monthly_resource_costs():.2f}")
+
+    # Commercialista report
+    print(f"\n  {'─'*50}")
+    print(f"  COMMERCIALISTA REPORT")
+    print(f"  {'─'*50}")
+    print(f"  Initial budget:      €{budget['initial']:.2f}")
+    print(f"  Current balance:     €{budget['balance']:.2f}")
+    print(f"  Total revenue:       €{budget['revenue']:.2f}")
+    print(f"  Total expenses:      €{budget['expenses']:.2f}")
+    print(f"  Net profit:          €{budget['net_profit']:.2f}")
+    print(f"  Self-sustaining:     {budget['self_sustaining']}")
+    print(f"  Burn rate:           €{budget['burn_rate_daily']:.4f}/day")
+    if budget['days_until_broke'] is not None:
+        print(f"  Days until broke:    {budget['days_until_broke']}")
+
+    # Costs by agent
+    costs_by_agent = commercialista.get_cost_by_agent()
+    if costs_by_agent:
+        print(f"\n  API Costs by Agent:")
+        for c in costs_by_agent:
+            print(f"    {c['agent_name']:25s}  Calls: {c['calls']:5d}  Cost: €{c['total_cost']:.4f}")
+
+    # Costs by model
+    costs_by_model = commercialista.get_cost_by_model()
+    if costs_by_model:
+        print(f"\n  API Costs by Model:")
+        for c in costs_by_model:
+            print(f"    {c['model']:25s}  Calls: {c['calls']:5d}  Cost: €{c['total_cost']:.4f}")
 
     if health["strategy_details"]:
         print(f"\n  Strategy P&L:")
         for s in health["strategy_details"]:
-            print(f"    {s['name']:25s}  Rev: ${s['revenue']:8.2f}  "
-                  f"Exp: ${s['expenses']:8.2f}  Net: ${s['net']:8.2f}")
+            print(f"    {s['name']:25s}  Rev: €{s['revenue']:8.2f}  "
+                  f"Exp: €{s['expenses']:8.2f}  Net: €{s['net']:8.2f}")
 
     if accounts:
         print(f"\n  Accounts:")
@@ -167,8 +204,8 @@ def show_status(config: Config):
             print(f"    {a['platform']:20s} {a['type']:20s} {a['identifier']}")
 
     daily = finance.get_daily_summary()
-    print(f"\n  Today: Rev ${daily['revenue']:.2f} | "
-          f"Exp ${daily['expenses']:.2f} | Net ${daily['net']:.2f}")
+    print(f"\n  Today: Rev €{daily['revenue']:.2f} | "
+          f"Exp €{daily['expenses']:.2f} | Net €{daily['net']:.2f}")
     print(f"{'='*60}\n")
 
 
@@ -181,8 +218,8 @@ def discover(config: Config):
     for i, opp in enumerate(opportunities, 1):
         print(f"\n  {i}. {opp.get('name', 'Unknown')}")
         print(f"     Category:       {opp.get('category', '?')}")
-        print(f"     Est. monthly:   ${opp.get('estimated_monthly_revenue', 0):.0f}")
-        print(f"     Startup cost:   ${opp.get('startup_cost', 0):.0f}")
+        print(f"     Est. monthly:   €{opp.get('estimated_monthly_revenue', 0):.0f}")
+        print(f"     Startup cost:   €{opp.get('startup_cost', 0):.0f}")
         print(f"     Risk:           {opp.get('risk_level', '?')}")
         print(f"     Automatable:    {opp.get('can_automate', '?')}")
         print(f"     How to start:   {opp.get('how_to_start', '?')}")
@@ -190,15 +227,23 @@ def discover(config: Config):
 
 def _print_cycle_summary(result: dict, db: Database):
     finance = Finance(db)
+    budget = result.get("budget_after", result.get("budget", {}))
+    api = result.get("api_costs_session", {})
+
     print(f"\n{'='*60}")
     print(f"  Cycle Complete — {result.get('timestamp', '')}")
     print(f"{'='*60}")
-    print(f"  Net profit:     ${result.get('net_profit', 0):.2f}")
-    print(f"  Health:         {result.get('health', {}).get('active_strategies', 0)} active strategies")
+    print(f"  Net profit:     €{result.get('net_profit', 0):.2f}")
+    print(f"  Budget left:    €{budget.get('balance', 0):.2f}")
+    print(f"  API calls:      {api.get('total_calls', 0)} (€{api.get('total_cost_eur', 0):.4f})")
+    print(f"  Strategies:     {result.get('health', {}).get('active_strategies', 0)} active")
     if result.get("provisioning", {}).get("provisioned"):
         print(f"  Provisioned:    {result['provisioning']['provisioned']}")
     if result.get("subagent_results"):
         print(f"  Sub-agents:     {len(result['subagent_results'])} tasks delegated")
+    res = result.get("resources", {})
+    if res:
+        print(f"  Memory:         {res.get('memory_mb', 0)}MB / {res.get('memory_limit_mb', 0)}MB")
     print(f"{'='*60}\n")
 
 

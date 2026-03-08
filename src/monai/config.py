@@ -54,8 +54,8 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     comms: CommsConfig = field(default_factory=CommsConfig)
-    initial_capital: float = 0.0
-    currency: str = "USD"
+    initial_capital: float = 500.0  # €500 initial budget
+    currency: str = "EUR"
     data_dir: Path = field(default_factory=lambda: CONFIG_DIR)
 
     @classmethod

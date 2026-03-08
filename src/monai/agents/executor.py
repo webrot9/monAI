@@ -26,6 +26,7 @@ from monai.config import Config
 from monai.db.database import Database
 from monai.utils.browser import Browser
 from monai.utils.llm import LLM
+from monai.utils.sandbox import is_path_allowed, safe_read, safe_write
 
 logger = logging.getLogger(__name__)
 
@@ -216,27 +217,32 @@ class AutonomousExecutor:
 
             elif tool == "shell":
                 cmd = args.get("command", "")
-                # Safety: block dangerous commands
-                blocked = ["rm -rf /", "mkfs", "dd if=", ":(){", "fork bomb"]
-                if any(b in cmd.lower() for b in blocked):
+                if is_action_blocked(cmd):
                     return "BLOCKED: dangerous command"
+                # Sandbox: run shell commands from project workspace only
+                from monai.utils.sandbox import PROJECT_ROOT
                 result = subprocess.run(
                     cmd, shell=True, capture_output=True, text=True, timeout=60,
+                    cwd=str(PROJECT_ROOT / "workspace"),
                 )
                 return {"stdout": result.stdout[:2000], "stderr": result.stderr[:500],
                         "returncode": result.returncode}
 
             elif tool == "write_file":
-                path = Path(args.get("path", ""))
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(args.get("content", ""))
+                path = args.get("path", "")
+                if not is_path_allowed(path):
+                    return f"SANDBOX VIOLATION: Cannot write outside allowed directories"
+                safe_write(path, args.get("content", ""))
                 return f"Written: {path}"
 
             elif tool == "read_file":
-                path = Path(args.get("path", ""))
-                if path.exists():
-                    return path.read_text()[:5000]
-                return "File not found"
+                path = args.get("path", "")
+                if not is_path_allowed(path):
+                    return f"SANDBOX VIOLATION: Cannot read outside allowed directories"
+                try:
+                    return safe_read(path)[:5000]
+                except FileNotFoundError:
+                    return "File not found"
 
             elif tool == "write_code":
                 from monai.agents.coder import Coder

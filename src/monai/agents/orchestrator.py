@@ -17,12 +17,15 @@ from monai.agents.base import BaseAgent
 from monai.agents.identity import IdentityManager
 from monai.agents.provisioner import Provisioner
 from monai.agents.spawner import AgentSpawner
+from monai.business.commercialista import Commercialista
 from monai.business.crm import CRM
 from monai.business.finance import Finance
 from monai.business.risk import RiskManager
 from monai.config import Config
 from monai.db.database import Database
-from monai.utils.llm import LLM
+from monai.utils.llm import LLM, get_cost_tracker
+from monai.utils.resources import check_resources
+from monai.utils.sandbox import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,7 @@ class Orchestrator(BaseAgent):
         self.identity = IdentityManager(config, db, llm)
         self.provisioner = Provisioner(config, db, llm)
         self.spawner = AgentSpawner(config, db, llm)
+        self.commercialista = Commercialista(config, db)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
     def register_strategy(self, agent: BaseAgent):
@@ -92,6 +96,28 @@ class Orchestrator(BaseAgent):
         self.log_action("cycle_start", f"Cycle {self._cycle} at {datetime.now()}")
         self.journal("plan", f"Starting cycle {self._cycle}")
         cycle_result = {}
+
+        # Phase -1: Resource check — don't damage the creator's computer
+        resources = check_resources(PROJECT_ROOT, self.config.data_dir)
+        cycle_result["resources"] = resources
+        if not resources["all_ok"]:
+            self.log_action("RESOURCE_LIMIT", json.dumps(resources))
+            self.learn("alert", "Resource limit exceeded", json.dumps(resources),
+                       rule="Reduce resource usage before next cycle", severity="critical")
+            return {"status": "aborted", "reason": "resource_limits_exceeded", **cycle_result}
+
+        # Phase -0.5: Budget check — can we afford to operate?
+        budget = self.commercialista.get_budget()
+        cycle_result["budget"] = budget
+        if budget["balance"] <= 0:
+            self.log_action("BUDGET_EXHAUSTED", json.dumps(budget))
+            self.learn("alert", "Budget exhausted",
+                       f"Balance: €{budget['balance']:.2f}. Cannot spend more.",
+                       rule="Focus only on zero-cost revenue activities", severity="critical")
+            # Don't abort entirely — still allow zero-cost operations
+        self.log_action("budget_check",
+                        f"€{budget['balance']:.2f} remaining, "
+                        f"burn: €{budget['burn_rate_daily']:.4f}/day")
 
         # Phase 0: Start cycle for all registered agents (process messages, load lessons)
         for agent in self._strategy_agents.values():
@@ -146,12 +172,22 @@ class Orchestrator(BaseAgent):
         # Phase 6: Run registered strategy agents
         cycle_result["strategy_results"] = self._run_strategies()
 
-        # Phase 7: Reflect and learn
+        # Phase 7: Commercialista report
         cycle_result["timestamp"] = datetime.now().isoformat()
         cycle_result["net_profit"] = self.finance.get_net_profit()
+        api_costs = get_cost_tracker().get_summary()
+        cycle_result["api_costs_session"] = api_costs
+        updated_budget = self.commercialista.get_budget()
+        cycle_result["budget_after"] = updated_budget
+        self.log_action("commercialista",
+                        f"API calls: {api_costs['total_calls']}, "
+                        f"cost: €{api_costs['total_cost_eur']:.4f}, "
+                        f"budget: €{updated_budget['balance']:.2f}")
+
+        # Phase 8: Reflect and learn
         self._reflect_on_cycle(cycle_result)
 
-        # Phase 8: Share cycle summary with all agents
+        # Phase 9: Share cycle summary with all agents
         self.broadcast(
             "info",
             f"Cycle {self._cycle} complete",

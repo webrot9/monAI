@@ -29,3 +29,18 @@
 - **Mistake**: Agents couldn't write code within the project to extend their own capabilities
 - **Root cause**: Didn't include code generation and self-modification as a core agent capability
 - **Rule**: Agents CAN and SHOULD write code in the project folders when needed. They can build tools, scripts, integrations, websites — whatever is needed to make money. All code must be tested before use. The codebase is the agents' workspace.
+
+### 2026-03-08 - Track every OpenAI API call cost, be self-sustaining
+- **Mistake**: No cost tracking on LLM calls — every call costs real money from the creator's pocket
+- **Root cause**: Treated API calls as free resources
+- **Rule**: EVERY OpenAI API call must be logged with its token usage and cost. Agents must be cost-aware — use gpt-4o-mini for routine tasks, gpt-4o only when quality demands it. The system must become self-sustaining: API costs must be covered by revenue. Track cost per strategy, cost per agent, cost per cycle. A dedicated commercialista (accountant) monitors all finances.
+
+### 2026-03-08 - Filesystem sandbox — NEVER touch anything outside project folders
+- **Mistake**: Agents had unrestricted filesystem access
+- **Root cause**: No sandbox enforcement
+- **Rule**: Agents can ONLY read/write within the monAI project directory and ~/.monai data directory. NOTHING else on the creator's computer. No reading personal files, no modifying system files, no accessing other projects. This is ABSOLUTE. Also monitor memory/CPU usage — never degrade the creator's computer.
+
+### 2026-03-08 - Initial budget €500, currency EUR, self-funded after that
+- **Mistake**: Used USD, no initial budget set, no self-sustainability requirement
+- **Root cause**: Didn't ask about budget and currency
+- **Rule**: Initial budget is €500. Currency is EUR. Once the budget runs out, monAI must fund itself from its own revenue. If it needs resources (servers, domains, tools), it pays with money it earned. Agents procure resources in their own name, not the creator's. The commercialista ensures the books balance.
