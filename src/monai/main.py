@@ -1,6 +1,8 @@
-"""monAI — main entry point.
+"""monAI — Fully autonomous money-making AI agent.
 
-Initializes the system, registers strategies, and runs the orchestrator.
+Runs as a daemon. Discovers opportunities, provisions its own infrastructure,
+spawns sub-agents, manages clients, delivers work, invoices, and scales.
+Zero human intervention.
 """
 
 from __future__ import annotations
@@ -8,9 +10,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
+import time
 from datetime import datetime
 
+from monai.agents.identity import IdentityManager
 from monai.agents.orchestrator import Orchestrator
 from monai.business.finance import Finance
 from monai.business.risk import RiskManager
@@ -23,67 +28,110 @@ from monai.utils.llm import LLM
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(Config.load().data_dir / "monai.log", mode="a"),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("monai")
 
+# Graceful shutdown
+_shutdown = False
 
-def init_default_strategies(db: Database):
-    """Seed default strategies if none exist."""
+
+def _handle_signal(signum, frame):
+    global _shutdown
+    logger.info("Shutdown signal received. Finishing current cycle...")
+    _shutdown = True
+
+
+signal.signal(signal.SIGINT, _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
+
+
+def init_strategies(db: Database):
+    """Seed initial strategies if none exist."""
     existing = db.execute("SELECT COUNT(*) as count FROM strategies")
     if existing[0]["count"] > 0:
         return
 
     strategies = [
-        ("freelance_writing", "services", "Freelance writing, blogging, copywriting"),
-        ("digital_products", "products", "Ebooks, templates, prompt packs, guides"),
-        ("cold_outreach", "services", "Cold email outreach for B2B services"),
+        ("freelance_writing", "services", "Freelance writing, blogging, copywriting", 10.0),
+        ("digital_products", "products", "Ebooks, templates, prompt packs, guides", 10.0),
+        ("cold_outreach", "services", "Cold email/LinkedIn outreach for B2B services", 10.0),
     ]
-    for name, category, description in strategies:
+    for name, category, description, budget in strategies:
         db.execute_insert(
             "INSERT INTO strategies (name, category, description, allocated_budget) "
             "VALUES (?, ?, ?, ?)",
-            (name, category, description, 10.0),
+            (name, category, description, budget),
         )
     logger.info(f"Initialized {len(strategies)} default strategies")
 
 
-def run_cycle(config: Config):
-    """Run one full orchestration cycle."""
+def create_orchestrator(config: Config) -> tuple[Orchestrator, Database]:
+    """Create and wire up the full autonomous system."""
     db = Database()
     llm = LLM(config)
 
-    init_default_strategies(db)
+    init_strategies(db)
 
-    # Create orchestrator
+    # Add file logging now that config dir is guaranteed
+    file_handler = logging.FileHandler(config.data_dir / "monai.log", mode="a")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
+    logging.getLogger().addHandler(file_handler)
+
     orchestrator = Orchestrator(config, db, llm)
 
-    # Register strategy agents
+    # Register built-in strategy agents
     orchestrator.register_strategy(FreelanceWritingAgent(config, db, llm))
     orchestrator.register_strategy(DigitalProductsAgent(config, db, llm))
 
-    # Run one cycle
+    return orchestrator, db
+
+
+def run_daemon(config: Config, cycle_interval: int = 300):
+    """Run monAI as a continuous daemon.
+
+    Args:
+        cycle_interval: Seconds between cycles (default 5 min)
+    """
+    orchestrator, db = create_orchestrator(config)
+    identity = IdentityManager(config, db, LLM(config))
+
+    agent_name = identity.get_identity().get("name", "monAI")
+    logger.info(f"{'='*60}")
+    logger.info(f"  {agent_name} starting in autonomous daemon mode")
+    logger.info(f"  Cycle interval: {cycle_interval}s")
+    logger.info(f"{'='*60}")
+
+    cycle = 0
+    while not _shutdown:
+        cycle += 1
+        logger.info(f"\n{'='*60}")
+        logger.info(f"  CYCLE {cycle} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"{'='*60}")
+
+        try:
+            result = orchestrator.run()
+            _print_cycle_summary(result, db)
+        except Exception as e:
+            logger.error(f"Cycle {cycle} failed: {e}", exc_info=True)
+
+        if _shutdown:
+            break
+
+        logger.info(f"Next cycle in {cycle_interval}s...")
+        for _ in range(cycle_interval):
+            if _shutdown:
+                break
+            time.sleep(1)
+
+    logger.info("monAI shut down gracefully.")
+
+
+def run_once(config: Config):
+    """Run a single orchestration cycle."""
+    orchestrator, db = create_orchestrator(config)
     result = orchestrator.run()
-
-    # Print summary
-    finance = Finance(db)
-    risk = RiskManager(config, db)
-    health = risk.get_portfolio_health()
-
-    print("\n" + "=" * 60)
-    print(f"  monAI Cycle Complete — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print("=" * 60)
-    print(f"  Active strategies: {health['active_strategies']}")
-    print(f"  Total revenue:     ${finance.get_total_revenue():.2f}")
-    print(f"  Total expenses:    ${finance.get_total_expenses():.2f}")
-    print(f"  Net profit:        ${finance.get_net_profit():.2f}")
-    print(f"  Profitable:        {health['profitable_strategies']}")
-    print(f"  Losing:            {health['losing_strategies']}")
-    print("=" * 60 + "\n")
-
+    _print_cycle_summary(result, db)
     return result
 
 
@@ -92,64 +140,102 @@ def show_status(config: Config):
     db = Database()
     finance = Finance(db)
     risk = RiskManager(config, db)
+    identity = IdentityManager(config, db, LLM(config))
     health = risk.get_portfolio_health()
+    agent_identity = identity.get_identity()
+    accounts = identity.get_all_accounts()
 
-    print("\n" + "=" * 60)
-    print("  monAI Status")
-    print("=" * 60)
+    print(f"\n{'='*60}")
+    print(f"  {agent_identity.get('name', 'monAI')} — Status")
+    print(f"{'='*60}")
+    print(f"  Identity:            {agent_identity.get('name', 'Not set')}")
+    print(f"  Accounts:            {len(accounts)}")
     print(f"  Active strategies:   {health['active_strategies']}")
     print(f"  Diversification OK:  {health['diversification_ok']}")
     print(f"  Total net profit:    ${health['total_net_profit']:.2f}")
-    print(f"  Profitable:          {health['profitable_strategies']}")
-    print(f"  Losing:              {health['losing_strategies']}")
+    print(f"  Monthly costs:       ${identity.get_monthly_resource_costs():.2f}")
 
     if health["strategy_details"]:
-        print("\n  Strategy P&L:")
+        print(f"\n  Strategy P&L:")
         for s in health["strategy_details"]:
             print(f"    {s['name']:25s}  Rev: ${s['revenue']:8.2f}  "
                   f"Exp: ${s['expenses']:8.2f}  Net: ${s['net']:8.2f}")
 
+    if accounts:
+        print(f"\n  Accounts:")
+        for a in accounts:
+            print(f"    {a['platform']:20s} {a['type']:20s} {a['identifier']}")
+
     daily = finance.get_daily_summary()
     print(f"\n  Today: Rev ${daily['revenue']:.2f} | "
           f"Exp ${daily['expenses']:.2f} | Net ${daily['net']:.2f}")
-    print("=" * 60 + "\n")
+    print(f"{'='*60}\n")
+
+
+def discover(config: Config):
+    """Discover new opportunities."""
+    orchestrator, _ = create_orchestrator(config)
+    opportunities = orchestrator.discover_opportunities()
+
+    print(f"\nDiscovered Opportunities:")
+    for i, opp in enumerate(opportunities, 1):
+        print(f"\n  {i}. {opp.get('name', 'Unknown')}")
+        print(f"     Category:       {opp.get('category', '?')}")
+        print(f"     Est. monthly:   ${opp.get('estimated_monthly_revenue', 0):.0f}")
+        print(f"     Startup cost:   ${opp.get('startup_cost', 0):.0f}")
+        print(f"     Risk:           {opp.get('risk_level', '?')}")
+        print(f"     Automatable:    {opp.get('can_automate', '?')}")
+        print(f"     How to start:   {opp.get('how_to_start', '?')}")
+
+
+def _print_cycle_summary(result: dict, db: Database):
+    finance = Finance(db)
+    print(f"\n{'='*60}")
+    print(f"  Cycle Complete — {result.get('timestamp', '')}")
+    print(f"{'='*60}")
+    print(f"  Net profit:     ${result.get('net_profit', 0):.2f}")
+    print(f"  Health:         {result.get('health', {}).get('active_strategies', 0)} active strategies")
+    if result.get("provisioning", {}).get("provisioned"):
+        print(f"  Provisioned:    {result['provisioning']['provisioned']}")
+    if result.get("subagent_results"):
+        print(f"  Sub-agents:     {len(result['subagent_results'])} tasks delegated")
+    print(f"{'='*60}\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="monAI — Autonomous money-making AI agent")
-    parser.add_argument("command", nargs="?", default="run",
-                        choices=["run", "status", "init", "discover"],
-                        help="Command to execute")
-    parser.add_argument("--config", type=str, help="Path to config file")
+    parser = argparse.ArgumentParser(description="monAI — Autonomous money-making AI")
+    parser.add_argument("command", nargs="?", default="daemon",
+                        choices=["daemon", "run", "status", "init", "discover"],
+                        help="Command: daemon (default), run (single cycle), status, init, discover")
+    parser.add_argument("--interval", type=int, default=300,
+                        help="Seconds between daemon cycles (default: 300)")
     args = parser.parse_args()
 
     config = Config.load()
 
     if not config.llm.api_key:
-        print("Error: OPENAI_API_KEY not set. Set it in env or ~/.monai/config.json")
+        print("Error: OPENAI_API_KEY not set.")
+        print("Set it via: export OPENAI_API_KEY=sk-...")
+        print("Or add it to ~/.monai/config.json")
         sys.exit(1)
 
     if args.command == "init":
         config.save()
         db = Database()
-        init_default_strategies(db)
-        print("monAI initialized. Config saved to ~/.monai/config.json")
+        init_strategies(db)
+        identity = IdentityManager(config, db, LLM(config))
+        agent = identity.get_identity()
+        print(f"monAI initialized as: {agent.get('name', 'monAI')}")
+        print(f"Config: ~/.monai/config.json")
+        print(f"Run: monai daemon")
     elif args.command == "status":
         show_status(config)
     elif args.command == "discover":
-        db = Database()
-        llm = LLM(config)
-        orchestrator = Orchestrator(config, db, llm)
-        opportunities = orchestrator.discover_opportunities()
-        print("\nDiscovered Opportunities:")
-        for i, opp in enumerate(opportunities, 1):
-            print(f"\n  {i}. {opp.get('name', 'Unknown')}")
-            print(f"     Category: {opp.get('category', '?')}")
-            print(f"     Est. monthly: ${opp.get('estimated_monthly_revenue', 0):.0f}")
-            print(f"     Startup cost: ${opp.get('startup_cost', 0):.0f}")
-            print(f"     Risk: {opp.get('risk_level', '?')}")
+        discover(config)
     elif args.command == "run":
-        run_cycle(config)
+        run_once(config)
+    elif args.command == "daemon":
+        run_daemon(config, cycle_interval=args.interval)
 
 
 if __name__ == "__main__":

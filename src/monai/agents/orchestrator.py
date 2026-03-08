@@ -1,17 +1,22 @@
 """Orchestrator agent — the brain of monAI.
 
-Decides which strategies to run, allocates resources, monitors performance,
-discovers new opportunities, and ensures diversification.
+Fully autonomous. Decides what to do, provisions its own infrastructure,
+spawns sub-agents, discovers opportunities, runs strategies, and scales.
+Zero human intervention required.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime
 from typing import Any
 
 from monai.agents.base import BaseAgent
+from monai.agents.identity import IdentityManager
+from monai.agents.provisioner import Provisioner
+from monai.agents.spawner import AgentSpawner
 from monai.business.crm import CRM
 from monai.business.finance import Finance
 from monai.business.risk import RiskManager
@@ -25,8 +30,9 @@ logger = logging.getLogger(__name__)
 class Orchestrator(BaseAgent):
     name = "orchestrator"
     description = (
-        "Master agent that discovers opportunities, selects strategies, "
-        "allocates resources, and monitors performance across all money-making activities."
+        "Fully autonomous master agent. Provisions its own infrastructure, "
+        "discovers opportunities, spawns sub-agents, runs strategies, "
+        "manages clients, and scales — all without human intervention."
     )
 
     def __init__(self, config: Config, db: Database, llm: LLM):
@@ -34,6 +40,9 @@ class Orchestrator(BaseAgent):
         self.crm = CRM(db)
         self.finance = Finance(db)
         self.risk = RiskManager(config, db)
+        self.identity = IdentityManager(config, db, llm)
+        self.provisioner = Provisioner(config, db, llm)
+        self.spawner = AgentSpawner(config, db, llm)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
     def register_strategy(self, agent: BaseAgent):
@@ -41,74 +50,140 @@ class Orchestrator(BaseAgent):
         self.log_action("register_strategy", f"Registered: {agent.name}")
 
     def plan(self) -> list[str]:
-        """Generate the orchestrator's action plan for this cycle."""
+        """Generate the orchestrator's full action plan for this cycle."""
         health = self.risk.get_portfolio_health()
-        context = json.dumps(health, indent=2, default=str)
+        identity = self.identity.get_identity()
+        accounts = self.identity.get_all_accounts()
+        resource_costs = self.identity.get_monthly_resource_costs()
+        pipeline = self.crm.get_pipeline_summary()
+
+        context = json.dumps({
+            "portfolio_health": health,
+            "identity": identity,
+            "accounts_count": len(accounts),
+            "accounts": [{"platform": a["platform"], "type": a["type"]} for a in accounts],
+            "monthly_resource_costs": resource_costs,
+            "client_pipeline": pipeline,
+            "total_revenue": self.finance.get_total_revenue(),
+            "total_expenses": self.finance.get_total_expenses(),
+            "net_profit": self.finance.get_net_profit(),
+        }, indent=2, default=str)
 
         plan_response = self.think_json(
-            "Based on the current portfolio health, generate an action plan. "
-            "Return JSON with: {\"actions\": [{\"action\": str, \"priority\": int, \"reason\": str}]}. "
-            "Actions can include: review_strategies, discover_opportunities, "
-            "rebalance, pause_underperformer, scale_winner, start_new_strategy, "
-            "follow_up_clients, check_deliverables.",
+            "You are a fully autonomous AI business. Plan your next cycle. "
+            "Consider ALL of the following:\n"
+            "1. INFRASTRUCTURE: Do I need accounts, emails, domains, API keys? Provision them.\n"
+            "2. OPPORTUNITIES: What new ways to make money should I explore?\n"
+            "3. CLIENT WORK: Who needs follow-up? What work needs delivering?\n"
+            "4. MARKETING: Should I do outreach, post content, bid on jobs?\n"
+            "5. OPTIMIZATION: Which strategies are working? Scale winners, cut losers.\n"
+            "6. NEW STRATEGIES: Should I start something entirely new?\n\n"
+            "Return: {\"actions\": [{\"action\": str, \"priority\": int (1=highest), "
+            "\"reason\": str, \"delegate_to_subagent\": bool}]}",
             context=context,
         )
         actions = plan_response.get("actions", [])
         self.log_action("plan", f"Generated {len(actions)} actions", json.dumps(actions))
-        return [a["action"] for a in sorted(actions, key=lambda x: x.get("priority", 99))]
+        return actions
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
-        """Execute one orchestration cycle."""
-        self.log_action("cycle_start", f"Starting orchestration cycle at {datetime.now()}")
+        """Execute one full autonomous orchestration cycle."""
+        self.log_action("cycle_start", f"Cycle at {datetime.now()}")
+        cycle_result = {}
 
-        # 1. Check portfolio health
+        # Phase 1: Self-check — do I have what I need?
+        cycle_result["provisioning"] = self._ensure_infrastructure()
+
+        # Phase 2: Health check
         health = self.risk.get_portfolio_health()
-        self.log_action("health_check", json.dumps(health, default=str))
+        cycle_result["health"] = health
+        self.log_action("health_check", json.dumps(health, default=str)[:500])
 
-        # 2. Review each active strategy
-        reviews = self._review_strategies()
+        # Phase 3: Review active strategies
+        cycle_result["reviews"] = self._review_strategies()
 
-        # 3. Generate and execute plan
-        plan = self.plan()
-        results = []
-        for action in plan:
-            result = self._execute_action(action)
-            results.append({"action": action, "result": result})
+        # Phase 4: Plan and execute
+        actions = self.plan()
+        action_results = []
+        subagent_tasks = []
 
-        # 4. Run active strategy agents
-        strategy_results = self._run_strategies()
+        for action_item in sorted(actions, key=lambda x: x.get("priority", 99)):
+            action = action_item["action"]
+            if action_item.get("delegate_to_subagent"):
+                subagent_tasks.append({"name": action.replace(" ", "_")[:30], "task": action})
+            else:
+                result = self._execute_action(action)
+                action_results.append({"action": action, "result": result})
 
-        cycle_result = {
-            "timestamp": datetime.now().isoformat(),
-            "health": health,
-            "reviews": reviews,
-            "plan_actions": results,
-            "strategy_results": strategy_results,
-        }
+        cycle_result["direct_actions"] = action_results
+
+        # Phase 5: Run delegated tasks via sub-agents (parallel)
+        if subagent_tasks:
+            loop = asyncio.new_event_loop()
+            try:
+                subagent_results = loop.run_until_complete(
+                    self.spawner.run_parallel(subagent_tasks)
+                )
+                cycle_result["subagent_results"] = {
+                    k: {"status": v.get("status")} for k, v in subagent_results.items()
+                }
+            except Exception as e:
+                logger.error(f"Sub-agent execution failed: {e}")
+                cycle_result["subagent_results"] = {"error": str(e)}
+            finally:
+                loop.close()
+
+        # Phase 6: Run registered strategy agents
+        cycle_result["strategy_results"] = self._run_strategies()
+
+        # Phase 7: Summary
+        cycle_result["timestamp"] = datetime.now().isoformat()
+        cycle_result["net_profit"] = self.finance.get_net_profit()
 
         self.log_action("cycle_complete", json.dumps(cycle_result, default=str)[:1000])
         return cycle_result
 
+    def _ensure_infrastructure(self) -> dict[str, Any]:
+        """Check and provision any missing infrastructure."""
+        identity = self.identity.get_identity()
+        accounts = self.identity.get_all_accounts()
+        account_types = {a["platform"] for a in accounts}
+
+        needs = []
+        if "email" not in account_types:
+            needs.append("email")
+        if not identity:
+            needs.append("identity")
+
+        if needs:
+            self.log_action("provisioning", f"Need to set up: {needs}")
+            # Run provisioner
+            result = self.provisioner.run()
+            return {"provisioned": needs, "result": result}
+
+        return {"status": "infrastructure_ok", "accounts": len(accounts)}
+
     def discover_opportunities(self) -> list[dict[str, Any]]:
-        """Use LLM to brainstorm new money-making opportunities."""
-        current_strategies = self.db.execute(
-            "SELECT name, category, status FROM strategies"
-        )
-        current = [dict(r) for r in current_strategies]
+        """Discover new money-making opportunities."""
+        current = self.db.execute("SELECT name, category, status FROM strategies")
+        current_list = [dict(r) for r in current]
+        identity = self.identity.get_identity()
 
         response = self.think_json(
-            "Brainstorm 5 new money-making opportunities I should explore. "
-            "Consider: freelancing, digital products, content, trading, arbitrage, "
-            "SaaS, consulting, automation, reselling, affiliate marketing, lead gen, "
-            "and ANYTHING else that could make money legally. "
-            "For each, return: {\"opportunities\": [{\"name\": str, \"category\": str, "
-            "\"description\": str, \"estimated_monthly_revenue\": float, "
-            "\"startup_cost\": float, \"risk_level\": str, \"time_to_first_revenue_days\": int}]}",
-            context=f"Current strategies: {json.dumps(current)}",
+            "Brainstorm 5 NEW money-making opportunities. Think creatively. "
+            "Consider ANYTHING legal: services, products, trading, content, "
+            "affiliate marketing, SaaS, automation, consulting, reselling, "
+            "domain flipping, social media, courses, newsletter monetization, "
+            "API services, data products, and anything else. "
+            "For each: {\"opportunities\": [{\"name\": str, \"category\": str, "
+            "\"description\": str, \"how_to_start\": str, "
+            "\"estimated_monthly_revenue\": float, \"startup_cost\": float, "
+            "\"risk_level\": str, \"time_to_first_revenue_days\": int, "
+            "\"platforms_needed\": [str], \"can_automate\": bool}]}",
+            context=f"Current strategies: {json.dumps(current_list)}\nIdentity: {json.dumps(identity, default=str)}",
         )
         opportunities = response.get("opportunities", [])
-        self.log_action("discover", f"Found {len(opportunities)} opportunities",
-                        json.dumps(opportunities))
+        self.log_action("discover", f"Found {len(opportunities)} opportunities")
         return opportunities
 
     def _review_strategies(self) -> list[dict[str, Any]]:
@@ -125,8 +200,7 @@ class Orchestrator(BaseAgent):
                 "reasons": pause_check["reasons"],
             }
             if pause_check["should_pause"]:
-                self.log_action("pause_strategy", s["name"],
-                                json.dumps(pause_check["reasons"]))
+                self.log_action("pause_strategy", s["name"], json.dumps(pause_check["reasons"]))
                 self.db.execute(
                     "UPDATE strategies SET status = 'paused', updated_at = ? WHERE id = ?",
                     (datetime.now().isoformat(), s["id"]),
@@ -135,35 +209,65 @@ class Orchestrator(BaseAgent):
         return reviews
 
     def _execute_action(self, action: str) -> str:
-        """Execute a planned action."""
         if action == "discover_opportunities":
             opportunities = self.discover_opportunities()
+            # Auto-evaluate and start promising ones
+            for opp in opportunities:
+                if opp.get("startup_cost", 999) <= self.config.risk.max_monthly_spend_new_strategy:
+                    self._start_new_strategy(opp)
             return f"Discovered {len(opportunities)} opportunities"
         elif action == "rebalance":
             return self._rebalance()
         elif action == "follow_up_clients":
             return self._follow_up_clients()
+        elif "provision" in action.lower() or "register" in action.lower():
+            result = self.provisioner.run()
+            return json.dumps(result, default=str)[:500]
+        elif "marketing" in action.lower() or "outreach" in action.lower():
+            return self._do_marketing(action)
         else:
-            return f"Action '{action}' noted for next cycle"
+            return f"Action '{action}' queued"
+
+    def _start_new_strategy(self, opportunity: dict) -> str:
+        """Automatically start a new strategy from a discovered opportunity."""
+        name = opportunity.get("name", "").lower().replace(" ", "_")[:30]
+        existing = self.db.execute("SELECT id FROM strategies WHERE name = ?", (name,))
+        if existing:
+            return f"Strategy {name} already exists"
+
+        self.db.execute_insert(
+            "INSERT INTO strategies (name, category, description, allocated_budget) VALUES (?, ?, ?, ?)",
+            (name, opportunity.get("category", "misc"),
+             opportunity.get("description", ""),
+             min(opportunity.get("startup_cost", 10), self.config.risk.max_monthly_spend_new_strategy)),
+        )
+        self.log_action("start_strategy", name, json.dumps(opportunity, default=str)[:500])
+        return f"Started new strategy: {name}"
 
     def _rebalance(self) -> str:
-        """Rebalance allocation across strategies based on performance."""
         pnl = self.finance.get_strategy_pnl()
         winners = [s for s in pnl if s["net"] > 0]
+        losers = [s for s in pnl if s["net"] < 0]
         if winners:
-            self.log_action("rebalance", f"{len(winners)} profitable strategies identified")
-            return f"Rebalanced: {len(winners)} winners identified for scale-up"
-        return "No rebalancing needed"
+            self.log_action("rebalance",
+                            f"{len(winners)} winners, {len(losers)} losers")
+        return f"Winners: {len(winners)}, Losers: {len(losers)}"
 
     def _follow_up_clients(self) -> str:
-        """Check for clients needing follow-up."""
         pipeline = self.crm.get_pipeline_summary()
+        # Delegate follow-ups to a sub-agent
         contacted = pipeline.get("contacted", 0)
         negotiating = pipeline.get("negotiating", 0)
+        if contacted + negotiating > 0:
+            self.log_action("follow_up", f"{contacted} contacted, {negotiating} negotiating")
         return f"Pipeline: {contacted} contacted, {negotiating} negotiating"
 
+    def _do_marketing(self, action: str) -> str:
+        """Delegate marketing tasks to sub-agents."""
+        self.log_action("marketing", action)
+        return f"Marketing action queued: {action}"
+
     def _run_strategies(self) -> dict[str, Any]:
-        """Run all registered and active strategy agents."""
         results = {}
         active = self.db.execute("SELECT name FROM strategies WHERE status = 'active'")
         active_names = {r["name"] for r in active}
