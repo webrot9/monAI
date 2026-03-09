@@ -109,11 +109,13 @@ monai discover
 
 | Command | Description |
 |---------|-------------|
-| `monai daemon` | Run continuous autonomous operation (default) |
-| `monai run` | Execute a single orchestration cycle |
-| `monai status` | Display financial reports and strategy health |
-| `monai init` | Initialize config and database |
-| `monai discover` | Brainstorm new money-making opportunities |
+| `monai daemon` | Start monAI. Runs orchestration cycles in a loop (every 5 min by default). This is the main command. |
+| `monai run` | Run a single orchestration cycle and exit. Useful for testing/debugging. |
+| `monai status` | Display financial reports and strategy health (read-only, no cycle). |
+| `monai init` | Initialize config and database. Run once before first use. |
+| `monai discover` | Manual shortcut to preview opportunity discovery. Not required — discovery already runs automatically inside each daemon cycle. |
+
+In practice, you only need: `monai init` (once), then `monai daemon` (forever).
 
 ## Configuration
 
@@ -143,7 +145,7 @@ All config lives in `~/.monai/config.json`. Created automatically on `monai init
   },
   "telegram": {
     "enabled": true,
-    "creator_username": "YourTelegramUsername"
+    "creator_username": "Cristal89"
   },
   "initial_capital": 500.0,
   "currency": "EUR"
@@ -229,16 +231,7 @@ monAI auto-provisions a Telegram bot for creator communication:
 3. Agent verifies creator identity via cryptographic token in `~/.monai/verify.txt`
 4. Creator can request status updates, reports, and give instructions
 
-To set your Telegram username, edit `~/.monai/config.json`:
-
-```json
-{
-  "telegram": {
-    "enabled": true,
-    "creator_username": "YourUsername"
-  }
-}
-```
+Your Telegram username (`Cristal89`) is already configured. Just send `/start` to the bot after it self-provisions.
 
 ## Development
 
