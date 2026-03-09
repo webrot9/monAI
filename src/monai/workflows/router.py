@@ -67,6 +67,7 @@ DEFAULT_CAPABILITIES: dict[str, list[str]] = {
     "research_team": ["market_research", "trend_analysis", "competitor_analysis", "niche_discovery"],
     "marketing_team": ["marketing", "campaigns", "growth", "content_marketing", "outreach"],
     "social_presence": ["social_posts", "brand_building", "community_engagement", "social_media"],
+    "web_presence": ["websites", "landing_pages", "seo", "web_analytics", "domains"],
 }
 
 # Task type → capabilities needed

@@ -23,15 +23,19 @@ from monai.agents.humanizer import Humanizer
 from monai.agents.marketing_team import MarketingTeam
 from monai.agents.research_team import ResearchTeam
 from monai.agents.social_presence import SocialPresence
+from monai.agents.web_presence import WebPresence
 from monai.agents.identity import IdentityManager
 from monai.agents.legal import LegalAdvisorFactory
 from monai.agents.phone_provisioner import PhoneProvisioner
 from monai.agents.provisioner import Provisioner
 from monai.agents.self_improve import SelfImprover
 from monai.agents.spawner import AgentSpawner
+from monai.business.brand_payments import BrandPayments
 from monai.business.commercialista import Commercialista
 from monai.business.crm import CRM
+from monai.business.email_marketing import EmailMarketing
 from monai.business.finance import Finance
+from monai.business.pipeline import Pipeline
 from monai.business.risk import RiskManager
 from monai.config import Config
 from monai.db.database import Database
@@ -77,6 +81,10 @@ class Orchestrator(BaseAgent):
         self.research_team = ResearchTeam(config, db, llm)
         self.marketing_team = MarketingTeam(config, db, llm)
         self.social_presence = SocialPresence(config, db, llm)
+        self.web_presence = WebPresence(config, db, llm)
+        self.pipeline = Pipeline(db)
+        self.email_marketing = EmailMarketing(db)
+        self.brand_payments = BrandPayments(db)
         self.workflow_engine = WorkflowEngine(config, db, llm)
         self.task_router = TaskRouter(config, db, llm)
         # Register utility agents with workflow engine
@@ -85,12 +93,13 @@ class Orchestrator(BaseAgent):
         self.workflow_engine.register_agent("research_team", self.research_team)
         self.workflow_engine.register_agent("marketing_team", self.marketing_team)
         self.workflow_engine.register_agent("social_presence", self.social_presence)
+        self.workflow_engine.register_agent("web_presence", self.web_presence)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
     def register_strategy(self, agent: BaseAgent):
         self._strategy_agents[agent.name] = agent
         self.workflow_engine.register_agent(agent.name, agent)
-        # Auto-register brand for social presence
+        # Auto-register brand for social presence and web presence
         self.social_presence.register_brand(agent.name)
         self.log_action("register_strategy", f"Registered: {agent.name}")
 
@@ -247,11 +256,12 @@ class Orchestrator(BaseAgent):
         # Phase 6.5: Self-improvement — analyze and improve agents
         cycle_result["self_improvement"] = self._run_self_improvement()
 
-        # Phase 6.6: Finance + Research + Marketing + Social teams
+        # Phase 6.6: Finance + Research + Marketing + Social + Web teams
         cycle_result["finance_analysis"] = self._run_finance_expert()
         cycle_result["market_research"] = self._run_market_research()
         cycle_result["marketing"] = self._run_marketing_team()
         cycle_result["social_presence"] = self._run_social_presence()
+        cycle_result["web_presence"] = self._run_web_presence()
 
         # Phase 6.7: Engineering team — self-healing bug fixes
         cycle_result["engineering"] = self._run_engineering_team()
@@ -837,6 +847,18 @@ class Orchestrator(BaseAgent):
             return result
         except Exception as e:
             logger.error(f"Social presence failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def _run_web_presence(self) -> dict[str, Any]:
+        """Run web presence management — every 3 cycles."""
+        if self._cycle % 3 != 0:
+            return {"status": "skipped", "reason": "not_web_cycle"}
+        try:
+            result = self.web_presence.run()
+            self.log_action("web_presence", json.dumps(result, default=str)[:500])
+            return result
+        except Exception as e:
+            logger.error(f"Web presence failed: {e}")
             return {"status": "error", "error": str(e)}
 
     def request_research(self, topic: str) -> dict[str, Any]:
