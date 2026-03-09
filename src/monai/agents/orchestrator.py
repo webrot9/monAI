@@ -14,10 +14,14 @@ from datetime import datetime
 from typing import Any
 
 from monai.agents.base import BaseAgent
+from monai.agents.browser_learner import BrowserLearner
 from monai.agents.collaboration import CollaborationHub
+from monai.agents.eng_team import EngineeringTeam
 from monai.agents.ethics_test import EthicsTester
+from monai.agents.humanizer import Humanizer
 from monai.agents.identity import IdentityManager
 from monai.agents.legal import LegalAdvisorFactory
+from monai.agents.phone_provisioner import PhoneProvisioner
 from monai.agents.provisioner import Provisioner
 from monai.agents.self_improve import SelfImprover
 from monai.agents.spawner import AgentSpawner
@@ -58,6 +62,10 @@ class Orchestrator(BaseAgent):
         self.self_improver = SelfImprover(config, db, llm)
         self.legal = LegalAdvisorFactory(config, db, llm)
         self.collab = CollaborationHub(config, db)
+        self.eng_team = EngineeringTeam(config, db, llm)
+        self.humanizer = Humanizer(config, db, llm)
+        self.browser_learner = BrowserLearner(config, db, llm)
+        self.phone_provisioner = PhoneProvisioner(config, db, llm)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
     def register_strategy(self, agent: BaseAgent):
@@ -210,6 +218,12 @@ class Orchestrator(BaseAgent):
 
         # Phase 6.5: Self-improvement — analyze and improve agents
         cycle_result["self_improvement"] = self._run_self_improvement()
+
+        # Phase 6.7: Engineering team — self-healing bug fixes
+        cycle_result["engineering"] = self._run_engineering_team()
+
+        # Phase 6.8: Browser automation metrics
+        cycle_result["browser_metrics"] = self._get_browser_metrics()
 
         # Phase 7: Commercialista report
         cycle_result["timestamp"] = datetime.now().isoformat()
@@ -660,6 +674,41 @@ class Orchestrator(BaseAgent):
                 results[name] = {"analysis": "sparse_data"}
 
         return results
+
+    def _run_engineering_team(self) -> dict[str, Any]:
+        """Run the engineering team to fix bugs and improve the system."""
+        # Only run every 2 cycles to save API costs
+        if self._cycle % 2 != 0:
+            return {"status": "skipped", "reason": "not_engineering_cycle"}
+
+        try:
+            result = self.eng_team.run()
+            self.log_action("engineering_team", json.dumps(result, default=str)[:500])
+            return result
+        except Exception as e:
+            logger.error(f"Engineering team failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def _get_browser_metrics(self) -> dict[str, Any]:
+        """Get browser automation success metrics."""
+        try:
+            success_rates = self.browser_learner.get_success_rate()
+            failures = self.browser_learner.get_failure_breakdown()
+            return {
+                "success_rates": success_rates,
+                "failure_breakdown": failures,
+            }
+        except Exception:
+            return {"status": "no_data"}
+
+    def humanize_content(self, content: str, style: str = "default",
+                         context: str = "") -> str:
+        """Humanize content before sending to clients. Available to all agents."""
+        return self.humanizer.humanize(content, style, context)
+
+    def get_phone_number(self, platform: str, requesting_agent: str) -> dict[str, Any]:
+        """Get a virtual phone number for platform signup. Available to all agents."""
+        return self.phone_provisioner.get_number(platform, requesting_agent)
 
     def _run_strategies(self) -> dict[str, Any]:
         results = {}

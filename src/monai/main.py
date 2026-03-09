@@ -22,8 +22,12 @@ from monai.business.finance import Finance
 from monai.business.risk import RiskManager
 from monai.config import Config
 from monai.db.database import Database
+from monai.strategies.affiliate import AffiliateAgent
+from monai.strategies.content_sites import ContentSiteAgent
 from monai.strategies.digital_products import DigitalProductsAgent
 from monai.strategies.freelance_writing import FreelanceWritingAgent
+from monai.strategies.micro_saas import MicroSaaSAgent
+from monai.strategies.telegram_bots import TelegramBotAgent
 from monai.utils.llm import LLM
 
 logging.basicConfig(
@@ -57,6 +61,10 @@ def init_strategies(db: Database):
         ("freelance_writing", "services", "Freelance writing, blogging, copywriting", 10.0),
         ("digital_products", "products", "Ebooks, templates, prompt packs, guides", 10.0),
         ("cold_outreach", "services", "Cold email/LinkedIn outreach for B2B services", 10.0),
+        ("content_sites", "content", "SEO blogs, affiliate content sites", 10.0),
+        ("micro_saas", "products", "Small tools, API wrappers, micro-SaaS products", 10.0),
+        ("telegram_bots", "products", "Telegram bots as paid services", 5.0),
+        ("affiliate", "content", "Review and comparison content for affiliate commissions", 5.0),
     ]
     for name, category, description, budget in strategies:
         db.execute_insert(
@@ -90,6 +98,23 @@ def create_orchestrator(config: Config) -> tuple[Orchestrator, Database]:
     dp_llm = LLM(config, caller="digital_products")
     dp_llm.set_db(db)
     orchestrator.register_strategy(DigitalProductsAgent(config, db, dp_llm))
+
+    # New revenue channel agents — diversified income
+    cs_llm = LLM(config, caller="content_sites")
+    cs_llm.set_db(db)
+    orchestrator.register_strategy(ContentSiteAgent(config, db, cs_llm))
+
+    ms_llm = LLM(config, caller="micro_saas")
+    ms_llm.set_db(db)
+    orchestrator.register_strategy(MicroSaaSAgent(config, db, ms_llm))
+
+    tb_llm = LLM(config, caller="telegram_bots")
+    tb_llm.set_db(db)
+    orchestrator.register_strategy(TelegramBotAgent(config, db, tb_llm))
+
+    af_llm = LLM(config, caller="affiliate")
+    af_llm.set_db(db)
+    orchestrator.register_strategy(AffiliateAgent(config, db, af_llm))
 
     return orchestrator, db
 
