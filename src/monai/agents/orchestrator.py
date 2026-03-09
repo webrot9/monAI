@@ -90,6 +90,8 @@ class Orchestrator(BaseAgent):
     def register_strategy(self, agent: BaseAgent):
         self._strategy_agents[agent.name] = agent
         self.workflow_engine.register_agent(agent.name, agent)
+        # Auto-register brand for social presence
+        self.social_presence.register_brand(agent.name)
         self.log_action("register_strategy", f"Registered: {agent.name}")
 
     def plan(self) -> list[str]:

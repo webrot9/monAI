@@ -5,7 +5,11 @@ its own social identity, content strategy, and audience. NOT a client service
 (that's strategies/social_media.py). This builds each business's brand,
 attracts inbound leads, and establishes authority.
 
-Platforms: Twitter/X, LinkedIn, Reddit, Indie Hackers.
+Features:
+- Per-brand accounts on Twitter, LinkedIn, Reddit, Indie Hackers
+- Content approval flow: draft → approved → scheduled → posted
+- Real posting via platform APIs (social.api)
+- Analytics pull: fetches real engagement metrics from platforms
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from typing import Any
 from monai.agents.base import BaseAgent
 from monai.config import Config
 from monai.db.database import Database
+from monai.social.api import SocialAPIError, create_platform_client
 from monai.utils.llm import LLM
 
 logger = logging.getLogger(__name__)
@@ -31,6 +36,7 @@ CREATE TABLE IF NOT EXISTS brand_social_accounts (
     profile_url TEXT,
     bio TEXT,
     brand_voice TEXT,                  -- tone/style description for this brand
+    credentials TEXT,                  -- JSON: API keys/tokens for this platform account
     followers INTEGER DEFAULT 0,
     status TEXT DEFAULT 'planned',     -- planned, created, active, suspended
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -47,12 +53,18 @@ CREATE TABLE IF NOT EXISTS brand_social_posts (
     topic TEXT,
     target_audience TEXT,
     hashtags TEXT,
-    status TEXT DEFAULT 'draft',       -- draft, scheduled, posted, failed
+    status TEXT DEFAULT 'draft',       -- draft, approved, scheduled, posted, rejected, failed
+    quality_score REAL,                -- LLM quality gate score (0-1)
+    rejection_reason TEXT,             -- why the quality gate rejected it
+    platform_post_id TEXT,             -- ID returned by the platform after posting
+    platform_url TEXT,                 -- URL of the live post
     engagement_likes INTEGER DEFAULT 0,
     engagement_comments INTEGER DEFAULT 0,
     engagement_shares INTEGER DEFAULT 0,
     engagement_clicks INTEGER DEFAULT 0,
     leads_generated INTEGER DEFAULT 0,
+    approved_at TIMESTAMP,
+    scheduled_for TIMESTAMP,
     posted_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -184,7 +196,10 @@ class SocialPresence(BaseAgent):
         ]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
-        """Full social presence cycle across all brands."""
+        """Full social presence cycle across all brands.
+
+        Pipeline: create drafts → quality gate → schedule → publish → pull metrics.
+        """
         brand_filter = kwargs.get("brand")
         brands = self._get_brands(brand_filter)
 
@@ -192,6 +207,7 @@ class SocialPresence(BaseAgent):
         total_posts = 0
         total_engagement = 0
 
+        # Phase 1: Create new content per brand
         for brand in brands:
             accounts = self._get_brand_accounts(brand)
             active = [a for a in accounts if a["status"] == "active"]
@@ -219,16 +235,40 @@ class SocialPresence(BaseAgent):
             total_posts += posts_created
             total_engagement += len(engagement)
 
-        self.journal("social_cycle", f"Created {total_posts} posts across {len(brands)} brands", {
-            "brands": len(brands),
-            "total_posts": total_posts,
-            "total_engagement": total_engagement,
-        })
+        # Phase 2: Quality gate — review all drafts
+        review_results = self.review_all_drafts()
+
+        # Phase 3: Schedule approved posts
+        schedule_results = self.schedule_all_approved()
+
+        # Phase 4: Publish scheduled posts via platform APIs
+        publish_results = self.publish_all_scheduled()
+
+        # Phase 5: Pull real metrics for previously posted content
+        metrics_results = self.pull_all_metrics()
+        follower_results = self.pull_follower_counts()
+
+        self.journal("social_cycle",
+                     f"Created {total_posts}, published {publish_results.get('posted', 0)} "
+                     f"across {len(brands)} brands", {
+                         "brands": len(brands),
+                         "total_drafts": total_posts,
+                         "approved": review_results.get("approved", 0),
+                         "rejected": review_results.get("rejected", 0),
+                         "published": publish_results.get("posted", 0),
+                         "metrics_updated": metrics_results.get("updated", 0),
+                         "total_engagement": total_engagement,
+                     })
 
         return {
             "brands_processed": len(brands),
             "total_posts": total_posts,
             "total_engagement": total_engagement,
+            "review": review_results,
+            "scheduled": schedule_results,
+            "published": publish_results,
+            "metrics_pull": metrics_results,
+            "followers_pull": follower_results,
             "per_brand": results,
         }
 
@@ -271,13 +311,15 @@ class SocialPresence(BaseAgent):
         return [dict(r) for r in rows]
 
     def setup_account(self, brand: str, platform: str, username: str,
-                      profile_url: str = "", bio: str = "") -> dict[str, Any]:
+                      profile_url: str = "", bio: str = "",
+                      credentials: dict[str, str] | None = None) -> dict[str, Any]:
         """Activate a social account for a brand."""
+        creds_json = json.dumps(credentials) if credentials else None
         self.db.execute(
             "UPDATE brand_social_accounts SET username = ?, profile_url = ?, "
-            "bio = ?, status = 'active', updated_at = CURRENT_TIMESTAMP "
+            "bio = ?, credentials = ?, status = 'active', updated_at = CURRENT_TIMESTAMP "
             "WHERE brand = ? AND platform = ?",
-            (username, profile_url, bio, brand, platform),
+            (username, profile_url, bio, creds_json, brand, platform),
         )
         self.log_action("setup_social_account", f"{brand}/{platform}", username)
         self.share_knowledge(
@@ -504,3 +546,260 @@ class SocialPresence(BaseAgent):
             "GROUP BY brand"
         )
         return [dict(r) for r in rows]
+
+    # ── Content Approval Flow ────────────────────────────────
+
+    def review_post(self, post_id: int) -> dict[str, Any]:
+        """Run quality gate on a draft post. Approves or rejects with reason."""
+        rows = self.db.execute(
+            "SELECT * FROM brand_social_posts WHERE id = ?", (post_id,)
+        )
+        if not rows:
+            return {"status": "not_found"}
+
+        post = dict(rows[0])
+        if post["status"] != "draft":
+            return {"status": "already_reviewed", "current_status": post["status"]}
+
+        platform = post["platform"]
+        strategy = PLATFORM_STRATEGIES.get(platform, {})
+        max_length = strategy.get("ideal_length", 500)
+
+        verdict = self.think_json(
+            f"Review this social media post for quality.\n\n"
+            f"Platform: {platform}\n"
+            f"Brand: {post['brand']}\n"
+            f"Content:\n{post['content']}\n\n"
+            f"Ideal max length: {max_length} chars (actual: {len(post['content'])})\n\n"
+            "Criteria:\n"
+            "1. Does it sound human and authentic (not AI-generated)?\n"
+            "2. Does it have a strong hook in the first line?\n"
+            "3. Is it appropriate for the platform and audience?\n"
+            "4. Is it within reasonable length for the platform?\n"
+            "5. Would it embarrass us if posted publicly?\n\n"
+            "Return JSON: {{\"approved\": bool, \"score\": float (0-1), "
+            "\"reason\": str (why rejected, if not approved)}}"
+        )
+
+        approved = verdict.get("approved", False)
+        score = verdict.get("score", 0.0)
+        reason = verdict.get("reason", "")
+
+        if approved:
+            self.db.execute(
+                "UPDATE brand_social_posts SET status = 'approved', "
+                "quality_score = ?, approved_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
+                (score, post_id),
+            )
+            self.log_action("approve_post", f"Post {post_id} approved (score={score:.2f})")
+            return {"status": "approved", "score": score, "post_id": post_id}
+        else:
+            self.db.execute(
+                "UPDATE brand_social_posts SET status = 'rejected', "
+                "quality_score = ?, rejection_reason = ? WHERE id = ?",
+                (score, reason, post_id),
+            )
+            self.log_action("reject_post", f"Post {post_id} rejected: {reason[:100]}")
+            return {"status": "rejected", "score": score, "reason": reason,
+                    "post_id": post_id}
+
+    def review_all_drafts(self) -> dict[str, Any]:
+        """Review all draft posts through the quality gate."""
+        rows = self.db.execute(
+            "SELECT id FROM brand_social_posts WHERE status = 'draft'"
+        )
+        results = {"approved": 0, "rejected": 0, "total": len(rows)}
+        for row in rows:
+            result = self.review_post(row["id"])
+            if result.get("status") == "approved":
+                results["approved"] += 1
+            elif result.get("status") == "rejected":
+                results["rejected"] += 1
+        return results
+
+    def schedule_post(self, post_id: int,
+                      scheduled_for: str | None = None) -> dict[str, Any]:
+        """Mark an approved post as scheduled for publishing."""
+        rows = self.db.execute(
+            "SELECT status FROM brand_social_posts WHERE id = ?", (post_id,)
+        )
+        if not rows:
+            return {"status": "not_found"}
+        if rows[0]["status"] != "approved":
+            return {"status": "not_approved", "current_status": rows[0]["status"]}
+
+        schedule_time = scheduled_for or datetime.now().isoformat()
+        self.db.execute(
+            "UPDATE brand_social_posts SET status = 'scheduled', "
+            "scheduled_for = ? WHERE id = ?",
+            (schedule_time, post_id),
+        )
+        return {"status": "scheduled", "post_id": post_id,
+                "scheduled_for": schedule_time}
+
+    def schedule_all_approved(self) -> dict[str, Any]:
+        """Schedule all approved posts for immediate publishing."""
+        rows = self.db.execute(
+            "SELECT id FROM brand_social_posts WHERE status = 'approved'"
+        )
+        now = datetime.now().isoformat()
+        for row in rows:
+            self.schedule_post(row["id"], scheduled_for=now)
+        return {"scheduled": len(rows)}
+
+    # ── Publishing (API Integration) ─────────────────────────
+
+    def publish_post(self, post_id: int) -> dict[str, Any]:
+        """Publish a scheduled post via the platform's API."""
+        rows = self.db.execute(
+            "SELECT p.*, a.credentials FROM brand_social_posts p "
+            "JOIN brand_social_accounts a ON p.brand = a.brand AND p.platform = a.platform "
+            "WHERE p.id = ?",
+            (post_id,),
+        )
+        if not rows:
+            return {"status": "not_found"}
+
+        post = dict(rows[0])
+        if post["status"] != "scheduled":
+            return {"status": "not_scheduled", "current_status": post["status"]}
+
+        creds_raw = post.get("credentials")
+        if not creds_raw:
+            self.db.execute(
+                "UPDATE brand_social_posts SET status = 'failed' WHERE id = ?",
+                (post_id,),
+            )
+            return {"status": "no_credentials", "post_id": post_id}
+
+        credentials = json.loads(creds_raw)
+
+        try:
+            client = create_platform_client(
+                post["platform"], self.config, credentials
+            )
+            result = client.post(post["content"])
+
+            self.db.execute(
+                "UPDATE brand_social_posts SET status = 'posted', "
+                "platform_post_id = ?, platform_url = ?, "
+                "posted_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (result.get("post_id", ""), result.get("url", ""), post_id),
+            )
+
+            self.log_action(
+                "publish_post",
+                f"{post['brand']}/{post['platform']}: {(post.get('topic') or '')[:50]}",
+                result.get("url", ""),
+            )
+
+            return {"status": "posted", "post_id": post_id,
+                    "platform_post_id": result.get("post_id", ""),
+                    "url": result.get("url", "")}
+
+        except SocialAPIError as e:
+            self.db.execute(
+                "UPDATE brand_social_posts SET status = 'failed', "
+                "rejection_reason = ? WHERE id = ?",
+                (str(e)[:500], post_id),
+            )
+            logger.error(f"Failed to publish post {post_id}: {e}")
+            return {"status": "failed", "post_id": post_id, "error": str(e)}
+
+    def publish_all_scheduled(self) -> dict[str, Any]:
+        """Publish all scheduled posts."""
+        rows = self.db.execute(
+            "SELECT id FROM brand_social_posts WHERE status = 'scheduled'"
+        )
+        results = {"posted": 0, "failed": 0, "total": len(rows)}
+        for row in rows:
+            result = self.publish_post(row["id"])
+            if result.get("status") == "posted":
+                results["posted"] += 1
+            else:
+                results["failed"] += 1
+        return results
+
+    # ── Analytics Pull ───────────────────────────────────────
+
+    def pull_post_metrics(self, post_id: int) -> dict[str, Any]:
+        """Fetch real engagement metrics from the platform API for a posted post."""
+        rows = self.db.execute(
+            "SELECT p.platform, p.platform_post_id, p.brand, a.credentials "
+            "FROM brand_social_posts p "
+            "JOIN brand_social_accounts a ON p.brand = a.brand AND p.platform = a.platform "
+            "WHERE p.id = ? AND p.status = 'posted' AND p.platform_post_id IS NOT NULL",
+            (post_id,),
+        )
+        if not rows:
+            return {"status": "not_found_or_not_posted"}
+
+        post = dict(rows[0])
+        creds_raw = post.get("credentials")
+        if not creds_raw:
+            return {"status": "no_credentials"}
+
+        credentials = json.loads(creds_raw)
+
+        try:
+            client = create_platform_client(
+                post["platform"], self.config, credentials
+            )
+            metrics = client.get_post_metrics(post["platform_post_id"])
+
+            self.update_metrics(
+                post_id,
+                likes=metrics.get("likes", 0),
+                comments=metrics.get("comments", 0),
+                shares=metrics.get("shares", 0),
+                clicks=metrics.get("clicks", 0),
+            )
+
+            return {"status": "updated", "post_id": post_id, "metrics": metrics}
+
+        except SocialAPIError as e:
+            logger.error(f"Failed to pull metrics for post {post_id}: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def pull_all_metrics(self) -> dict[str, Any]:
+        """Pull metrics for all posted content that has a platform_post_id."""
+        rows = self.db.execute(
+            "SELECT id FROM brand_social_posts "
+            "WHERE status = 'posted' AND platform_post_id IS NOT NULL"
+        )
+        results = {"updated": 0, "failed": 0, "total": len(rows)}
+        for row in rows:
+            result = self.pull_post_metrics(row["id"])
+            if result.get("status") == "updated":
+                results["updated"] += 1
+            else:
+                results["failed"] += 1
+        return results
+
+    def pull_follower_counts(self) -> dict[str, Any]:
+        """Pull follower counts from platform APIs for all active accounts."""
+        rows = self.db.execute(
+            "SELECT brand, platform, credentials "
+            "FROM brand_social_accounts "
+            "WHERE status = 'active' AND credentials IS NOT NULL"
+        )
+        results = {"updated": 0, "failed": 0, "total": len(rows)}
+
+        for row in rows:
+            try:
+                credentials = json.loads(row["credentials"])
+                client = create_platform_client(
+                    row["platform"], self.config, credentials
+                )
+                profile = client.get_profile_metrics()
+                followers = profile.get("followers", 0)
+                self.update_followers(row["brand"], row["platform"], followers)
+                results["updated"] += 1
+            except Exception as e:
+                logger.error(
+                    f"Failed to pull followers for {row['brand']}/{row['platform']}: {e}"
+                )
+                results["failed"] += 1
+
+        return results

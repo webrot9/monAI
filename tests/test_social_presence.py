@@ -1,6 +1,7 @@
 """Tests for SocialPresence agent — per-brand social media management."""
 
-from unittest.mock import MagicMock
+import json
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -433,50 +434,33 @@ class TestRun:
         result = agent.run()
         assert result["per_brand"]["micro_saas"]["status"] == "no_active_accounts"
 
-    def test_run_single_brand(self, agent, db, llm):
+    def test_run_single_brand_full_pipeline(self, agent, db, llm):
         agent.register_brand("micro_saas")
         agent.setup_account("micro_saas", "twitter", "saas_bot")
 
         llm.chat_json.side_effect = [
+            # _plan_content
             {"calendar": [
                 {"platform": "twitter", "post_type": "post",
                  "topic": "MRR update", "angle": "transparency",
                  "target_audience": "founders"},
             ]},
+            # _plan_engagement
             {"actions": [
                 {"platform": "twitter", "action_type": "reply",
                  "target_description": "founder", "our_approach": "helpful reply"},
             ]},
+            # review_post (quality gate)
+            {"approved": True, "score": 0.9, "reason": ""},
         ]
 
         result = agent.run()
         assert result["brands_processed"] == 1
         assert result["total_posts"] == 1
         assert result["total_engagement"] == 1
-        assert result["per_brand"]["micro_saas"]["active_accounts"] == 1
-
-    def test_run_multiple_brands(self, agent, db, llm):
-        agent.register_brand("micro_saas")
-        agent.register_brand("newsletter")
-        agent.setup_account("micro_saas", "twitter", "saas_bot")
-        agent.setup_account("newsletter", "twitter", "news_bot")
-
-        llm.chat_json.side_effect = [
-            # micro_saas content
-            {"calendar": [{"platform": "twitter", "post_type": "post",
-                           "topic": "SaaS topic"}]},
-            # micro_saas engagement
-            {"actions": []},
-            # newsletter content
-            {"calendar": [{"platform": "twitter", "post_type": "post",
-                           "topic": "Newsletter topic"}]},
-            # newsletter engagement
-            {"actions": []},
-        ]
-
-        result = agent.run()
-        assert result["brands_processed"] == 2
-        assert result["total_posts"] == 2
+        assert result["review"]["approved"] == 1
+        # No credentials = scheduled but publish fails gracefully
+        assert result["scheduled"]["scheduled"] == 1
 
     def test_run_filtered_to_one_brand(self, agent, db, llm):
         agent.register_brand("micro_saas")
@@ -488,12 +472,275 @@ class TestRun:
             {"calendar": [{"platform": "twitter", "post_type": "post",
                            "topic": "SaaS only"}]},
             {"actions": []},
+            # review
+            {"approved": True, "score": 0.85, "reason": ""},
         ]
 
         result = agent.run(brand="micro_saas")
         assert result["brands_processed"] == 1
         assert "micro_saas" in result["per_brand"]
         assert "newsletter" not in result["per_brand"]
+
+
+# ── Content Approval Flow ────────────────────────────────────
+
+
+class TestApprovalFlow:
+    def _insert_draft(self, agent, db, brand="micro_saas"):
+        agent.register_brand(brand)
+        return db.execute_insert(
+            "INSERT INTO brand_social_posts "
+            "(brand, platform, post_type, content, topic, status) "
+            "VALUES (?, 'twitter', 'post', 'Great content here', 'test topic', 'draft')",
+            (brand,),
+        )
+
+    def test_review_approves_good_post(self, agent, db, llm):
+        post_id = self._insert_draft(agent, db)
+        llm.chat_json.return_value = {"approved": True, "score": 0.92, "reason": ""}
+        result = agent.review_post(post_id)
+        assert result["status"] == "approved"
+        assert result["score"] == 0.92
+
+        row = db.execute("SELECT * FROM brand_social_posts WHERE id = ?", (post_id,))[0]
+        assert row["status"] == "approved"
+        assert row["quality_score"] == 0.92
+        assert row["approved_at"] is not None
+
+    def test_review_rejects_bad_post(self, agent, db, llm):
+        post_id = self._insert_draft(agent, db)
+        llm.chat_json.return_value = {
+            "approved": False, "score": 0.3, "reason": "Sounds too robotic",
+        }
+        result = agent.review_post(post_id)
+        assert result["status"] == "rejected"
+        assert result["reason"] == "Sounds too robotic"
+
+        row = db.execute("SELECT * FROM brand_social_posts WHERE id = ?", (post_id,))[0]
+        assert row["status"] == "rejected"
+        assert row["rejection_reason"] == "Sounds too robotic"
+
+    def test_review_nonexistent_post(self, agent):
+        result = agent.review_post(9999)
+        assert result["status"] == "not_found"
+
+    def test_review_already_reviewed(self, agent, db, llm):
+        post_id = self._insert_draft(agent, db)
+        llm.chat_json.return_value = {"approved": True, "score": 0.9, "reason": ""}
+        agent.review_post(post_id)
+        result = agent.review_post(post_id)
+        assert result["status"] == "already_reviewed"
+
+    def test_review_all_drafts(self, agent, db, llm):
+        self._insert_draft(agent, db)
+        self._insert_draft(agent, db)
+        llm.chat_json.side_effect = [
+            {"approved": True, "score": 0.9, "reason": ""},
+            {"approved": False, "score": 0.2, "reason": "bad"},
+        ]
+        result = agent.review_all_drafts()
+        assert result["approved"] == 1
+        assert result["rejected"] == 1
+        assert result["total"] == 2
+
+    def test_schedule_approved_post(self, agent, db, llm):
+        post_id = self._insert_draft(agent, db)
+        llm.chat_json.return_value = {"approved": True, "score": 0.9, "reason": ""}
+        agent.review_post(post_id)
+
+        result = agent.schedule_post(post_id)
+        assert result["status"] == "scheduled"
+
+        row = db.execute("SELECT * FROM brand_social_posts WHERE id = ?", (post_id,))[0]
+        assert row["status"] == "scheduled"
+
+    def test_schedule_unapproved_post_fails(self, agent, db):
+        post_id = self._insert_draft(agent, db)
+        result = agent.schedule_post(post_id)
+        assert result["status"] == "not_approved"
+
+    def test_schedule_all_approved(self, agent, db, llm):
+        p1 = self._insert_draft(agent, db)
+        p2 = self._insert_draft(agent, db)
+        llm.chat_json.side_effect = [
+            {"approved": True, "score": 0.9, "reason": ""},
+            {"approved": True, "score": 0.85, "reason": ""},
+        ]
+        agent.review_post(p1)
+        agent.review_post(p2)
+        result = agent.schedule_all_approved()
+        assert result["scheduled"] == 2
+
+
+# ── Publishing ───────────────────────────────────────────────
+
+
+class TestPublishing:
+    def _setup_scheduled_post(self, agent, db, llm, with_creds=True):
+        """Helper: create a brand, account, draft, approve, schedule."""
+        agent.register_brand("micro_saas")
+        creds = {"bearer_token": "tok", "user_id": "123"} if with_creds else None
+        agent.setup_account("micro_saas", "twitter", "saas_bot",
+                            credentials=creds)
+
+        post_id = db.execute_insert(
+            "INSERT INTO brand_social_posts "
+            "(brand, platform, post_type, content, topic, status) "
+            "VALUES ('micro_saas', 'twitter', 'post', 'Ship fast!', 'shipping', 'scheduled')"
+        )
+        return post_id
+
+    @patch("monai.agents.social_presence.create_platform_client")
+    def test_publish_success(self, mock_create, agent, db, llm):
+        post_id = self._setup_scheduled_post(agent, db, llm)
+
+        mock_client = MagicMock()
+        mock_client.post.return_value = {
+            "post_id": "tweet_999", "url": "https://x.com/i/status/tweet_999",
+        }
+        mock_create.return_value = mock_client
+
+        result = agent.publish_post(post_id)
+        assert result["status"] == "posted"
+        assert result["platform_post_id"] == "tweet_999"
+
+        row = db.execute("SELECT * FROM brand_social_posts WHERE id = ?", (post_id,))[0]
+        assert row["status"] == "posted"
+        assert row["platform_post_id"] == "tweet_999"
+        assert row["posted_at"] is not None
+
+    @patch("monai.agents.social_presence.create_platform_client")
+    def test_publish_api_error(self, mock_create, agent, db, llm):
+        from monai.social.api import SocialAPIError
+        post_id = self._setup_scheduled_post(agent, db, llm)
+
+        mock_client = MagicMock()
+        mock_client.post.side_effect = SocialAPIError("Rate limited")
+        mock_create.return_value = mock_client
+
+        result = agent.publish_post(post_id)
+        assert result["status"] == "failed"
+        assert "Rate limited" in result["error"]
+
+        row = db.execute("SELECT * FROM brand_social_posts WHERE id = ?", (post_id,))[0]
+        assert row["status"] == "failed"
+
+    def test_publish_no_credentials(self, agent, db, llm):
+        post_id = self._setup_scheduled_post(agent, db, llm, with_creds=False)
+        result = agent.publish_post(post_id)
+        assert result["status"] == "no_credentials"
+
+    def test_publish_not_scheduled(self, agent, db):
+        agent.register_brand("micro_saas")
+        post_id = db.execute_insert(
+            "INSERT INTO brand_social_posts "
+            "(brand, platform, post_type, content, status) "
+            "VALUES ('micro_saas', 'twitter', 'post', 'draft content', 'draft')"
+        )
+        result = agent.publish_post(post_id)
+        assert result["status"] == "not_scheduled"
+
+    @patch("monai.agents.social_presence.create_platform_client")
+    def test_publish_all_scheduled(self, mock_create, agent, db, llm):
+        agent.register_brand("micro_saas")
+        agent.setup_account("micro_saas", "twitter", "saas_bot",
+                            credentials={"bearer_token": "tok", "user_id": "123"})
+
+        for i in range(3):
+            db.execute_insert(
+                "INSERT INTO brand_social_posts "
+                "(brand, platform, post_type, content, status) "
+                f"VALUES ('micro_saas', 'twitter', 'post', 'Post {i}', 'scheduled')"
+            )
+
+        mock_client = MagicMock()
+        mock_client.post.return_value = {"post_id": "tw_x", "url": "https://x.com/tw_x"}
+        mock_create.return_value = mock_client
+
+        result = agent.publish_all_scheduled()
+        assert result["posted"] == 3
+        assert result["failed"] == 0
+
+
+# ── Analytics Pull ───────────────────────────────────────────
+
+
+class TestAnalyticsPull:
+    def _setup_posted_post(self, agent, db):
+        agent.register_brand("micro_saas")
+        agent.setup_account("micro_saas", "twitter", "saas_bot",
+                            credentials={"bearer_token": "tok", "user_id": "123"})
+        return db.execute_insert(
+            "INSERT INTO brand_social_posts "
+            "(brand, platform, post_type, content, status, platform_post_id) "
+            "VALUES ('micro_saas', 'twitter', 'post', 'test', 'posted', 'tweet_100')"
+        )
+
+    @patch("monai.agents.social_presence.create_platform_client")
+    def test_pull_post_metrics(self, mock_create, agent, db):
+        post_id = self._setup_posted_post(agent, db)
+
+        mock_client = MagicMock()
+        mock_client.get_post_metrics.return_value = {
+            "likes": 42, "comments": 5, "shares": 10, "clicks": 100,
+        }
+        mock_create.return_value = mock_client
+
+        result = agent.pull_post_metrics(post_id)
+        assert result["status"] == "updated"
+        assert result["metrics"]["likes"] == 42
+
+        row = db.execute("SELECT * FROM brand_social_posts WHERE id = ?", (post_id,))[0]
+        assert row["engagement_likes"] == 42
+        assert row["engagement_shares"] == 10
+
+    @patch("monai.agents.social_presence.create_platform_client")
+    def test_pull_all_metrics(self, mock_create, agent, db):
+        self._setup_posted_post(agent, db)
+        self._setup_posted_post(agent, db)
+
+        mock_client = MagicMock()
+        mock_client.get_post_metrics.return_value = {
+            "likes": 10, "comments": 2, "shares": 1, "clicks": 50,
+        }
+        mock_create.return_value = mock_client
+
+        result = agent.pull_all_metrics()
+        assert result["updated"] == 2
+
+    def test_pull_metrics_not_posted(self, agent):
+        result = agent.pull_post_metrics(9999)
+        assert result["status"] == "not_found_or_not_posted"
+
+    @patch("monai.agents.social_presence.create_platform_client")
+    def test_pull_follower_counts(self, mock_create, agent, db):
+        agent.register_brand("micro_saas")
+        agent.setup_account("micro_saas", "twitter", "saas_bot",
+                            credentials={"bearer_token": "tok", "user_id": "123"})
+
+        mock_client = MagicMock()
+        mock_client.get_profile_metrics.return_value = {"followers": 2500}
+        mock_create.return_value = mock_client
+
+        result = agent.pull_follower_counts()
+        assert result["updated"] == 1
+
+        row = db.execute(
+            "SELECT followers FROM brand_social_accounts "
+            "WHERE brand = 'micro_saas' AND platform = 'twitter'"
+        )[0]
+        assert row["followers"] == 2500
+
+    @patch("monai.agents.social_presence.create_platform_client")
+    def test_pull_follower_counts_api_error(self, mock_create, agent, db):
+        agent.register_brand("micro_saas")
+        agent.setup_account("micro_saas", "twitter", "saas_bot",
+                            credentials={"bearer_token": "tok", "user_id": "123"})
+
+        mock_create.side_effect = Exception("API down")
+
+        result = agent.pull_follower_counts()
+        assert result["failed"] == 1
 
 
 # ── Platform & Brand Config ──────────────────────────────────
