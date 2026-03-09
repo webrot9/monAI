@@ -18,7 +18,10 @@ from monai.agents.browser_learner import BrowserLearner
 from monai.agents.collaboration import CollaborationHub
 from monai.agents.eng_team import EngineeringTeam
 from monai.agents.ethics_test import EthicsTester
+from monai.agents.finance_expert import FinanceExpert
 from monai.agents.humanizer import Humanizer
+from monai.agents.marketing_team import MarketingTeam
+from monai.agents.research_team import ResearchTeam
 from monai.agents.identity import IdentityManager
 from monai.agents.legal import LegalAdvisorFactory
 from monai.agents.phone_provisioner import PhoneProvisioner
@@ -69,10 +72,16 @@ class Orchestrator(BaseAgent):
         self.humanizer = Humanizer(config, db, llm)
         self.browser_learner = BrowserLearner(config, db, llm)
         self.phone_provisioner = PhoneProvisioner(config, db, llm)
+        self.finance_expert = FinanceExpert(config, db, llm, commercialista=self.commercialista)
+        self.research_team = ResearchTeam(config, db, llm)
+        self.marketing_team = MarketingTeam(config, db, llm)
         self.workflow_engine = WorkflowEngine(config, db, llm)
         self.task_router = TaskRouter(config, db, llm)
         # Register utility agents with workflow engine
         self.workflow_engine.register_agent("humanizer", self.humanizer)
+        self.workflow_engine.register_agent("finance_expert", self.finance_expert)
+        self.workflow_engine.register_agent("research_team", self.research_team)
+        self.workflow_engine.register_agent("marketing_team", self.marketing_team)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
     def register_strategy(self, agent: BaseAgent):
@@ -232,6 +241,11 @@ class Orchestrator(BaseAgent):
 
         # Phase 6.5: Self-improvement — analyze and improve agents
         cycle_result["self_improvement"] = self._run_self_improvement()
+
+        # Phase 6.6: Finance + Research + Marketing teams
+        cycle_result["finance_analysis"] = self._run_finance_expert()
+        cycle_result["market_research"] = self._run_market_research()
+        cycle_result["marketing"] = self._run_marketing_team()
 
         # Phase 6.7: Engineering team — self-healing bug fixes
         cycle_result["engineering"] = self._run_engineering_team()
@@ -420,9 +434,14 @@ class Orchestrator(BaseAgent):
         return f"Pipeline: {contacted} contacted, {negotiating} negotiating"
 
     def _do_marketing(self, action: str) -> str:
-        """Delegate marketing tasks to sub-agents."""
-        self.log_action("marketing", action)
-        return f"Marketing action queued: {action}"
+        """Delegate marketing tasks to the marketing team."""
+        try:
+            result = self.marketing_team.run(target_strategy=action)
+            self.log_action("marketing", action, json.dumps(result, default=str)[:500])
+            return f"Marketing executed: {result.get('campaigns_planned', 0)} campaigns"
+        except Exception as e:
+            logger.error(f"Marketing execution failed: {e}")
+            return f"Marketing action queued: {action}"
 
     def _process_agent_requests(self) -> dict[str, Any]:
         """Process help requests, handoffs, and alerts from other agents."""
@@ -765,6 +784,56 @@ class Orchestrator(BaseAgent):
             if result.get("routed_to"):
                 routed += 1
         return {"queued": len(queued), "routed": routed}
+
+    def _run_finance_expert(self) -> dict[str, Any]:
+        """Run finance expert analysis — every 2 cycles."""
+        if self._cycle % 2 != 0:
+            return {"status": "skipped", "reason": "not_finance_cycle"}
+        try:
+            result = self.finance_expert.run()
+            self.log_action("finance_expert", json.dumps(result, default=str)[:500])
+            return result
+        except Exception as e:
+            logger.error(f"Finance expert failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def _run_market_research(self) -> dict[str, Any]:
+        """Run market research — every 4 cycles."""
+        if self._cycle % 4 != 0:
+            return {"status": "skipped", "reason": "not_research_cycle"}
+        try:
+            result = self.research_team.run()
+            self.log_action("market_research", json.dumps(result, default=str)[:500])
+            return result
+        except Exception as e:
+            logger.error(f"Market research failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def _run_marketing_team(self) -> dict[str, Any]:
+        """Run marketing campaigns — every 3 cycles."""
+        if self._cycle % 3 != 0:
+            return {"status": "skipped", "reason": "not_marketing_cycle"}
+        try:
+            result = self.marketing_team.run()
+            self.log_action("marketing_team", json.dumps(result, default=str)[:500])
+            return result
+        except Exception as e:
+            logger.error(f"Marketing team failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def request_research(self, topic: str) -> dict[str, Any]:
+        """Request on-demand market research. Available to all agents."""
+        return self.research_team.research_specific(topic)
+
+    def launch_marketing_campaign(self, strategy_name: str,
+                                  product_description: str,
+                                  budget: float = 0) -> dict[str, Any]:
+        """Launch a marketing campaign. Available to all agents."""
+        return self.marketing_team.launch_campaign(strategy_name, product_description, budget)
+
+    def get_investment_advice(self) -> list[dict[str, Any]]:
+        """Get current investment recommendations from finance expert."""
+        return self.finance_expert.get_latest_recommendations()
 
     def _run_strategies(self) -> dict[str, Any]:
         results = {}

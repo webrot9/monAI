@@ -63,6 +63,9 @@ DEFAULT_CAPABILITIES: dict[str, list[str]] = {
     "print_on_demand": ["design", "merchandise", "creative", "ecommerce"],
     "saas": ["code", "product_design", "market_research", "saas_full", "architecture"],
     "cold_outreach": ["sales", "outreach", "b2b", "lead_nurturing"],
+    "finance_expert": ["finance", "investment", "roi_analysis", "forecasting", "budgeting"],
+    "research_team": ["market_research", "trend_analysis", "competitor_analysis", "niche_discovery"],
+    "marketing_team": ["marketing", "campaigns", "growth", "content_marketing", "outreach"],
 }
 
 # Task type → capabilities needed
@@ -75,6 +78,7 @@ TASK_TYPE_CAPABILITIES: dict[str, list[str]] = {
     "design": ["design", "creative", "templates", "digital_assets"],
     "data": ["data", "leads", "enrichment", "research"],
     "education": ["education", "curriculum", "lessons"],
+    "finance": ["finance", "investment", "roi_analysis", "forecasting", "budgeting"],
 }
 
 
