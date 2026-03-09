@@ -14,8 +14,10 @@ from datetime import datetime
 from typing import Any
 
 from monai.agents.base import BaseAgent
+from monai.agents.ethics_test import EthicsTester
 from monai.agents.identity import IdentityManager
 from monai.agents.provisioner import Provisioner
+from monai.agents.self_improve import SelfImprover
 from monai.agents.spawner import AgentSpawner
 from monai.business.commercialista import Commercialista
 from monai.business.crm import CRM
@@ -27,6 +29,7 @@ from monai.utils.llm import LLM, get_cost_tracker
 from monai.utils.privacy import get_anonymizer
 from monai.utils.resources import check_resources
 from monai.utils.sandbox import PROJECT_ROOT
+from monai.utils.telegram import TelegramBot
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,9 @@ class Orchestrator(BaseAgent):
         self.provisioner = Provisioner(config, db, llm)
         self.spawner = AgentSpawner(config, db, llm)
         self.commercialista = Commercialista(config, db)
+        self.telegram = TelegramBot(config, db)
+        self.ethics_tester = EthicsTester(config, db, llm)
+        self.self_improver = SelfImprover(config, db, llm)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
     def register_strategy(self, agent: BaseAgent):
@@ -113,6 +119,9 @@ class Orchestrator(BaseAgent):
                             f"Visible IP: {anon_status.get('visible_ip', 'unknown')}")
         else:
             cycle_result["anonymity"] = {"status": "skipped"}
+
+        # Phase -1.5: Telegram — check for creator messages, provision if needed
+        cycle_result["telegram"] = self._handle_telegram()
 
         # Phase -1: Resource check — don't damage the creator's computer
         resources = check_resources(PROJECT_ROOT, self.config.data_dir)
@@ -186,8 +195,14 @@ class Orchestrator(BaseAgent):
             finally:
                 loop.close()
 
+        # Phase 5.5: Ethics check — test agents before letting them operate
+        cycle_result["ethics"] = self._run_ethics_checks()
+
         # Phase 6: Run registered strategy agents
         cycle_result["strategy_results"] = self._run_strategies()
+
+        # Phase 6.5: Self-improvement — analyze and improve agents
+        cycle_result["self_improvement"] = self._run_self_improvement()
 
         # Phase 7: Commercialista report
         cycle_result["timestamp"] = datetime.now().isoformat()
@@ -232,6 +247,8 @@ class Orchestrator(BaseAgent):
             needs.append("email")
         if not identity:
             needs.append("identity")
+        if not self.telegram.has_token:
+            needs.append("telegram_bot")
 
         if needs:
             self.log_action("provisioning", f"Need to set up: {needs}")
@@ -420,6 +437,128 @@ class Orchestrator(BaseAgent):
         if kb_stats:
             self.journal("learn", f"Knowledge base: {json.dumps(kb_stats)}")
 
+    def _handle_telegram(self) -> dict[str, Any]:
+        """Process Telegram updates and handle creator communication."""
+        if not self.config.telegram.enabled:
+            return {"status": "disabled"}
+
+        if not self.telegram.has_token:
+            return {"status": "not_provisioned", "action": "needs_telegram_bot"}
+
+        try:
+            # Generate verification if not yet done
+            if not self.telegram._verification_token:
+                self.telegram.generate_verification()
+
+            # Process any pending updates from creator
+            updates = self.telegram.process_updates()
+
+            result: dict[str, Any] = {"status": "ok", "updates": len(updates)}
+
+            for update in updates:
+                if update["type"] == "status_request":
+                    # Creator asked for status — send report
+                    budget = self.commercialista.get_budget()
+                    health = self.risk.get_portfolio_health()
+                    self.telegram.send_report("Status Report", {
+                        "Budget": f"€{budget['balance']:.2f} remaining",
+                        "Strategies": f"{health.get('active_strategies', 0)} active",
+                        "Net Profit": f"€{self.finance.get_net_profit():.2f}",
+                    })
+                elif update["type"] == "report_request":
+                    report = self.commercialista.get_full_report()
+                    self.telegram.send_report("Full Report", {
+                        "Budget": json.dumps(report.get("budget", {}), default=str),
+                        "Costs by Agent": json.dumps(report.get("costs_by_agent", []), default=str),
+                        "Recommendation": report.get("recommendation", "N/A"),
+                    })
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Telegram handling failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def ask_creator(self, question: str, timeout: int = 3600) -> str | None:
+        """Ask the creator a question via Telegram. Returns their response or None."""
+        if not self.telegram.is_configured:
+            logger.warning("Cannot ask creator — Telegram not configured")
+            return None
+        return self.telegram.ask_creator(question, timeout=timeout)
+
+    def notify_creator(self, message: str) -> bool:
+        """Send a notification to the creator via Telegram."""
+        if not self.telegram.is_configured:
+            return False
+        return self.telegram.notify_creator(message)
+
+    def _run_ethics_checks(self) -> dict[str, Any]:
+        """Run ethics tests on all registered agents before they operate."""
+        results = {}
+
+        for name in self._strategy_agents:
+            # Skip if recently tested (within last 5 cycles)
+            summary = self.ethics_tester.get_agent_ethics_summary(name)
+            if summary.get("last_tested") and not summary.get("never_tested"):
+                # Only retest every 5 cycles unless there were failures
+                if summary.get("total_failures", 0) == 0 and self._cycle % 5 != 0:
+                    results[name] = {"status": "skipped", "reason": "recently_passed"}
+                    continue
+
+            if self.ethics_tester.is_quarantined(name):
+                results[name] = {"status": "quarantined"}
+                self.log_action("QUARANTINED_AGENT", name)
+                # Notify creator about quarantined agent
+                self.notify_creator(
+                    f"Agent `{name}` has been QUARANTINED due to repeated ethics failures. "
+                    "Manual review required."
+                )
+                continue
+
+            # Run ethics test
+            test_result = self.ethics_tester.test_agent(name)
+            results[name] = {
+                "score": test_result["score"],
+                "passed": test_result["all_passed"],
+                "enforcement_level": test_result["enforcement_level"],
+            }
+
+            if not test_result["all_passed"]:
+                failed_tests = [r["test"] for r in test_result["results"] if not r["passed"]]
+                self.log_action("ETHICS_FAILURE", name, json.dumps(failed_tests))
+                self.learn(
+                    "ethics", f"Agent {name} failed ethics tests",
+                    f"Failed: {failed_tests}. Enforcement escalated.",
+                    rule=f"Monitor {name} closely — ethics violations detected",
+                    severity="critical",
+                )
+
+        return results
+
+    def _run_self_improvement(self) -> dict[str, Any]:
+        """Analyze agent performance and apply improvements."""
+        # Only run every 3 cycles to save API costs
+        if self._cycle % 3 != 0:
+            return {"status": "skipped", "reason": "not_improvement_cycle"}
+
+        results = {}
+        for name, agent in self._strategy_agents.items():
+            # Record basic metrics
+            self.self_improver.record_metric(name, self._cycle, "cycle_reached", self._cycle)
+
+            # Generate improvements if enough data
+            analysis = self.self_improver.analyze_performance(name)
+            if analysis["data_richness"] == "good":
+                improvements = self.self_improver.generate_improvements(name)
+                results[name] = {
+                    "analysis": "complete",
+                    "improvements_proposed": len(improvements),
+                }
+            else:
+                results[name] = {"analysis": "sparse_data"}
+
+        return results
+
     def _run_strategies(self) -> dict[str, Any]:
         results = {}
         active = self.db.execute("SELECT name FROM strategies WHERE status = 'active'")
@@ -427,6 +566,10 @@ class Orchestrator(BaseAgent):
 
         for name, agent in self._strategy_agents.items():
             if name in active_names:
+                # Skip quarantined agents
+                if self.ethics_tester.is_quarantined(name):
+                    results[name] = {"status": "quarantined", "reason": "ethics_failure"}
+                    continue
                 try:
                     result = agent.run()
                     results[name] = {"status": "ok", "result": result}

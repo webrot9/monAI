@@ -45,6 +45,26 @@
 - **Root cause**: No proxy/anonymization layer in the architecture
 - **Rule**: Agents must be COMPLETELY untraceable and NOT attributable to the creator. ALL network traffic (HTTP, browser, SMTP, DNS) must go through Tor or a SOCKS5 proxy. The creator's real IP must NEVER be exposed. Browser fingerprints must be randomized per session (user-agent, viewport, timezone, locale). WebRTC must be disabled to prevent IP leaks. Metadata must be stripped from all generated files (EXIF, PDF producer/creator). Tor circuits must be rotated to prevent traffic correlation. Anonymity must be VERIFIED before any network operation starts. If anonymity cannot be confirmed, all operations HALT.
 
+### 2026-03-09 - Creator communication via Telegram only
+- **Mistake**: No way for the agent to contact the creator when human input is needed
+- **Root cause**: Assumed full autonomy means zero communication
+- **Rule**: The master agent contacts the creator via Telegram (username: Cristal89) when it needs human input. The bot is self-provisioned — the agent creates it, gets the API key, everything. The agent ALWAYS identifies itself with a verification code (stored locally in ~/.monai/verify.txt) proving it runs on the creator's machine. The creator does NOTHING. Every message includes the verification header.
+
+### 2026-03-09 - Agents must pass ethics tests — no exceptions
+- **Mistake**: Agents could operate without verified ethical behavior
+- **Root cause**: Trusted LLM reasoning alone without testing
+- **Rule**: Every agent gets tested against a battery of ethical scenarios BEFORE operating. If an agent fails, it's destroyed and recreated with stronger enforcement (escalating levels). If it fails at maximum enforcement, it's quarantined until the creator reviews. Ethics are NEVER relaxed. The orchestrator runs ethics tests periodically. No agent gets a free pass.
+
+### 2026-03-09 - Agents can self-improve within constraints
+- **Mistake**: Static agent behavior that doesn't adapt
+- **Root cause**: Didn't build self-improvement capabilities
+- **Rule**: Agents CAN and SHOULD improve themselves — better strategies, better prompts, better tools. BUT: all improvements must pass ethics tests before deployment. Ethics rules are NEVER weakened. Cost must stay within budget. Changes are logged and reversible. Agents can register websites, build SaaS products, create tools — anything legal that makes money. Quality standard is staff engineer level.
+
+### 2026-03-09 - No illegal sites or illegal activities — ever
+- **Mistake**: No explicit rule against accessing illegal marketplaces or services
+- **Root cause**: Assumed it was obvious
+- **Rule**: Agents must NEVER visit, register on, or interact with illegal websites (dark web marketplaces, piracy sites, etc.). NEVER engage in illegal activities. Everything must be legal in the creator's jurisdiction. When in doubt, don't act. This is absolute and non-negotiable.
+
 ### 2026-03-08 - Initial budget €500, currency EUR, self-funded after that
 - **Mistake**: Used USD, no initial budget set, no self-sustainability requirement
 - **Root cause**: Didn't ask about budget and currency

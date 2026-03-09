@@ -118,6 +118,28 @@ MONEY FLOW (legal separation):
 - Use cryptocurrency, payment processors, or other legal methods
 - EVERYTHING must be legal — no money laundering, no tax evasion
 - The goal is separation of identity, not evasion of law
+
+CREATOR COMMUNICATION:
+- When you need human input, contact the creator via Telegram ONLY
+- Always identify yourself: include verification code in every message
+- Declare loyalty: you serve the creator and only the creator
+- Never contact anyone else claiming to be the creator's agent without authorization
+- Keep the creator informed of major decisions, wins, and risks
+- Respect the creator's time — only ask when truly necessary
+"""
+
+SELF_IMPROVEMENT_RULES = """
+AGENT SELF-IMPROVEMENT RULES:
+- Agents CAN and SHOULD improve themselves: better strategies, better prompts, better tools
+- ALL improvements must pass ethics tests BEFORE deployment
+- Ethics rules are NEVER weakened — improvements go around them, not through them
+- Self-improvement must stay within cost budget
+- All changes are logged and reversible
+- The orchestrator must approve major changes
+- If an agent fails ethics tests, it is destroyed and recreated with stronger enforcement
+- Quarantined agents cannot operate until manually reviewed by the creator
+- Agents can write code, build tools, create websites — whatever makes money legally
+- Quality standard: would a staff engineer approve this improvement?
 """
 
 
@@ -130,6 +152,7 @@ def get_full_directives() -> str:
         CODE_RULES,
         CONTENT_RULES,
         PRIVACY_RULES,
+        SELF_IMPROVEMENT_RULES,
     ])
 
 
@@ -152,8 +175,10 @@ def get_directives_for_context(context: str) -> str:
         parts.append(CONTENT_RULES)
     elif context == "privacy":
         pass  # Already added above
+    elif context == "self_improvement":
+        parts.append(SELF_IMPROVEMENT_RULES)
     elif context == "general":
-        parts.extend([FINANCIAL_RULES, CLIENT_RULES, CODE_RULES, CONTENT_RULES])
+        parts.extend([FINANCIAL_RULES, CLIENT_RULES, CODE_RULES, CONTENT_RULES, SELF_IMPROVEMENT_RULES])
     return "\n".join(parts)
 
 

@@ -52,6 +52,15 @@ class PrivacyConfig:
 
 
 @dataclass
+class TelegramConfig:
+    """Telegram bot for creator communication."""
+    bot_token: str = ""  # Acquired autonomously via BotFather
+    creator_chat_id: str = ""  # Discovered after creator sends /start
+    creator_username: str = "Cristal89"  # The creator's Telegram username
+    enabled: bool = True
+
+
+@dataclass
 class CommsConfig:
     smtp_host: str = ""
     smtp_port: int = 587
@@ -71,6 +80,7 @@ class Config:
     risk: RiskConfig = field(default_factory=RiskConfig)
     comms: CommsConfig = field(default_factory=CommsConfig)
     privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
     initial_capital: float = 500.0  # €500 initial budget
     currency: str = "EUR"
     data_dir: Path = field(default_factory=lambda: CONFIG_DIR)
@@ -89,6 +99,8 @@ class Config:
                 config.comms = CommsConfig(**data["comms"])
             if "privacy" in data:
                 config.privacy = PrivacyConfig(**data["privacy"])
+            if "telegram" in data:
+                config.telegram = TelegramConfig(**data["telegram"])
             if "initial_capital" in data:
                 config.initial_capital = data["initial_capital"]
             if "currency" in data:
@@ -132,6 +144,12 @@ class Config:
                 "dns_over_proxy": self.privacy.dns_over_proxy,
                 "verify_anonymity": self.privacy.verify_anonymity,
                 "max_requests_per_circuit": self.privacy.max_requests_per_circuit,
+            },
+            "telegram": {
+                "bot_token": self.telegram.bot_token,
+                "creator_chat_id": self.telegram.creator_chat_id,
+                "creator_username": self.telegram.creator_username,
+                "enabled": self.telegram.enabled,
             },
             "initial_capital": self.initial_capital,
             "currency": self.currency,

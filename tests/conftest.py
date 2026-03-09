@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from monai.config import Config, LLMConfig, RiskConfig, CommsConfig
+from monai.config import Config, LLMConfig, RiskConfig, CommsConfig, TelegramConfig
 from monai.db.database import Database
 
 
@@ -29,6 +29,12 @@ def config(tmp_dir):
             smtp_host="",
             from_name="TestAgent",
             from_email="test@example.com",
+        ),
+        telegram=TelegramConfig(
+            bot_token="",
+            creator_chat_id="",
+            creator_username="TestCreator",
+            enabled=False,
         ),
         initial_capital=500.0,
         currency="EUR",
