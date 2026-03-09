@@ -65,10 +65,10 @@ class Finance:
             "FROM transactions WHERE DATE(created_at) = ? GROUP BY type",
             (date,),
         )
-        result = {"revenue": 0.0, "expenses": 0.0, "net": 0.0}
+        result = {"revenue": 0.0, "expense": 0.0, "net": 0.0}
         for row in rows:
             result[row["type"]] = row["total"]
-        result["net"] = result["revenue"] - result["expenses"]
+        result["net"] = result["revenue"] - result["expense"]
         return result
 
     def get_roi(self, strategy_id: int | None = None, days: int | None = None) -> float:
