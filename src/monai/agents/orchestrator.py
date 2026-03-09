@@ -31,6 +31,7 @@ from monai.agents.provisioner import Provisioner
 from monai.agents.self_improve import SelfImprover
 from monai.agents.spawner import AgentSpawner
 from monai.business.brand_payments import BrandPayments
+from monai.payments.manager import UnifiedPaymentManager
 from monai.business.commercialista import Commercialista
 from monai.business.crm import CRM
 from monai.business.email_marketing import EmailMarketing
@@ -85,6 +86,7 @@ class Orchestrator(BaseAgent):
         self.pipeline = Pipeline(db)
         self.email_marketing = EmailMarketing(db)
         self.brand_payments = BrandPayments(db)
+        self.payment_manager = UnifiedPaymentManager(config, db)
         self.workflow_engine = WorkflowEngine(config, db, llm)
         self.task_router = TaskRouter(config, db, llm)
         # Register utility agents with workflow engine
@@ -268,6 +270,9 @@ class Orchestrator(BaseAgent):
 
         # Phase 6.8: Browser automation metrics
         cycle_result["browser_metrics"] = self._get_browser_metrics()
+
+        # Phase 6.9: Payment processing — sweep profits to creator
+        cycle_result["payments"] = self._run_payment_cycle()
 
         # Phase 7: Commercialista report
         cycle_result["timestamp"] = datetime.now().isoformat()
@@ -874,6 +879,53 @@ class Orchestrator(BaseAgent):
     def get_investment_advice(self) -> list[dict[str, Any]]:
         """Get current investment recommendations from finance expert."""
         return self.finance_expert.get_latest_recommendations()
+
+    def _run_payment_cycle(self) -> dict[str, Any]:
+        """Run payment processing — check balances and sweep profits to creator.
+
+        Runs every 3 cycles to avoid excessive RPC calls.
+        Sweeps profits from brand crypto wallets to creator's Monero address.
+        """
+        if self._cycle % 3 != 0:
+            return {"status": "skipped", "reason": "not_payment_cycle"}
+
+        if not self.config.creator_wallet.xmr_address:
+            return {"status": "skipped", "reason": "no_creator_wallet_configured"}
+
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                # Run sweep cycle
+                sweep_result = loop.run_until_complete(
+                    self.payment_manager.run_sweep_cycle()
+                )
+
+                # Get payment system health
+                health = loop.run_until_complete(
+                    self.payment_manager.health_check()
+                )
+            finally:
+                loop.close()
+
+            result = {
+                "sweep": sweep_result,
+                "health": health,
+                "status": self.payment_manager.get_status(),
+            }
+
+            if sweep_result.get("sweeps_successful", 0) > 0:
+                xmr_swept = sweep_result.get("total_xmr_swept", 0)
+                self.log_action("payment_sweep",
+                                f"Swept {xmr_swept:.8f} XMR to creator")
+                self.notify_creator(
+                    f"Profit sweep: {xmr_swept:.8f} XMR transferred to your wallet."
+                )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Payment cycle failed: {e}")
+            return {"status": "error", "error": str(e)}
 
     def _run_strategies(self) -> dict[str, Any]:
         results = {}

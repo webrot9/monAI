@@ -20,6 +20,8 @@ dependencies = [
     "playwright>=1.40.0",
     "pysocks>=1.7.0",
     "Pillow>=10.0.0",
+    "monero>=1.1.0",
+    "stripe>=8.0.0",
 ]
 
 [project.optional-dependencies]

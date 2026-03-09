@@ -1,126 +1,140 @@
-# monAI - Architecture Evolution Plan
+# monAI - Payment Pipeline Implementation
 
 ## Vision
-Evolve monAI from a single-orchestrator system to a multi-team autonomous organization with self-healing engineering, adaptive browser automation, anti-AI-detection capabilities, and diversified revenue channels.
+Implementare il flusso reale dei soldi: Brand raccoglie → Anonimizza → Trasferisce al creator.
+Ogni brand ha i suoi account di pagamento. I profitti vengono "swept" in crypto anonima verso il creator.
 
-## New Architecture
+## Architecture
 
 ```
-Orchestrator (CEO)
-├── Engineering Team (self-healing, continuous improvement)
-│   ├── TechLead (reviews errors, prioritizes bugs, assigns work)
-│   └── Engineers x2-3 (fix bugs, improve modules, write tests)
-│
-├── Revenue Squad (one agent per channel, Darwinian selection)
-│   ├── FreelanceAgent (Upwork/Fiverr — existing, needs flesh)
-│   ├── DigitalProductsAgent (Gumroad/Etsy — existing, needs flesh)
-│   ├── ContentSiteAgent (SEO blogs, affiliate content)
-│   ├── MicroSaaSAgent (small tools, API wrappers)
-│   ├── TelegramBotAgent (bots-as-a-service)
-│   └── AffiliateAgent (affiliate marketing content)
-│
-├── Infrastructure Team
-│   ├── BrowserAgent (adaptive automation, learns from failures)
-│   └── PhoneProvisionerAgent (virtual numbers for signups)
-│
-└── Quality Team
-    └── HumanizeAgent (anti-AI-detection, style matching, quality)
+Customer pays Brand
+       │
+       ▼
+┌─────────────────────┐
+│  Payment Gateway    │  ← Stripe webhook / BTCPay callback / Gumroad webhook
+│  (per-provider)     │
+└────────┬────────────┘
+         │ record_payment()
+         ▼
+┌─────────────────────┐
+│  Brand Balance      │  ← SQLite tracking (already exists)
+│  (sweepable_amt)    │
+└────────┬────────────┘
+         │ sweep triggered (threshold or schedule)
+         ▼
+┌─────────────────────┐
+│  Crypto Gateway     │  ← Monero wallet RPC / Bitcoin RPC
+│  (sweep executor)   │
+└────────┬────────────┘
+         │ XMR tx or BTC+CoinJoin
+         ▼
+┌─────────────────────┐
+│  Creator Wallet     │  ← Creator's Monero address (from config)
+└─────────────────────┘
 ```
 
 ## Implementation Plan
 
-### Phase A: Engineering Team (self-healing system)
-- [x] Design `EngineeringTeam` architecture
-- [ ] Create `TechLead` agent (`src/monai/agents/eng_team/tech_lead.py`)
-  - Monitors error logs, agent failures, test results
-  - Prioritizes issues by severity and business impact
-  - Assigns work to engineer agents
-  - Reviews fixes before deployment
-  - Reports to orchestrator
-- [ ] Create `Engineer` agent (`src/monai/agents/eng_team/engineer.py`)
-  - Receives bug assignments from TechLead
-  - Uses Coder agent to write fixes + tests
-  - Submits fixes for review
-  - Can be spawned as multiple instances
-- [ ] Create `EngineeringTeam` coordinator (`src/monai/agents/eng_team/__init__.py`)
-  - Manages the team lifecycle
-  - Exposes `run()` that the orchestrator calls
-  - Tracks bug backlog, fix rate, regression rate
-- [ ] Wire into orchestrator cycle (new Phase 6.7: Engineering)
-- [ ] Add DB schema for bug tracking (bugs table)
+### Phase 1: Payment Gateway Abstraction Layer
+- [ ] Create `src/monai/payments/` package with `__init__.py`
+- [ ] Create `src/monai/payments/base.py` — abstract `PaymentProvider` interface
+  - `verify_payment(payment_ref) -> PaymentStatus`
+  - `get_balance(account_id) -> float`
+  - `create_payment_link(amount, product, currency) -> str`
+  - `handle_webhook(payload, headers) -> WebhookEvent`
+- [ ] Create `src/monai/payments/types.py` — shared types (PaymentStatus, WebhookEvent, etc.)
 
-### Phase B: Adaptive Browser Automation (learning loop)
-- [ ] Create `BrowserLearner` (`src/monai/agents/browser_learner.py`)
-  - Wraps existing `Browser` class
-  - Logs every action: URL, selector, action type, result, error
-  - Categorizes failures: CAPTCHA, bot_detection, dom_change, timeout, auth_required
-  - Tracks success rates per site, per action type
-  - Generates countermeasures per failure type:
-    - CAPTCHA → route to solving service (2captcha API)
-    - Bot detection → fingerprint rotation, realistic delays, mouse movement
-    - DOM changes → self-healing selectors (find by text/role/aria, not CSS)
-    - Timeout → adaptive wait times
-  - Maintains a "site playbook" — learned interaction patterns per domain
-  - Exposes metrics: success_rate, avg_time, failure_breakdown
-- [ ] Add `browser_actions` DB table (action log with outcomes)
-- [ ] Add `site_playbooks` DB table (learned patterns per domain)
-- [ ] Add CAPTCHA solver integration (2captcha/anti-captcha API)
-- [ ] Add self-healing selector logic (fallback strategies)
+### Phase 2: Stripe Integration (card payments — most customers)
+- [ ] Create `src/monai/payments/stripe_provider.py`
+  - Stripe Checkout Session creation (payment links)
+  - Webhook handler (checkout.session.completed, charge.refunded)
+  - Balance retrieval via Stripe API
+  - Payout tracking
+- [ ] Add `stripe>=8.0.0` to pyproject.toml dependencies
+- [ ] Tests: `tests/test_stripe_provider.py`
 
-### Phase C: Anti-AI Detection / Humanizer
-- [ ] Create `Humanizer` (`src/monai/agents/humanizer.py`)
-  - Post-processes all outbound content
-  - Analyzes and matches target voice/style
-  - Varies sentence structure (breaks AI-typical patterns)
-  - Injects specificity, opinions, natural imperfections
-  - Maintains style profiles per client/platform
-  - Self-critique loop: draft → analyze → rewrite
-  - Tracks detection scores over time (self-test with detectors)
-- [ ] Add `style_profiles` DB table
-- [ ] Add `content_quality` DB table (tracks detection scores, rewrites)
-- [ ] Integrate into all content-producing agents
+### Phase 3: Monero Integration (anonymous sweep to creator)
+- [ ] Create `src/monai/payments/monero_provider.py`
+  - Wallet RPC client (create wallet, get address, get balance)
+  - `send_transfer(dest_address, amount)` — actual XMR transaction
+  - `verify_incoming(tx_hash)` — confirm payment received
+  - Per-brand wallet generation (subaddresses)
+- [ ] Add `monero>=1.1.0` (monero-python) to pyproject.toml
+- [ ] Add `MoneroConfig` to config.py (wallet_rpc_url, wallet_rpc_port)
+- [ ] Tests: `tests/test_monero_provider.py`
 
-### Phase D: Multi-Channel Revenue Diversification
-- [ ] Create `ContentSiteAgent` (`src/monai/strategies/content_sites.py`)
-  - SEO blog creation and management
-  - Affiliate content with tracked links
-  - Targets low-competition long-tail keywords
-- [ ] Create `MicroSaaSAgent` (`src/monai/strategies/micro_saas.py`)
-  - Identifies micro-SaaS opportunities
-  - Uses Coder to build small tools/APIs
-  - Deploys on free tiers (Vercel, Railway, etc.)
-- [ ] Create `TelegramBotAgent` (`src/monai/strategies/telegram_bots.py`)
-  - Builds and deploys Telegram bots as paid services
-  - Targets specific niches (productivity, crypto, etc.)
-- [ ] Create `AffiliateAgent` (`src/monai/strategies/affiliate.py`)
-  - Review/comparison content for affiliate programs
-  - Targets high-commission niches
-- [ ] Register all new strategy agents with orchestrator
-- [ ] Update orchestrator to run Darwinian channel selection
+### Phase 4: Sweep Engine (automated brand → creator transfers)
+- [ ] Create `src/monai/payments/sweep_engine.py`
+  - `SweepEngine` class coordinating the full sweep flow
+  - Threshold-based triggers (sweep when balance > X EUR)
+  - Schedule-based triggers (sweep every N days)
+  - Full flow: check balance → convert to XMR if needed → send to creator wallet
+  - Retry logic with exponential backoff
+  - Status tracking (pending → mixing → completed / failed)
+- [ ] Wire `SweepEngine` into `BrandPayments.initiate_sweep()` and `complete_sweep()`
+- [ ] Tests: `tests/test_sweep_engine.py`
 
-### Phase E: Virtual Phone Provisioning
-- [ ] Create `PhoneProvisioner` (`src/monai/agents/phone_provisioner.py`)
-  - Integrates with SMS API services (TextVerified, SMSPool)
-  - Procures virtual numbers for platform signups
-  - Manages number lifecycle (acquire, use, release)
-  - Routes verification codes to requesting agents
-- [ ] Add `virtual_phones` DB table
-- [ ] Wire into provisioner flow
+### Phase 5: BTCPay Server Integration (self-hosted crypto payments)
+- [ ] Create `src/monai/payments/btcpay_provider.py`
+  - Create invoice (payment request)
+  - Webhook handler (InvoiceSettled, InvoicePaymentSettled)
+  - Balance check
+  - Supports BTC + optional Lightning Network
+- [ ] No external dependency needed (REST API via httpx)
+- [ ] Tests: `tests/test_btcpay_provider.py`
 
-### Phase F: Orchestrator Evolution
-- [ ] Add engineering team phase to cycle
-- [ ] Add Darwinian revenue optimization (shift resources to winners)
-- [ ] Add browser learning metrics to health checks
-- [ ] Add humanizer quality gate for all outbound content
-- [ ] Update cycle to support new agent teams
+### Phase 6: Platform Payout Integrations (Gumroad, LemonSqueezy)
+- [ ] Create `src/monai/payments/gumroad_provider.py`
+  - Webhook handler (sale, refund)
+  - Sales verification via API
+  - Payout tracking
+- [ ] Create `src/monai/payments/lemonsqueezy_provider.py`
+  - Webhook handler (order_created, subscription_payment_success)
+  - Order verification
+  - Payout tracking
+- [ ] Tests for both
+
+### Phase 7: Webhook Server (receives payment notifications)
+- [ ] Create `src/monai/payments/webhook_server.py`
+  - Lightweight HTTP server (using built-in or httpx/starlette)
+  - Routes: POST /webhooks/stripe, /webhooks/btcpay, /webhooks/gumroad, /webhooks/lemonsqueezy
+  - Signature verification per provider
+  - Dispatches to appropriate provider handler
+  - Logs all webhook events
+- [ ] Add webhook URL configuration to brand accounts
+
+### Phase 8: Wire into Orchestrator
+- [ ] Create `src/monai/payments/manager.py` — unified PaymentManager (replaces/extends old payments.py)
+  - Provider registry (register providers at startup)
+  - Sweep scheduling (APScheduler integration)
+  - Creator wallet configuration
+  - Payment link generation per brand
+- [ ] Wire into orchestrator cycle (new payment phase)
+- [ ] Update brand_payments.py to use real providers
+
+### Phase 9: Creator Wallet Config
+- [ ] Add `CreatorWalletConfig` to config.py
+  - `xmr_address: str` — creator's Monero receive address
+  - `btc_address: str` — fallback Bitcoin address
+  - `sweep_threshold_eur: float = 50.0` — minimum sweep amount
+  - `sweep_interval_hours: int = 24`
+- [ ] Add save/load support in Config
+
+### Phase 10: Integration Tests & Verification
+- [ ] End-to-end test: Stripe payment → record → sweep → Monero transfer
+- [ ] End-to-end test: BTCPay payment → record → sweep → Monero transfer
+- [ ] Verify all webhook signature verification works
+- [ ] Verify sweep engine handles failures gracefully
 
 ## Priority Order
-1. **Phase A** (Engineering Team) — enables self-healing, unblocks everything else
-2. **Phase C** (Humanizer) — quality moat, affects all revenue
-3. **Phase B** (Browser Learner) — unblocks platform signups
-4. **Phase D** (Revenue Channels) — diversified income
-5. **Phase E** (Phone Provisioner) — unblocks platform registration
-6. **Phase F** (Orchestrator Evolution) — ties it all together
+1. Phase 1 + 3 + 9 (abstraction + Monero + config) — core sweep capability
+2. Phase 4 (sweep engine) — automated transfers
+3. Phase 2 (Stripe) — most common payment method
+4. Phase 5 (BTCPay) — crypto-native customers
+5. Phase 7 (webhooks) — real-time payment notifications
+6. Phase 6 (platforms) — Gumroad/LemonSqueezy
+7. Phase 8 (orchestrator) — tie it all together
+8. Phase 10 (tests) — verify everything works
 
 ## Review
 <!-- Post-completion review -->

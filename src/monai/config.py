@@ -75,12 +75,43 @@ class CommsConfig:
 
 
 @dataclass
+class CreatorWalletConfig:
+    """Creator's anonymous wallet addresses for receiving swept profits."""
+    xmr_address: str = ""  # Primary: Monero receive address
+    btc_address: str = ""  # Fallback: Bitcoin receive address
+    sweep_threshold_eur: float = 50.0  # Min amount to trigger a sweep
+    sweep_interval_hours: int = 24  # How often to check for sweepable balances
+    min_confirmations_xmr: int = 10  # Wait for N confirmations
+    min_confirmations_btc: int = 3
+
+
+@dataclass
+class MoneroConfig:
+    """Monero wallet RPC connection for the brand wallets."""
+    wallet_rpc_url: str = "http://127.0.0.1:18082"
+    rpc_user: str = ""
+    rpc_password: str = ""
+    proxy_url: str = ""  # Route through Tor: socks5://127.0.0.1:9050
+
+
+@dataclass
+class BTCPayConfig:
+    """BTCPay Server for self-hosted crypto payment processing."""
+    server_url: str = ""  # https://btcpay.yourdomain.com
+    api_key: str = ""
+    store_id: str = ""
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     comms: CommsConfig = field(default_factory=CommsConfig)
     privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    creator_wallet: CreatorWalletConfig = field(default_factory=CreatorWalletConfig)
+    monero: MoneroConfig = field(default_factory=MoneroConfig)
+    btcpay: BTCPayConfig = field(default_factory=BTCPayConfig)
     initial_capital: float = 500.0  # €500 initial budget
     currency: str = "EUR"
     data_dir: Path = field(default_factory=lambda: CONFIG_DIR)
@@ -101,6 +132,12 @@ class Config:
                 config.privacy = PrivacyConfig(**data["privacy"])
             if "telegram" in data:
                 config.telegram = TelegramConfig(**data["telegram"])
+            if "creator_wallet" in data:
+                config.creator_wallet = CreatorWalletConfig(**data["creator_wallet"])
+            if "monero" in data:
+                config.monero = MoneroConfig(**data["monero"])
+            if "btcpay" in data:
+                config.btcpay = BTCPayConfig(**data["btcpay"])
             if "initial_capital" in data:
                 config.initial_capital = data["initial_capital"]
             if "currency" in data:
@@ -150,6 +187,23 @@ class Config:
                 "creator_chat_id": self.telegram.creator_chat_id,
                 "creator_username": self.telegram.creator_username,
                 "enabled": self.telegram.enabled,
+            },
+            "creator_wallet": {
+                "xmr_address": self.creator_wallet.xmr_address,
+                "btc_address": self.creator_wallet.btc_address,
+                "sweep_threshold_eur": self.creator_wallet.sweep_threshold_eur,
+                "sweep_interval_hours": self.creator_wallet.sweep_interval_hours,
+                "min_confirmations_xmr": self.creator_wallet.min_confirmations_xmr,
+                "min_confirmations_btc": self.creator_wallet.min_confirmations_btc,
+            },
+            "monero": {
+                "wallet_rpc_url": self.monero.wallet_rpc_url,
+                "rpc_user": self.monero.rpc_user,
+                "proxy_url": self.monero.proxy_url,
+            },
+            "btcpay": {
+                "server_url": self.btcpay.server_url,
+                "store_id": self.btcpay.store_id,
             },
             "initial_capital": self.initial_capital,
             "currency": self.currency,
