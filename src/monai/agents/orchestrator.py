@@ -26,6 +26,7 @@ from monai.agents.social_presence import SocialPresence
 from monai.agents.web_presence import WebPresence
 from monai.agents.identity import IdentityManager
 from monai.agents.legal import LegalAdvisorFactory
+from monai.agents.llc_provisioner import LLCProvisioner
 from monai.agents.phone_provisioner import PhoneProvisioner
 from monai.agents.provisioner import Provisioner
 from monai.agents.self_improve import SelfImprover
@@ -89,6 +90,7 @@ class Orchestrator(BaseAgent):
         self.brand_payments = BrandPayments(db)
         self.payment_manager = UnifiedPaymentManager(config, db)
         self.corporate = CorporateManager(db)
+        self.llc_provisioner = LLCProvisioner(config, db, llm)
         self._ensure_llc_setup()
         self.workflow_engine = WorkflowEngine(config, db, llm)
         self.task_router = TaskRouter(config, db, llm)
@@ -349,13 +351,43 @@ class Orchestrator(BaseAgent):
         if not self.telegram.has_token:
             needs.append("telegram_bot")
 
+        result: dict[str, Any] = {}
+
         if needs:
             self.log_action("provisioning", f"Need to set up: {needs}")
-            # Run provisioner
             result = self.provisioner.run()
-            return {"provisioned": needs, "result": result}
 
-        return {"status": "infrastructure_ok", "accounts": len(accounts)}
+        # LLC provisioning — runs if enabled but not yet complete
+        llc_status = self.llc_provisioner.get_provision_status()
+        if (self.config.llc.enabled
+                and llc_status.get("status") != "not_configured"
+                and llc_status.get("progress_pct", 0) < 100):
+            self.log_action("llc_provisioning",
+                            f"LLC at {llc_status.get('progress_pct', 0)}% — "
+                            f"current step: {llc_status.get('current_step', 'unknown')}")
+            llc_result = self.llc_provisioner.run()
+            result["llc"] = llc_result
+
+            # Notify creator of progress
+            if llc_result.get("status") == "completed":
+                self.notify_creator(
+                    f"LLC '{self.config.llc.entity_name}' fully provisioned! "
+                    f"Entity formed, EIN obtained, bank opened, Stripe connected."
+                )
+            else:
+                completed = sum(
+                    1 for s in llc_result.get("steps", {}).values()
+                    if s.get("status") == "completed"
+                )
+                self.notify_creator(
+                    f"LLC provisioning in progress: {completed}/8 steps done. "
+                    f"Will continue next cycle."
+                )
+
+        if not needs and "llc" not in result:
+            return {"status": "infrastructure_ok", "accounts": len(accounts)}
+
+        return {"provisioned": needs, "result": result}
 
     def discover_opportunities(self) -> list[dict[str, Any]]:
         """Discover new money-making opportunities."""
