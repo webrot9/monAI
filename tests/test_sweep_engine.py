@@ -36,23 +36,22 @@ def mock_db():
 class TestFlowDetection:
     def test_no_flow_configured(self, mock_config, mock_db):
         engine = SweepEngine(mock_config, mock_db)
-        # Mock corporate to return no entity
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = None
+        engine._corporate.get_all_entities.return_value = []
         assert engine.get_active_flow() == "none"
 
     def test_crypto_flow(self, mock_config, mock_db):
         mock_config.creator_wallet.xmr_address = "4" + "A" * 94
         engine = SweepEngine(mock_config, mock_db)
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = None
+        engine._corporate.get_all_entities.return_value = []
         assert engine.get_active_flow() == "crypto_xmr"
 
     def test_llc_flow_takes_priority(self, mock_config, mock_db):
         mock_config.creator_wallet.xmr_address = "4" + "A" * 94  # Both configured
         engine = SweepEngine(mock_config, mock_db)
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = {"id": 1, "name": "LLC"}
+        engine._corporate.get_all_entities.return_value = [{"id": 1, "name": "LLC"}]
         engine._corporate.get_active_contractor.return_value = {"id": 1, "alias": "Creator"}
         assert engine.get_active_flow() == "llc_contractor"
 
@@ -60,7 +59,7 @@ class TestFlowDetection:
         mock_config.creator_wallet.xmr_address = "4" + "A" * 94
         engine = SweepEngine(mock_config, mock_db)
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = {"id": 1, "name": "LLC"}
+        engine._corporate.get_all_entities.return_value = [{"id": 1, "name": "LLC"}]
         engine._corporate.get_active_contractor.return_value = None
         assert engine.get_active_flow() == "crypto_xmr"
 
@@ -69,20 +68,24 @@ class TestLLCSweepCycle:
     @pytest.mark.asyncio
     async def test_llc_sweep_cycle(self, mock_config, mock_db):
         engine = SweepEngine(mock_config, mock_db)
+        entity = {"id": 1, "name": "Holdings LLC"}
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = {
-            "id": 1, "name": "Holdings LLC",
-        }
+        engine._corporate.get_all_entities.return_value = [entity]
+        engine._corporate.get_primary_entity.return_value = entity
         engine._corporate.get_active_contractor.return_value = {
             "id": 1, "alias": "Creator",
         }
         engine._corporate.get_entity_brands.return_value = [
             {"brand": "saas_brand"},
         ]
-        engine._corporate.get_brand_entity.return_value = {"id": 1}
+        engine._corporate.get_brand_entity.return_value = entity
+        engine._corporate.get_expense_total.return_value = 0
+        engine._corporate.get_recurring_expenses.return_value = []
+        engine._corporate.get_overdue_obligations.return_value = []
         engine.brand_payments.get_all_brands_revenue = MagicMock(return_value=[
             {"brand": "saas_brand", "total_revenue": 500.0, "transactions": 10},
         ])
+        mock_config.llc.multi_llc = False
 
         # Mock no existing invoices
         mock_db.execute.return_value = []
@@ -95,16 +98,65 @@ class TestLLCSweepCycle:
     @pytest.mark.asyncio
     async def test_llc_sweep_no_entity(self, mock_config, mock_db):
         engine = SweepEngine(mock_config, mock_db)
+        entity = {"id": 1, "name": "LLC"}
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = {"id": 1, "name": "LLC"}
+        engine._corporate.get_all_entities.return_value = [entity]
+        engine._corporate.get_primary_entity.return_value = entity
         engine._corporate.get_active_contractor.return_value = {"id": 1, "alias": "X"}
-        # But _run_llc_sweep_cycle will find entity
         engine._corporate.get_entity_brands.return_value = []
+        engine._corporate.get_expense_total.return_value = 0
+        engine._corporate.get_recurring_expenses.return_value = []
+        engine._corporate.get_overdue_obligations.return_value = []
         engine.brand_payments.get_all_brands_revenue = MagicMock(return_value=[])
+        mock_config.llc.multi_llc = False
         mock_db.execute.return_value = []
 
         result = await engine.run_sweep_cycle()
         assert result["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_llc_sweep_with_expenses(self, mock_config, mock_db):
+        engine = SweepEngine(mock_config, mock_db)
+        entity = {"id": 1, "name": "Holdings LLC"}
+        engine._corporate = MagicMock()
+        engine._corporate.get_all_entities.return_value = [entity]
+        engine._corporate.get_primary_entity.return_value = entity
+        engine._corporate.get_active_contractor.return_value = {"id": 1, "alias": "Creator"}
+        engine._corporate.get_brand_entity.return_value = entity
+        engine._corporate.get_expense_total.return_value = 1500.0
+        engine._corporate.get_recurring_expenses.return_value = [
+            {"description": "AWS", "amount": 50.0},
+        ]
+        engine._corporate.get_overdue_obligations.return_value = []
+        engine.brand_payments.get_all_brands_revenue = MagicMock(return_value=[
+            {"brand": "brand_a", "total_revenue": 3000.0, "transactions": 20},
+        ])
+        mock_config.llc.multi_llc = False
+        mock_db.execute.return_value = []
+
+        result = await engine.run_sweep_cycle()
+        assert result["total_expenses_via_llc"] == 1500.0
+        assert result["recurring_expenses"] == 1
+
+    @pytest.mark.asyncio
+    async def test_llc_sweep_reports_overdue_tax(self, mock_config, mock_db):
+        engine = SweepEngine(mock_config, mock_db)
+        entity = {"id": 1, "name": "LLC"}
+        engine._corporate = MagicMock()
+        engine._corporate.get_all_entities.return_value = [entity]
+        engine._corporate.get_primary_entity.return_value = entity
+        engine._corporate.get_active_contractor.return_value = {"id": 1, "alias": "X"}
+        engine._corporate.get_expense_total.return_value = 0
+        engine._corporate.get_recurring_expenses.return_value = []
+        engine._corporate.get_overdue_obligations.return_value = [
+            {"obligation_type": "form_5472", "due_date": "2025-04-15", "jurisdiction": "US"},
+        ]
+        engine.brand_payments.get_all_brands_revenue = MagicMock(return_value=[])
+        mock_config.llc.multi_llc = False
+        mock_db.execute.return_value = []
+
+        result = await engine.run_sweep_cycle()
+        assert result["overdue_tax_obligations"] == 1
 
 
 class TestCryptoSweepCycle:
@@ -113,7 +165,7 @@ class TestCryptoSweepCycle:
         mock_config.creator_wallet.xmr_address = "4" + "A" * 94
         engine = SweepEngine(mock_config, mock_db)
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = None
+        engine._corporate.get_all_entities.return_value = []
 
         result = await engine.run_sweep_cycle()
         assert result["status"] == "error"
@@ -123,7 +175,7 @@ class TestCryptoSweepCycle:
     async def test_sweep_brand_no_wallet(self, mock_config, mock_db):
         engine = SweepEngine(mock_config, mock_db)
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = None
+        engine._corporate.get_all_entities.return_value = []
         mock_config.creator_wallet.xmr_address = ""
 
         result = await engine.sweep_brand("test")
@@ -133,7 +185,7 @@ class TestCryptoSweepCycle:
     async def test_sweep_brand_llc_mode(self, mock_config, mock_db):
         engine = SweepEngine(mock_config, mock_db)
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = {"id": 1, "name": "LLC"}
+        engine._corporate.get_all_entities.return_value = [{"id": 1, "name": "LLC"}]
         engine._corporate.get_active_contractor.return_value = {"id": 1, "alias": "X"}
 
         result = await engine.sweep_brand("test")
@@ -146,7 +198,7 @@ class TestNoFlowConfigured:
     async def test_sweep_cycle_no_config(self, mock_config, mock_db):
         engine = SweepEngine(mock_config, mock_db)
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = None
+        engine._corporate.get_all_entities.return_value = []
 
         result = await engine.run_sweep_cycle()
         assert result["status"] == "skipped"
@@ -157,7 +209,7 @@ class TestSweepSummary:
     def test_summary_no_flow(self, mock_config, mock_db):
         engine = SweepEngine(mock_config, mock_db)
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = None
+        engine._corporate.get_all_entities.return_value = []
         engine.brand_payments.get_total_swept = MagicMock(return_value=0)
         engine.brand_payments.get_sweep_history = MagicMock(return_value=[])
 
@@ -166,10 +218,14 @@ class TestSweepSummary:
 
     def test_summary_llc_flow(self, mock_config, mock_db):
         engine = SweepEngine(mock_config, mock_db)
+        entity = {"id": 1, "name": "Test LLC"}
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = {"id": 1, "name": "Test LLC"}
+        engine._corporate.get_all_entities.return_value = [entity]
+        engine._corporate.get_primary_entity.return_value = entity
         engine._corporate.get_active_contractor.return_value = {"id": 1, "alias": "Creator"}
         engine._corporate.get_total_paid_to_contractor.return_value = 5000.0
+        engine._corporate.get_expense_total.return_value = 1200.0
+        engine._corporate.get_overdue_obligations.return_value = []
         engine.brand_payments.get_total_swept = MagicMock(return_value=0)
         engine.brand_payments.get_sweep_history = MagicMock(return_value=[])
 
@@ -177,18 +233,61 @@ class TestSweepSummary:
         assert summary["active_flow"] == "llc_contractor"
         assert summary["llc_name"] == "Test LLC"
         assert summary["total_paid_to_contractor"] == 5000.0
+        assert summary["total_expenses_via_llc"] == 1200.0
+        assert summary["entities_count"] == 1
 
     def test_summary_crypto_flow(self, mock_config, mock_db):
         mock_config.creator_wallet.xmr_address = "4" + "X" * 94
         engine = SweepEngine(mock_config, mock_db)
         engine._corporate = MagicMock()
-        engine._corporate.get_primary_entity.return_value = None
+        engine._corporate.get_all_entities.return_value = []
         engine.brand_payments.get_total_swept = MagicMock(return_value=2.5)
         engine.brand_payments.get_sweep_history = MagicMock(return_value=[])
 
         summary = engine.get_sweep_summary()
         assert summary["active_flow"] == "crypto_xmr"
         assert "4XXX" in summary["creator_xmr_address"]
+
+
+class TestMultiLLCRotation:
+    def test_single_llc_uses_primary(self, mock_config, mock_db):
+        engine = SweepEngine(mock_config, mock_db)
+        entity = {"id": 1, "name": "Primary LLC"}
+        engine._corporate = MagicMock()
+        engine._corporate.get_all_entities.return_value = [entity]
+        engine._corporate.get_primary_entity.return_value = entity
+        mock_config.llc.multi_llc = False
+
+        target = engine._get_invoice_target_entity()
+        assert target["name"] == "Primary LLC"
+
+    def test_multi_llc_picks_least_invoiced(self, mock_config, mock_db):
+        engine = SweepEngine(mock_config, mock_db)
+        entity_a = {"id": 1, "name": "LLC A"}
+        entity_b = {"id": 2, "name": "LLC B"}
+        engine._corporate = MagicMock()
+        engine._corporate.get_all_entities.return_value = [entity_a, entity_b]
+        engine._corporate.get_active_contractor.return_value = {"id": 1, "alias": "Creator"}
+        mock_config.llc.multi_llc = True
+
+        # LLC A has 5 recent invoices, LLC B has 2
+        def mock_execute(query, params):
+            entity_id = params[0]
+            if entity_id == 1:
+                return [{"cnt": 5}]
+            return [{"cnt": 2}]
+        mock_db.execute = mock_execute
+
+        target = engine._get_invoice_target_entity()
+        assert target["name"] == "LLC B"
+
+    def test_multi_llc_no_entities(self, mock_config, mock_db):
+        engine = SweepEngine(mock_config, mock_db)
+        engine._corporate = MagicMock()
+        engine._corporate.get_all_entities.return_value = []
+        mock_config.llc.multi_llc = True
+
+        assert engine._get_invoice_target_entity() is None
 
 
 class TestHelpers:

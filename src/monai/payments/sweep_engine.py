@@ -9,6 +9,12 @@ Supports two flows:
         4. LLC pays contractor invoice via bank transfer
         5. Money arrives in creator's personal account
 
+        Mixed strategy: LLC also buys things for the creator (expenses).
+        Revenue is split: part as contractor invoices (P.IVA), part as LLC expenses.
+
+        Multi-LLC: if config.llc.multi_llc=True, invoices rotate across entities
+        to avoid suspicious single-client pattern.
+
     Flow B (Crypto — optional, for maximum anonymity):
         1. Check brand crypto wallet balance
         2. Send XMR to creator's wallet directly
@@ -82,8 +88,8 @@ class SweepEngine:
     def get_active_flow(self) -> str:
         """Determine which payout flow is active."""
         # LLC mode is primary if configured
-        entity = self.corporate.get_primary_entity()
-        if entity:
+        entities = self.corporate.get_all_entities()
+        for entity in entities:
             contractor = self.corporate.get_active_contractor(entity["id"])
             if contractor:
                 return "llc_contractor"
@@ -93,6 +99,42 @@ class SweepEngine:
             return "crypto_xmr"
 
         return "none"
+
+    def _get_invoice_target_entity(self) -> dict[str, Any] | None:
+        """Pick which LLC to invoice next (rotation for multi-LLC).
+
+        If multi_llc is enabled, rotates across entities to avoid
+        always invoicing the same one. Uses round-robin based on
+        recent invoice counts.
+        """
+        entities = self.corporate.get_all_entities()
+        if not entities:
+            return None
+
+        if not getattr(self.config, 'llc', None) or not self.config.llc.multi_llc:
+            # Single LLC mode — use primary
+            return self.corporate.get_primary_entity()
+
+        # Multi-LLC rotation: pick the entity with fewest recent invoices
+        entity_scores = []
+        for entity in entities:
+            contractor = self.corporate.get_active_contractor(entity["id"])
+            if not contractor:
+                continue
+            recent_invoices = self.db.execute(
+                "SELECT COUNT(*) as cnt FROM contractor_invoices "
+                "WHERE entity_id = ? AND created_at > datetime('now', '-6 months')",
+                (entity["id"],),
+            )
+            count = recent_invoices[0]["cnt"] if recent_invoices else 0
+            entity_scores.append((count, entity))
+
+        if not entity_scores:
+            return self.corporate.get_primary_entity()
+
+        # Pick the one with fewest recent invoices
+        entity_scores.sort(key=lambda x: x[0])
+        return entity_scores[0][1]
 
     # ── LLC + Contractor Flow ──────────────────────────────────
 
@@ -116,27 +158,32 @@ class SweepEngine:
 
         This doesn't move money — it tracks what platforms already moved
         and generates invoices for the contractor payment.
+
+        Mixed strategy: revenue splits between LLC expenses (tax-free for
+        creator) and contractor invoices (P.IVA income).
+        Multi-LLC: rotates invoice target across entities.
         """
-        entity = self.corporate.get_primary_entity()
+        # Pick which entity to invoice (rotation if multi-LLC)
+        entity = self._get_invoice_target_entity()
         if not entity:
-            return {"status": "error", "reason": "no_primary_entity"}
+            return {"status": "error", "reason": "no_entity_with_contractor"}
 
         contractor = self.corporate.get_active_contractor(entity["id"])
         if not contractor:
             return {"status": "error", "reason": "no_active_contractor"}
 
-        # Track platform payouts for all brands under this entity
-        brands = self.corporate.get_entity_brands(entity["id"])
-        platform_payouts_tracked = 0
-
+        # Aggregate revenue across ALL entities (not just the target)
+        all_entities = self.corporate.get_all_entities()
         all_revenue = self.brand_payments.get_all_brands_revenue()
         brand_revenues = []
 
         for brand_data in all_revenue:
             brand = brand_data["brand"]
-            # Check if this brand belongs to our entity
             brand_entity = self.corporate.get_brand_entity(brand)
-            if not brand_entity or brand_entity["id"] != entity["id"]:
+            if not brand_entity:
+                continue
+            # Only count brands belonging to any of our entities
+            if brand_entity["id"] not in {e["id"] for e in all_entities}:
                 continue
 
             revenue = brand_data["total_revenue"]
@@ -145,22 +192,50 @@ class SweepEngine:
                     "brand": brand,
                     "revenue": revenue,
                     "transactions": brand_data["transactions"],
+                    "entity_id": brand_entity["id"],
                 })
+
+        # Expense summary
+        total_expenses = sum(
+            self.corporate.get_expense_total(e["id"]) for e in all_entities
+        )
+        recurring_expenses = []
+        for e in all_entities:
+            recurring_expenses.extend(self.corporate.get_recurring_expenses(e["id"]))
 
         # Check if it's time to generate a contractor invoice
         invoice_result = self._maybe_generate_invoice(
             contractor, entity, brand_revenues
         )
 
-        return {
+        # Check overdue tax obligations
+        overdue = self.corporate.get_overdue_obligations()
+
+        result: dict[str, Any] = {
             "flow": "llc_contractor",
             "entity": entity["name"],
             "contractor": contractor["alias"],
             "brands_tracked": len(brand_revenues),
             "total_revenue": sum(br["revenue"] for br in brand_revenues),
+            "total_expenses_via_llc": total_expenses,
+            "recurring_expenses": len(recurring_expenses),
             "invoice": invoice_result,
             "status": "ok",
         }
+
+        if len(all_entities) > 1:
+            result["multi_llc"] = True
+            result["entities_count"] = len(all_entities)
+
+        if overdue:
+            result["overdue_tax_obligations"] = len(overdue)
+            result["overdue_details"] = [
+                {"type": o["obligation_type"], "due": o["due_date"],
+                 "jurisdiction": o["jurisdiction"]}
+                for o in overdue
+            ]
+
+        return result
 
     def _maybe_generate_invoice(self, contractor: dict, entity: dict,
                                 brand_revenues: list[dict]) -> dict[str, Any]:
@@ -472,12 +547,20 @@ class SweepEngine:
         }
 
         if flow == "llc_contractor":
+            entities = self.corporate.get_all_entities()
             entity = self.corporate.get_primary_entity()
             if entity:
                 contractor = self.corporate.get_active_contractor(entity["id"])
                 summary["llc_name"] = entity["name"]
                 summary["contractor_alias"] = contractor["alias"] if contractor else "NOT SET"
                 summary["total_paid_to_contractor"] = self.corporate.get_total_paid_to_contractor()
+                summary["total_expenses_via_llc"] = sum(
+                    self.corporate.get_expense_total(e["id"]) for e in entities
+                )
+                summary["entities_count"] = len(entities)
+                overdue = self.corporate.get_overdue_obligations()
+                if overdue:
+                    summary["overdue_tax_obligations"] = len(overdue)
         elif flow == "crypto_xmr":
             addr = self.config.creator_wallet.xmr_address
             summary["creator_xmr_address"] = addr[:12] + "..." if addr else "NOT SET"

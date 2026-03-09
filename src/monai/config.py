@@ -101,6 +101,10 @@ class LLCConfig:
     contractor_rate_percentage: float = 90.0  # 90% of revenue to contractor
     contractor_rate_amount: float = 0.0  # Fixed amount if monthly
     contractor_payment_method: str = "bank_transfer"
+    contractor_tax_id: str = ""  # Creator's P.IVA or codice fiscale
+    contractor_tax_regime: str = "forfettario"  # forfettario, ordinario, occasionale
+    multi_llc: bool = False  # Rotate invoicing across multiple LLCs
+    expense_budget_monthly: float = 0.0  # Monthly expense budget via LLC (0=no limit)
 
 
 @dataclass
