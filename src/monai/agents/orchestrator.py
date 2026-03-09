@@ -22,6 +22,7 @@ from monai.agents.finance_expert import FinanceExpert
 from monai.agents.humanizer import Humanizer
 from monai.agents.marketing_team import MarketingTeam
 from monai.agents.research_team import ResearchTeam
+from monai.agents.social_presence import SocialPresence
 from monai.agents.identity import IdentityManager
 from monai.agents.legal import LegalAdvisorFactory
 from monai.agents.phone_provisioner import PhoneProvisioner
@@ -75,6 +76,7 @@ class Orchestrator(BaseAgent):
         self.finance_expert = FinanceExpert(config, db, llm, commercialista=self.commercialista)
         self.research_team = ResearchTeam(config, db, llm)
         self.marketing_team = MarketingTeam(config, db, llm)
+        self.social_presence = SocialPresence(config, db, llm)
         self.workflow_engine = WorkflowEngine(config, db, llm)
         self.task_router = TaskRouter(config, db, llm)
         # Register utility agents with workflow engine
@@ -82,6 +84,7 @@ class Orchestrator(BaseAgent):
         self.workflow_engine.register_agent("finance_expert", self.finance_expert)
         self.workflow_engine.register_agent("research_team", self.research_team)
         self.workflow_engine.register_agent("marketing_team", self.marketing_team)
+        self.workflow_engine.register_agent("social_presence", self.social_presence)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
     def register_strategy(self, agent: BaseAgent):
@@ -242,10 +245,11 @@ class Orchestrator(BaseAgent):
         # Phase 6.5: Self-improvement — analyze and improve agents
         cycle_result["self_improvement"] = self._run_self_improvement()
 
-        # Phase 6.6: Finance + Research + Marketing teams
+        # Phase 6.6: Finance + Research + Marketing + Social teams
         cycle_result["finance_analysis"] = self._run_finance_expert()
         cycle_result["market_research"] = self._run_market_research()
         cycle_result["marketing"] = self._run_marketing_team()
+        cycle_result["social_presence"] = self._run_social_presence()
 
         # Phase 6.7: Engineering team — self-healing bug fixes
         cycle_result["engineering"] = self._run_engineering_team()
@@ -819,6 +823,18 @@ class Orchestrator(BaseAgent):
             return result
         except Exception as e:
             logger.error(f"Marketing team failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def _run_social_presence(self) -> dict[str, Any]:
+        """Run social media presence — every 2 cycles."""
+        if self._cycle % 2 != 0:
+            return {"status": "skipped", "reason": "not_social_cycle"}
+        try:
+            result = self.social_presence.run()
+            self.log_action("social_presence", json.dumps(result, default=str)[:500])
+            return result
+        except Exception as e:
+            logger.error(f"Social presence failed: {e}")
             return {"status": "error", "error": str(e)}
 
     def request_research(self, topic: str) -> dict[str, Any]:

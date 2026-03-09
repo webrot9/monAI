@@ -66,6 +66,7 @@ DEFAULT_CAPABILITIES: dict[str, list[str]] = {
     "finance_expert": ["finance", "investment", "roi_analysis", "forecasting", "budgeting"],
     "research_team": ["market_research", "trend_analysis", "competitor_analysis", "niche_discovery"],
     "marketing_team": ["marketing", "campaigns", "growth", "content_marketing", "outreach"],
+    "social_presence": ["social_posts", "brand_building", "community_engagement", "social_media"],
 }
 
 # Task type → capabilities needed
