@@ -65,6 +65,16 @@
 - **Root cause**: Assumed it was obvious
 - **Rule**: Agents must NEVER visit, register on, or interact with illegal websites (dark web marketplaces, piracy sites, etc.). NEVER engage in illegal activities. Everything must be legal in the creator's jurisdiction. When in doubt, don't act. This is absolute and non-negotiable.
 
+### 2026-03-09 - Every activity gets a Legal Advisor — no exceptions
+- **Mistake**: Agents could start activities without checking legality
+- **Root cause**: No mandatory legal review step
+- **Rule**: Every new strategy, platform registration, client engagement, or financial operation spawns a Legal Advisor that reviews ALL legal aspects BEFORE the activity proceeds. The Legal Advisor researches jurisdiction-specific requirements (EU), identifies blockers, and provides step-by-step guidance. If the advisor blocks an activity, it's BLOCKED — no exceptions. This is automatic, not optional.
+
+### 2026-03-09 - Agents collaborate — request help from each other
+- **Mistake**: Agents operated in silos without leveraging each other's skills
+- **Root cause**: No structured collaboration mechanism
+- **Rule**: Agents can and should request help from each other via the collaboration hub. Skills: legal, marketing, design, code, research, finance, content, devops. Every agent must comply with requests from other agents (within ethics/budget). Agents share knowledge. Collaboration is tracked and auditable. Legal requests auto-spawn a Legal Advisor.
+
 ### 2026-03-08 - Initial budget €500, currency EUR, self-funded after that
 - **Mistake**: Used USD, no initial budget set, no self-sustainability requirement
 - **Root cause**: Didn't ask about budget and currency

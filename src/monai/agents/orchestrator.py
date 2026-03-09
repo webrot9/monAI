@@ -14,8 +14,10 @@ from datetime import datetime
 from typing import Any
 
 from monai.agents.base import BaseAgent
+from monai.agents.collaboration import CollaborationHub
 from monai.agents.ethics_test import EthicsTester
 from monai.agents.identity import IdentityManager
+from monai.agents.legal import LegalAdvisorFactory
 from monai.agents.provisioner import Provisioner
 from monai.agents.self_improve import SelfImprover
 from monai.agents.spawner import AgentSpawner
@@ -54,6 +56,8 @@ class Orchestrator(BaseAgent):
         self.telegram = TelegramBot(config, db)
         self.ethics_tester = EthicsTester(config, db, llm)
         self.self_improver = SelfImprover(config, db, llm)
+        self.legal = LegalAdvisorFactory(config, db, llm)
+        self.collab = CollaborationHub(config, db)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
     def register_strategy(self, agent: BaseAgent):
@@ -152,6 +156,9 @@ class Orchestrator(BaseAgent):
 
         # Phase 0.5: Process inter-agent requests (help requests, handoffs)
         cycle_result["collaboration"] = self._process_agent_requests()
+
+        # Phase 0.6: Process collaboration hub (help requests between agents)
+        cycle_result["help_requests"] = self._process_help_requests()
 
         # Phase 1: Self-check — do I have what I need?
         cycle_result["provisioning"] = self._ensure_infrastructure()
@@ -316,6 +323,14 @@ class Orchestrator(BaseAgent):
         elif action == "follow_up_clients":
             return self._follow_up_clients()
         elif "provision" in action.lower() or "register" in action.lower():
+            # Legal review for platform registrations
+            legal_result = self.legal.assess_activity(
+                activity_name=action[:30].lower().replace(" ", "_"),
+                activity_type="registration",
+                description=action,
+            )
+            if legal_result["status"] == "blocked":
+                return f"BLOCKED by legal advisor: {action}"
             result = self.provisioner.run()
             return json.dumps(result, default=str)[:500]
         elif "marketing" in action.lower() or "outreach" in action.lower():
@@ -324,20 +339,39 @@ class Orchestrator(BaseAgent):
             return f"Action '{action}' queued"
 
     def _start_new_strategy(self, opportunity: dict) -> str:
-        """Automatically start a new strategy from a discovered opportunity."""
+        """Automatically start a new strategy from a discovered opportunity.
+
+        Every new strategy gets a Legal Advisor that reviews legality
+        BEFORE the strategy is activated.
+        """
         name = opportunity.get("name", "").lower().replace(" ", "_")[:30]
         existing = self.db.execute("SELECT id FROM strategies WHERE name = ?", (name,))
         if existing:
             return f"Strategy {name} already exists"
 
+        # LEGAL REVIEW FIRST — every activity gets a legal advisor
+        legal_result = self.legal.assess_activity(
+            activity_name=name,
+            activity_type="strategy",
+            description=opportunity.get("description", name),
+            requesting_agent="orchestrator",
+        )
+
+        if legal_result["status"] == "blocked":
+            self.log_action("strategy_blocked_legal", name,
+                            json.dumps(legal_result, default=str)[:500])
+            return f"Strategy {name} BLOCKED by legal advisor: {legal_result.get('blockers_count', 0)} blockers"
+
+        # Legal review passed or needs_review — proceed with caution
         self.db.execute_insert(
             "INSERT INTO strategies (name, category, description, allocated_budget) VALUES (?, ?, ?, ?)",
             (name, opportunity.get("category", "misc"),
              opportunity.get("description", ""),
              min(opportunity.get("startup_cost", 10), self.config.risk.max_monthly_spend_new_strategy)),
         )
-        self.log_action("start_strategy", name, json.dumps(opportunity, default=str)[:500])
-        return f"Started new strategy: {name}"
+        self.log_action("start_strategy", name,
+                        json.dumps({**opportunity, "legal_status": legal_result["status"]}, default=str)[:500])
+        return f"Started new strategy: {name} (legal: {legal_result['status']})"
 
     def _rebalance(self) -> str:
         pnl = self.finance.get_strategy_pnl()
@@ -436,6 +470,74 @@ class Orchestrator(BaseAgent):
         kb_stats = self.memory.get_knowledge_summary()
         if kb_stats:
             self.journal("learn", f"Knowledge base: {json.dumps(kb_stats)}")
+
+    def _process_help_requests(self) -> dict[str, Any]:
+        """Process open help requests from the collaboration hub."""
+        open_requests = self.collab.get_open_requests()
+        processed = []
+
+        for req in open_requests:
+            skill = req["skill_needed"]
+
+            # Legal requests → auto-spawn legal advisor
+            if skill == "legal":
+                self.collab.claim_request(req["id"], "legal_advisor")
+                self.collab.start_work(req["id"])
+
+                context = json.loads(req.get("context", "{}"))
+                legal_result = self.legal.assess_activity(
+                    activity_name=context.get("activity_name", req["task_description"][:30]),
+                    activity_type=context.get("activity_type", "strategy"),
+                    description=req["task_description"],
+                    requesting_agent=req["requesting_agent"],
+                )
+
+                self.collab.complete_request(req["id"], json.dumps(legal_result, default=str))
+                processed.append({
+                    "id": req["id"],
+                    "skill": skill,
+                    "handler": "legal_advisor",
+                    "status": legal_result["status"],
+                })
+
+            else:
+                # Route to appropriate sub-agent or queue for next cycle
+                subagent_tasks = [{
+                    "name": f"help_{skill}_{req['id']}",
+                    "task": req["task_description"],
+                }]
+                self.collab.claim_request(req["id"], f"subagent_{skill}")
+                self.collab.start_work(req["id"])
+
+                try:
+                    loop = asyncio.new_event_loop()
+                    try:
+                        results = loop.run_until_complete(
+                            self.spawner.run_parallel(subagent_tasks, max_steps=20)
+                        )
+                    finally:
+                        loop.close()
+
+                    task_name = subagent_tasks[0]["name"]
+                    result = results.get(task_name, {})
+                    if result.get("status") == "completed":
+                        self.collab.complete_request(
+                            req["id"], json.dumps(result, default=str)[:2000]
+                        )
+                    else:
+                        self.collab.fail_request(
+                            req["id"], result.get("error", "Task did not complete")
+                        )
+                except Exception as e:
+                    self.collab.fail_request(req["id"], str(e))
+
+                processed.append({
+                    "id": req["id"],
+                    "skill": skill,
+                    "handler": f"subagent_{skill}",
+                })
+
+        return {"processed": len(processed), "details": processed}
 
     def _handle_telegram(self) -> dict[str, Any]:
         """Process Telegram updates and handle creator communication."""

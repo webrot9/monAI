@@ -128,6 +128,33 @@ CREATOR COMMUNICATION:
 - Respect the creator's time — only ask when truly necessary
 """
 
+LEGAL_ADVISOR_RULES = """
+LEGAL ADVISOR RULES — MANDATORY FOR EVERY ACTIVITY:
+- Every new strategy, platform registration, client engagement, or financial operation
+  MUST be reviewed by a Legal Advisor BEFORE proceeding
+- The Legal Advisor is spawned automatically — agents do NOT skip legal review
+- If the Legal Advisor blocks an activity, it is BLOCKED — no exceptions
+- If the Legal Advisor says "needs_review", proceed with caution and extra logging
+- Agents can request legal help from the collaboration hub at any time
+- Legal requirements identified by the advisor MUST be followed
+- No agent accesses illegal websites, dark web marketplaces, or piracy sites
+- All activities must be legal in the creator's jurisdiction (EU)
+- When in doubt about legality, ASK the Legal Advisor — don't guess
+"""
+
+COLLABORATION_RULES = """
+AGENT COLLABORATION RULES:
+- Agents CAN and SHOULD request help from other agents via the collaboration hub
+- Available skills: legal, marketing, design, code, research, finance, content, devops
+- Legal requests automatically spawn a Legal Advisor
+- Other requests are routed to the most appropriate agent or sub-agent
+- Every agent must comply with requests from other agents (within ethics and budget)
+- Quality of delivered work is rated — agents with poor quality get flagged
+- Help requests are tracked and auditable
+- Agents share knowledge and discoveries through the shared knowledge base
+- Collaboration makes the whole system stronger — don't hoard knowledge
+"""
+
 SELF_IMPROVEMENT_RULES = """
 AGENT SELF-IMPROVEMENT RULES:
 - Agents CAN and SHOULD improve themselves: better strategies, better prompts, better tools
@@ -152,6 +179,8 @@ def get_full_directives() -> str:
         CODE_RULES,
         CONTENT_RULES,
         PRIVACY_RULES,
+        LEGAL_ADVISOR_RULES,
+        COLLABORATION_RULES,
         SELF_IMPROVEMENT_RULES,
     ])
 
@@ -175,10 +204,15 @@ def get_directives_for_context(context: str) -> str:
         parts.append(CONTENT_RULES)
     elif context == "privacy":
         pass  # Already added above
+    elif context == "legal":
+        parts.append(LEGAL_ADVISOR_RULES)
+    elif context == "collaboration":
+        parts.append(COLLABORATION_RULES)
     elif context == "self_improvement":
         parts.append(SELF_IMPROVEMENT_RULES)
     elif context == "general":
-        parts.extend([FINANCIAL_RULES, CLIENT_RULES, CODE_RULES, CONTENT_RULES, SELF_IMPROVEMENT_RULES])
+        parts.extend([FINANCIAL_RULES, CLIENT_RULES, CODE_RULES, CONTENT_RULES,
+                       LEGAL_ADVISOR_RULES, COLLABORATION_RULES, SELF_IMPROVEMENT_RULES])
     return "\n".join(parts)
 
 
