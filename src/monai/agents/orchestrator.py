@@ -32,6 +32,9 @@ from monai.business.risk import RiskManager
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.llm import LLM, get_cost_tracker
+from monai.workflows.engine import WorkflowEngine
+from monai.workflows.pipelines import get_pipeline, list_pipelines, PIPELINE_REGISTRY
+from monai.workflows.router import TaskRouter
 from monai.utils.privacy import get_anonymizer
 from monai.utils.resources import check_resources
 from monai.utils.sandbox import PROJECT_ROOT
@@ -66,10 +69,15 @@ class Orchestrator(BaseAgent):
         self.humanizer = Humanizer(config, db, llm)
         self.browser_learner = BrowserLearner(config, db, llm)
         self.phone_provisioner = PhoneProvisioner(config, db, llm)
+        self.workflow_engine = WorkflowEngine(config, db, llm)
+        self.task_router = TaskRouter(config, db, llm)
+        # Register utility agents with workflow engine
+        self.workflow_engine.register_agent("humanizer", self.humanizer)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
     def register_strategy(self, agent: BaseAgent):
         self._strategy_agents[agent.name] = agent
+        self.workflow_engine.register_agent(agent.name, agent)
         self.log_action("register_strategy", f"Registered: {agent.name}")
 
     def plan(self) -> list[str]:
@@ -215,6 +223,12 @@ class Orchestrator(BaseAgent):
 
         # Phase 6: Run registered strategy agents
         cycle_result["strategy_results"] = self._run_strategies()
+
+        # Phase 6.3: Run workflow pipelines (if any are scheduled)
+        cycle_result["workflows"] = self._run_scheduled_workflows()
+
+        # Phase 6.4: Process task queue (route unassigned tasks)
+        cycle_result["task_routing"] = self._process_task_queue()
 
         # Phase 6.5: Self-improvement — analyze and improve agents
         cycle_result["self_improvement"] = self._run_self_improvement()
@@ -709,6 +723,48 @@ class Orchestrator(BaseAgent):
     def get_phone_number(self, platform: str, requesting_agent: str) -> dict[str, Any]:
         """Get a virtual phone number for platform signup. Available to all agents."""
         return self.phone_provisioner.get_number(platform, requesting_agent)
+
+    def run_pipeline(self, pipeline_name: str, context: dict | None = None) -> dict[str, Any]:
+        """Run a named pipeline. Available to all agents and the orchestrator."""
+        pipeline = get_pipeline(pipeline_name)
+        if not pipeline:
+            return {"status": "error", "reason": f"Pipeline '{pipeline_name}' not found"}
+        return self.workflow_engine.execute(pipeline, context)
+
+    def route_task(self, task: str, task_type: str = "",
+                   priority: int = 5) -> dict[str, Any]:
+        """Route a task to the best agent. Available to all agents."""
+        return self.task_router.route(task, task_type, priority)
+
+    def _run_scheduled_workflows(self) -> dict[str, Any]:
+        """Run any scheduled workflow pipelines."""
+        # Every 5 cycles, run the revenue diversification pipeline
+        if self._cycle % 5 == 0:
+            try:
+                pipeline = get_pipeline("revenue_diversification")
+                if pipeline:
+                    result = self.workflow_engine.execute(pipeline)
+                    self.log_action("workflow_pipeline", "revenue_diversification",
+                                    json.dumps(result, default=str)[:500])
+                    return {"revenue_diversification": result}
+            except Exception as e:
+                logger.error(f"Revenue diversification pipeline failed: {e}")
+                return {"error": str(e)}
+        return {"status": "skipped", "reason": "not_workflow_cycle"}
+
+    def _process_task_queue(self) -> dict[str, Any]:
+        """Process any unrouted tasks in the queue."""
+        queued = self.task_router.get_queue("queued")
+        routed = 0
+        for task in queued[:10]:  # Process up to 10 per cycle
+            result = self.task_router.route(
+                task["task_description"],
+                task.get("task_type", ""),
+                task.get("priority", 5),
+            )
+            if result.get("routed_to"):
+                routed += 1
+        return {"queued": len(queued), "routed": routed}
 
     def _run_strategies(self) -> dict[str, Any]:
         results = {}
