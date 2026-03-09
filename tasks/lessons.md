@@ -40,6 +40,11 @@
 - **Root cause**: No sandbox enforcement
 - **Rule**: Agents can ONLY read/write within the monAI project directory and ~/.monai data directory. NOTHING else on the creator's computer. No reading personal files, no modifying system files, no accessing other projects. This is ABSOLUTE. Also monitor memory/CPU usage — never degrade the creator's computer.
 
+### 2026-03-09 - Complete anonymity — agents must be untraceable
+- **Mistake**: All network traffic went directly from the creator's IP
+- **Root cause**: No proxy/anonymization layer in the architecture
+- **Rule**: Agents must be COMPLETELY untraceable and NOT attributable to the creator. ALL network traffic (HTTP, browser, SMTP, DNS) must go through Tor or a SOCKS5 proxy. The creator's real IP must NEVER be exposed. Browser fingerprints must be randomized per session (user-agent, viewport, timezone, locale). WebRTC must be disabled to prevent IP leaks. Metadata must be stripped from all generated files (EXIF, PDF producer/creator). Tor circuits must be rotated to prevent traffic correlation. Anonymity must be VERIFIED before any network operation starts. If anonymity cannot be confirmed, all operations HALT.
+
 ### 2026-03-08 - Initial budget €500, currency EUR, self-funded after that
 - **Mistake**: Used USD, no initial budget set, no self-sustainability requirement
 - **Root cause**: Didn't ask about budget and currency

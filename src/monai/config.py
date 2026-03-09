@@ -36,6 +36,22 @@ class LLMConfig:
 
 
 @dataclass
+class PrivacyConfig:
+    """Network anonymization — agents must be completely untraceable."""
+    proxy_type: str = "tor"  # tor, socks5, http, none
+    tor_socks_port: int = 9050
+    tor_control_port: int = 9051
+    tor_password: str = ""  # For Tor control protocol (circuit renewal)
+    socks5_proxy: str = ""  # socks5://host:port (when not using Tor)
+    http_proxy: str = ""  # http://host:port (fallback)
+    rotate_user_agent: bool = True
+    strip_metadata: bool = True  # Strip EXIF, PDF metadata from all output
+    dns_over_proxy: bool = True  # Route DNS through proxy to prevent leaks
+    verify_anonymity: bool = True  # Check real IP is hidden before operations
+    max_requests_per_circuit: int = 50  # Rotate Tor circuit after N requests
+
+
+@dataclass
 class CommsConfig:
     smtp_host: str = ""
     smtp_port: int = 587
@@ -54,6 +70,7 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     comms: CommsConfig = field(default_factory=CommsConfig)
+    privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
     initial_capital: float = 500.0  # €500 initial budget
     currency: str = "EUR"
     data_dir: Path = field(default_factory=lambda: CONFIG_DIR)
@@ -70,6 +87,8 @@ class Config:
                 config.risk = RiskConfig(**data["risk"])
             if "comms" in data:
                 config.comms = CommsConfig(**data["comms"])
+            if "privacy" in data:
+                config.privacy = PrivacyConfig(**data["privacy"])
             if "initial_capital" in data:
                 config.initial_capital = data["initial_capital"]
             if "currency" in data:
@@ -101,6 +120,18 @@ class Config:
                 "imap_port": self.comms.imap_port,
                 "from_name": self.comms.from_name,
                 "from_email": self.comms.from_email,
+            },
+            "privacy": {
+                "proxy_type": self.privacy.proxy_type,
+                "tor_socks_port": self.privacy.tor_socks_port,
+                "tor_control_port": self.privacy.tor_control_port,
+                "socks5_proxy": self.privacy.socks5_proxy,
+                "http_proxy": self.privacy.http_proxy,
+                "rotate_user_agent": self.privacy.rotate_user_agent,
+                "strip_metadata": self.privacy.strip_metadata,
+                "dns_over_proxy": self.privacy.dns_over_proxy,
+                "verify_anonymity": self.privacy.verify_anonymity,
+                "max_requests_per_circuit": self.privacy.max_requests_per_circuit,
             },
             "initial_capital": self.initial_capital,
             "currency": self.currency,

@@ -3,6 +3,9 @@
 Uses Playwright for full browser control: navigate, click, type, screenshot,
 extract content. This is how monAI registers on platforms, manages accounts,
 and interacts with any website autonomously.
+
+ALL traffic routed through proxy (Tor/SOCKS5) for complete anonymity.
+Browser fingerprint randomized per session to prevent tracking.
 """
 
 from __future__ import annotations
@@ -14,12 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from monai.config import Config
+from monai.utils.privacy import get_anonymizer
 
 logger = logging.getLogger(__name__)
 
 
 class Browser:
-    """Autonomous browser that monAI uses to interact with the web."""
+    """Autonomous browser — all traffic proxied, fingerprint randomized."""
 
     def __init__(self, config: Config, headless: bool = True):
         self.config = config
@@ -27,21 +31,66 @@ class Browser:
         self._playwright = None
         self._browser = None
         self._context = None
+        self._anonymizer = get_anonymizer(config)
         self.screenshots_dir = config.data_dir / "screenshots"
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
 
     async def start(self):
         from playwright.async_api import async_playwright
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=self.headless)
+
+        # Launch with proxy — all traffic routed through Tor/SOCKS5
+        launch_args = {"headless": self.headless}
+        proxy_config = self._anonymizer.get_browser_proxy()
+        if proxy_config:
+            launch_args["proxy"] = proxy_config
+            logger.info(f"Browser proxy: {proxy_config['server']}")
+
+        self._browser = await self._playwright.chromium.launch(**launch_args)
+
+        # Randomized fingerprint — prevents cross-session tracking
+        fp = self._anonymizer.get_browser_fingerprint()
         self._context = await self._browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
+            viewport=fp["viewport"],
+            user_agent=fp["user_agent"],
+            timezone_id=fp["timezone_id"],
+            locale=fp["locale"],
+            color_scheme=fp["color_scheme"],
+            device_scale_factor=fp["device_scale_factor"],
+            permissions=[],  # Block all permissions (geolocation, notifications, etc.)
         )
-        logger.info("Browser started")
+
+        # Inject anti-fingerprinting scripts
+        await self._context.add_init_script("""
+            // Disable WebRTC to prevent real IP leak via STUN/TURN
+            Object.defineProperty(navigator, 'mediaDevices', { get: () => undefined });
+            window.RTCPeerConnection = undefined;
+            window.RTCSessionDescription = undefined;
+            window.RTCIceCandidate = undefined;
+            window.webkitRTCPeerConnection = undefined;
+            // Normalize hardware fingerprint
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+            // Prevent canvas fingerprinting
+            const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = function(type) {
+                const ctx = this.getContext('2d');
+                if (ctx) {
+                    const imgData = ctx.getImageData(0, 0, this.width, this.height);
+                    for (let i = 0; i < imgData.data.length; i += 4) {
+                        imgData.data[i] ^= 1;  // Tiny noise, invisible but breaks fingerprint
+                    }
+                    ctx.putImageData(imgData, 0, 0);
+                }
+                return origToDataURL.call(this, type);
+            };
+        """)
+
+        logger.info(
+            f"Browser started (proxy={'yes' if proxy_config else 'no'}, "
+            f"tz={fp['timezone_id']}, locale={fp['locale']})"
+        )
 
     async def stop(self):
         if self._browser:
@@ -52,6 +101,7 @@ class Browser:
 
     async def navigate(self, url: str, wait_for: str = "domcontentloaded") -> str:
         page = await self._get_page()
+        self._anonymizer.maybe_rotate()  # Maybe rotate Tor circuit
         await page.goto(url, wait_until=wait_for)
         logger.info(f"Navigated to {url}")
         return await page.content()
@@ -60,6 +110,8 @@ class Browser:
         page = await self._get_page()
         path = self.screenshots_dir / f"{name}.png"
         await page.screenshot(path=str(path), full_page=True)
+        # Strip metadata from screenshot
+        self._anonymizer.strip_file_metadata(path)
         logger.info(f"Screenshot saved: {path}")
         return path
 

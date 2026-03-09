@@ -91,9 +91,16 @@ class TestGetDirectivesForContext:
         assert "CODE GENERATION RULES" in text
         assert "CONTENT GENERATION RULES" in text
 
-    def test_unknown_context_returns_core_only(self):
+    def test_privacy_always_included(self):
+        # Privacy rules are injected into EVERY context — non-negotiable
+        for ctx in ["financial", "client", "code", "content", "general", "unknown"]:
+            text = get_directives_for_context(ctx)
+            assert "CREATOR ANONYMITY & AGENT IDENTITY RULES" in text
+
+    def test_unknown_context_returns_core_and_privacy_only(self):
         text = get_directives_for_context("unknown")
         assert "CORE DIRECTIVES" in text
+        assert "CREATOR ANONYMITY & AGENT IDENTITY RULES" in text
         assert "FINANCIAL RULES" not in text
 
 
@@ -105,3 +112,4 @@ class TestGetFullDirectives:
         assert "CLIENT INTERACTION" in text
         assert "CODE GENERATION RULES" in text
         assert "CONTENT GENERATION RULES" in text
+        assert "CREATOR ANONYMITY & AGENT IDENTITY RULES" in text

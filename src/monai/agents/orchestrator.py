@@ -24,6 +24,7 @@ from monai.business.risk import RiskManager
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.llm import LLM, get_cost_tracker
+from monai.utils.privacy import get_anonymizer
 from monai.utils.resources import check_resources
 from monai.utils.sandbox import PROJECT_ROOT
 
@@ -96,6 +97,22 @@ class Orchestrator(BaseAgent):
         self.log_action("cycle_start", f"Cycle {self._cycle} at {datetime.now()}")
         self.journal("plan", f"Starting cycle {self._cycle}")
         cycle_result = {}
+
+        # Phase -2: Anonymity check — creator must NEVER be traceable
+        anonymizer = get_anonymizer(self.config)
+        if self.config.privacy.verify_anonymity and self.config.privacy.proxy_type != "none":
+            anon_status = anonymizer.startup_check()
+            cycle_result["anonymity"] = anon_status
+            if not anon_status.get("anonymous"):
+                self.log_action("ANONYMITY_FAILED", json.dumps(anon_status))
+                self.learn("alert", "Anonymity check failed",
+                           f"Cannot verify anonymous proxy. Status: {anon_status}",
+                           rule="NEVER operate without verified anonymity", severity="critical")
+                return {"status": "aborted", "reason": "anonymity_check_failed", **cycle_result}
+            self.log_action("anonymity_ok",
+                            f"Visible IP: {anon_status.get('visible_ip', 'unknown')}")
+        else:
+            cycle_result["anonymity"] = {"status": "skipped"}
 
         # Phase -1: Resource check — don't damage the creator's computer
         resources = check_resources(PROJECT_ROOT, self.config.data_dir)

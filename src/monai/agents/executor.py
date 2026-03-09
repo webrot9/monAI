@@ -19,13 +19,12 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from monai.agents.ethics import CORE_DIRECTIVES, is_action_blocked, requires_risk_check
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.browser import Browser
 from monai.utils.llm import LLM
+from monai.utils.privacy import get_anonymizer
 from monai.utils.sandbox import is_path_allowed, safe_read, safe_write
 
 logger = logging.getLogger(__name__)
@@ -63,7 +62,9 @@ class AutonomousExecutor:
         self.llm = llm
         self.max_steps = max_steps
         self.browser = Browser(config, headless=headless)
-        self.http_client = httpx.Client(timeout=30)
+        self._anonymizer = get_anonymizer(config)
+        # HTTP client routed through proxy — no direct connections
+        self.http_client = self._anonymizer.create_http_client(timeout=30)
         self.action_history: list[dict] = []
 
     async def execute_task(self, task: str, context: str = "") -> dict[str, Any]:
@@ -201,6 +202,7 @@ class AutonomousExecutor:
                 return await self.browser.get_text()
 
             elif tool == "http_get":
+                self._anonymizer.maybe_rotate()
                 resp = self.http_client.get(
                     args.get("url", ""),
                     headers=args.get("headers", {}),
@@ -208,6 +210,7 @@ class AutonomousExecutor:
                 return {"status": resp.status_code, "body": resp.text[:2000]}
 
             elif tool == "http_post":
+                self._anonymizer.maybe_rotate()
                 resp = self.http_client.post(
                     args.get("url", ""),
                     json=args.get("data", {}),
