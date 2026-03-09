@@ -1,15 +1,21 @@
 """Sweep Engine — automated profit transfer from brands to creator.
 
-The sweep engine periodically checks brand balances and transfers
-profits to the creator's anonymous wallet via Monero.
+Supports two flows:
 
-Flow:
-    1. Check sweepable balance per brand (received - already swept)
-    2. If balance > threshold, initiate sweep
-    3. Convert to XMR if source is fiat (via brand's crypto holdings)
-    4. Send XMR to creator's wallet
-    5. Track the sweep in DB with tx hash
-    6. Retry on failure with exponential backoff
+    Flow A (LLC + Contractor — primary, no crypto required):
+        1. Platforms (Stripe/Gumroad/LS) auto-payout to LLC bank account
+        2. Sweep engine tracks these platform payouts
+        3. Generates monthly contractor invoice (creator bills the LLC)
+        4. LLC pays contractor invoice via bank transfer
+        5. Money arrives in creator's personal account
+
+    Flow B (Crypto — optional, for maximum anonymity):
+        1. Check brand crypto wallet balance
+        2. Send XMR to creator's wallet directly
+        3. Track with tx hash
+
+The flow is selected based on config: if LLC is configured, use Flow A.
+If crypto wallets are configured, use Flow B. Both can coexist.
 """
 
 from __future__ import annotations
@@ -17,13 +23,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
+from datetime import datetime, timedelta
 from typing import Any
 
 from monai.business.brand_payments import BrandPayments
 from monai.config import Config
 from monai.db.database import Database
-from monai.payments.monero_provider import MoneroProvider, MoneroRPCError
 from monai.payments.types import (
     PaymentStatus,
     SweepRequest,
@@ -38,41 +43,220 @@ RETRY_BACKOFF_BASE = 5  # seconds
 
 
 class SweepEngine:
-    """Orchestrates profit sweeps from brand accounts to creator wallet."""
+    """Orchestrates profit sweeps from brand accounts to creator.
+
+    Adapts to configured payout method:
+    - LLC mode: tracks platform payouts, generates contractor invoices
+    - Crypto mode: sends XMR from brand wallet to creator wallet
+    """
 
     def __init__(self, config: Config, db: Database):
         self.config = config
         self.db = db
         self.brand_payments = BrandPayments(db)
-        self.monero = MoneroProvider(
-            wallet_rpc_url=config.monero.wallet_rpc_url,
-            rpc_user=config.monero.rpc_user,
-            rpc_password=config.monero.rpc_password,
-            min_confirmations=config.creator_wallet.min_confirmations_xmr,
-            proxy_url=config.monero.proxy_url,
+        self._monero = None  # Lazy-loaded only if crypto is configured
+
+        # Lazy import corporate module
+        self._corporate = None
+
+    @property
+    def corporate(self):
+        if self._corporate is None:
+            from monai.business.corporate import CorporateManager
+            self._corporate = CorporateManager(self.db)
+        return self._corporate
+
+    @property
+    def monero(self):
+        if self._monero is None and self.config.monero.wallet_rpc_url:
+            from monai.payments.monero_provider import MoneroProvider
+            self._monero = MoneroProvider(
+                wallet_rpc_url=self.config.monero.wallet_rpc_url,
+                rpc_user=self.config.monero.rpc_user,
+                rpc_password=self.config.monero.rpc_password,
+                min_confirmations=self.config.creator_wallet.min_confirmations_xmr,
+                proxy_url=self.config.monero.proxy_url,
+            )
+        return self._monero
+
+    def get_active_flow(self) -> str:
+        """Determine which payout flow is active."""
+        # LLC mode is primary if configured
+        entity = self.corporate.get_primary_entity()
+        if entity:
+            contractor = self.corporate.get_active_contractor(entity["id"])
+            if contractor:
+                return "llc_contractor"
+
+        # Crypto fallback
+        if self.config.creator_wallet.xmr_address:
+            return "crypto_xmr"
+
+        return "none"
+
+    # ── LLC + Contractor Flow ──────────────────────────────────
+
+    async def run_sweep_cycle(self) -> dict[str, Any]:
+        """Run a full sweep cycle. Adapts to configured flow."""
+        flow = self.get_active_flow()
+
+        if flow == "llc_contractor":
+            return await self._run_llc_sweep_cycle()
+        elif flow == "crypto_xmr":
+            return await self._run_crypto_sweep_cycle()
+        else:
+            return {
+                "status": "skipped",
+                "reason": "no_payout_method_configured",
+                "hint": "Configure LLC entity + contractor, or set creator_wallet.xmr_address",
+            }
+
+    async def _run_llc_sweep_cycle(self) -> dict[str, Any]:
+        """LLC flow: track platform payouts and generate contractor invoices.
+
+        This doesn't move money — it tracks what platforms already moved
+        and generates invoices for the contractor payment.
+        """
+        entity = self.corporate.get_primary_entity()
+        if not entity:
+            return {"status": "error", "reason": "no_primary_entity"}
+
+        contractor = self.corporate.get_active_contractor(entity["id"])
+        if not contractor:
+            return {"status": "error", "reason": "no_active_contractor"}
+
+        # Track platform payouts for all brands under this entity
+        brands = self.corporate.get_entity_brands(entity["id"])
+        platform_payouts_tracked = 0
+
+        all_revenue = self.brand_payments.get_all_brands_revenue()
+        brand_revenues = []
+
+        for brand_data in all_revenue:
+            brand = brand_data["brand"]
+            # Check if this brand belongs to our entity
+            brand_entity = self.corporate.get_brand_entity(brand)
+            if not brand_entity or brand_entity["id"] != entity["id"]:
+                continue
+
+            revenue = brand_data["total_revenue"]
+            if revenue > 0:
+                brand_revenues.append({
+                    "brand": brand,
+                    "revenue": revenue,
+                    "transactions": brand_data["transactions"],
+                })
+
+        # Check if it's time to generate a contractor invoice
+        invoice_result = self._maybe_generate_invoice(
+            contractor, entity, brand_revenues
         )
 
-    async def run_sweep_cycle(self) -> list[SweepResult]:
-        """Run a full sweep cycle across all brands.
+        return {
+            "flow": "llc_contractor",
+            "entity": entity["name"],
+            "contractor": contractor["alias"],
+            "brands_tracked": len(brand_revenues),
+            "total_revenue": sum(br["revenue"] for br in brand_revenues),
+            "invoice": invoice_result,
+            "status": "ok",
+        }
 
-        Called periodically by the orchestrator (every sweep_interval_hours).
-        Returns list of sweep results.
-        """
-        results: list[SweepResult] = []
+    def _maybe_generate_invoice(self, contractor: dict, entity: dict,
+                                brand_revenues: list[dict]) -> dict[str, Any]:
+        """Generate a contractor invoice if we're in a new billing period."""
+        now = datetime.now()
 
-        # Pre-check: is Monero wallet available?
+        # Check last invoice date
+        last_invoices = self.db.execute(
+            "SELECT * FROM contractor_invoices "
+            "WHERE contractor_id = ? AND entity_id = ? "
+            "ORDER BY period_end DESC LIMIT 1",
+            (contractor["id"], entity["id"]),
+        )
+
+        if last_invoices:
+            last = dict(last_invoices[0])
+            last_end = datetime.strptime(last["period_end"], "%Y-%m-%d")
+
+            # Only generate if the last period ended at least a month ago
+            if now - last_end < timedelta(days=28):
+                return {
+                    "status": "not_due",
+                    "last_invoice": last["invoice_number"],
+                    "last_period_end": last["period_end"],
+                    "next_due": (last_end + timedelta(days=28)).strftime("%Y-%m-%d"),
+                }
+
+            period_start = (last_end + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            # First invoice: period starts at entity formation or 30 days ago
+            period_start = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+
+        period_end = now.strftime("%Y-%m-%d")
+
+        # Generate the invoice
+        invoice = self.corporate.generate_invoice(
+            contractor_id=contractor["id"],
+            entity_id=entity["id"],
+            period_start=period_start,
+            period_end=period_end,
+            brand_revenues=brand_revenues,
+        )
+
+        if invoice.get("error"):
+            return {"status": "no_revenue", "detail": invoice["error"]}
+
+        return {
+            "status": "generated",
+            "invoice_number": invoice.get("invoice_number", ""),
+            "amount": invoice.get("amount", 0),
+            "period": invoice.get("period", ""),
+        }
+
+    async def sweep_brand(self, brand: str,
+                          amount: float | None = None) -> SweepResult:
+        """Manually trigger a sweep for a specific brand."""
+        flow = self.get_active_flow()
+
+        if flow == "llc_contractor":
+            # In LLC mode, "sweep" means tracking the payout and invoicing
+            return SweepResult(
+                success=True,
+                status=SweepStatus.COMPLETED,
+                metadata={
+                    "flow": "llc_contractor",
+                    "note": "Platform payouts are automatic. "
+                            "Use contractor invoicing to collect.",
+                },
+            )
+
+        if flow == "crypto_xmr":
+            return await self._crypto_sweep_brand(brand, amount)
+
+        return SweepResult(
+            success=False,
+            error="No payout method configured",
+            status=SweepStatus.FAILED,
+        )
+
+    # ── Crypto Flow (Monero) ───────────────────────────────────
+
+    async def _run_crypto_sweep_cycle(self) -> dict[str, Any]:
+        """Crypto flow: send XMR from brand wallets to creator."""
+        if not self.monero:
+            return {"status": "error", "reason": "monero_not_configured"}
+
         if not await self.monero.health_check():
             logger.error("Monero wallet RPC unreachable — skipping sweep cycle")
-            return results
+            return {"status": "error", "reason": "monero_offline"}
 
         creator_address = self.config.creator_wallet.xmr_address
         if not creator_address:
-            logger.error("No creator XMR address configured — skipping sweep cycle")
-            return results
+            return {"status": "error", "reason": "no_creator_xmr_address"}
 
         threshold = self.config.creator_wallet.sweep_threshold_eur
-
-        # Get all brands with revenue
+        results: list[SweepResult] = []
         all_revenue = self.brand_payments.get_all_brands_revenue()
 
         for brand_data in all_revenue:
@@ -80,143 +264,31 @@ class SweepEngine:
             sweepable = self.brand_payments.get_sweepable_balance(brand)
 
             if sweepable < threshold:
-                logger.debug(
-                    f"Sweep skip: {brand} has €{sweepable:.2f} "
-                    f"(threshold: €{threshold:.2f})"
-                )
                 continue
 
-            # Find the brand's crypto collection account (XMR preferred)
             from_account = self._find_sweep_source(brand)
             if not from_account:
-                logger.warning(f"No sweepable crypto account for brand {brand}")
                 continue
 
-            # Find or create sweep destination account
-            to_account = self._ensure_sweep_destination(brand, creator_address)
-
-            result = await self._execute_sweep(
-                SweepRequest(
-                    brand=brand,
-                    from_account_id=from_account["id"],
-                    to_address=creator_address,
-                    amount=sweepable,
-                    currency="EUR",
-                    method="crypto_xmr",
-                )
-            )
+            result = await self._crypto_sweep_brand(brand, sweepable)
             results.append(result)
 
-        if results:
-            completed = sum(1 for r in results if r.success)
-            total_swept = sum(r.amount_crypto for r in results if r.success)
-            logger.info(
-                f"Sweep cycle complete: {completed}/{len(results)} successful, "
-                f"total {total_swept:.8f} XMR swept"
-            )
+        completed = sum(1 for r in results if r.success)
+        total_swept = sum(r.amount_crypto for r in results if r.success)
 
-        return results
+        return {
+            "flow": "crypto_xmr",
+            "sweeps_attempted": len(results),
+            "sweeps_successful": completed,
+            "total_xmr_swept": total_swept,
+            "status": "ok",
+        }
 
-    async def _execute_sweep(self, request: SweepRequest) -> SweepResult:
-        """Execute a single sweep with retry logic."""
-        # Record the sweep initiation in DB
-        from_account = self._find_sweep_source(request.brand)
-        to_account = self._ensure_sweep_destination(request.brand, request.to_address)
+    async def _crypto_sweep_brand(self, brand: str,
+                                  amount: float | None = None) -> SweepResult:
+        """Execute a crypto sweep for a single brand."""
+        from monai.payments.monero_provider import MoneroRPCError
 
-        sweep_id = self.brand_payments.initiate_sweep(
-            brand=request.brand,
-            from_account_id=request.from_account_id,
-            to_account_id=to_account["id"],
-            amount=request.amount,
-            sweep_method=request.method,
-            metadata=request.metadata,
-        )
-
-        # Get XMR amount from the wallet balance
-        balance = await self.monero.get_balance()
-        if balance.available <= 0:
-            self.brand_payments.fail_sweep(sweep_id, "No XMR available in wallet")
-            return SweepResult(
-                success=False, sweep_id=sweep_id,
-                error="No XMR available in wallet",
-                status=SweepStatus.FAILED,
-            )
-
-        # Determine XMR amount to send
-        # If the source is crypto_xmr, use the actual XMR balance
-        # (the EUR amount is just for tracking)
-        xmr_to_send = min(balance.available, balance.available)  # Send all available
-        fee_estimate = await self.monero.estimate_fee(xmr_to_send)
-        xmr_to_send -= fee_estimate  # Leave room for fee
-
-        if xmr_to_send <= 0:
-            self.brand_payments.fail_sweep(sweep_id, "Balance too low after fee estimate")
-            return SweepResult(
-                success=False, sweep_id=sweep_id,
-                error="Balance too low after fee estimate",
-                status=SweepStatus.FAILED,
-            )
-
-        # Attempt send with retries
-        last_error = ""
-        for attempt in range(MAX_RETRIES):
-            try:
-                result = await self.monero.send_payout(
-                    to_address=request.to_address,
-                    amount=xmr_to_send,
-                    currency="XMR",
-                    priority="normal",
-                )
-
-                if result.success:
-                    tx_hash = result.payment_ref
-                    fee = result.raw.get("fee", 0)
-
-                    self.brand_payments.complete_sweep(sweep_id, tx_reference=tx_hash)
-
-                    logger.info(
-                        f"Sweep completed: {request.brand} → creator, "
-                        f"{xmr_to_send:.8f} XMR, tx={tx_hash[:16]}..."
-                    )
-
-                    return SweepResult(
-                        success=True,
-                        sweep_id=sweep_id,
-                        tx_hash=tx_hash,
-                        status=SweepStatus.COMPLETED,
-                        amount_crypto=xmr_to_send,
-                        fee=fee,
-                        metadata=result.raw,
-                    )
-                else:
-                    last_error = result.error
-
-            except MoneroRPCError as e:
-                last_error = str(e)
-                logger.warning(
-                    f"Sweep attempt {attempt + 1}/{MAX_RETRIES} failed: {e}"
-                )
-
-            if attempt < MAX_RETRIES - 1:
-                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-                logger.info(f"Retrying sweep in {wait}s...")
-                await asyncio.sleep(wait)
-
-        # All retries exhausted
-        self.brand_payments.fail_sweep(sweep_id, last_error)
-        return SweepResult(
-            success=False,
-            sweep_id=sweep_id,
-            error=f"Failed after {MAX_RETRIES} attempts: {last_error}",
-            status=SweepStatus.FAILED,
-        )
-
-    async def sweep_brand(self, brand: str,
-                          amount: float | None = None) -> SweepResult:
-        """Manually trigger a sweep for a specific brand.
-
-        If amount is None, sweeps the full sweepable balance.
-        """
         creator_address = self.config.creator_wallet.xmr_address
         if not creator_address:
             return SweepResult(
@@ -238,18 +310,94 @@ class SweepEngine:
                 status=SweepStatus.FAILED,
             )
 
-        return await self._execute_sweep(
-            SweepRequest(
-                brand=brand,
-                from_account_id=from_account["id"],
-                to_address=creator_address,
-                amount=sweepable,
-                method="crypto_xmr",
+        if not self.monero:
+            return SweepResult(
+                success=False, error="Monero provider not configured",
+                status=SweepStatus.FAILED,
             )
+
+        to_account = self._ensure_sweep_destination(brand, creator_address)
+
+        sweep_id = self.brand_payments.initiate_sweep(
+            brand=brand,
+            from_account_id=from_account["id"],
+            to_account_id=to_account["id"],
+            amount=sweepable,
+            sweep_method="crypto_xmr",
+        )
+
+        # Get available XMR
+        balance = await self.monero.get_balance()
+        if balance.available <= 0:
+            self.brand_payments.fail_sweep(sweep_id, "No XMR available")
+            return SweepResult(
+                success=False, sweep_id=sweep_id,
+                error="No XMR available in wallet",
+                status=SweepStatus.FAILED,
+            )
+
+        xmr_to_send = balance.available
+        fee_estimate = await self.monero.estimate_fee(xmr_to_send)
+        xmr_to_send -= fee_estimate
+
+        if xmr_to_send <= 0:
+            self.brand_payments.fail_sweep(sweep_id, "Balance too low after fee")
+            return SweepResult(
+                success=False, sweep_id=sweep_id,
+                error="Balance too low after fee estimate",
+                status=SweepStatus.FAILED,
+            )
+
+        # Attempt send with retries
+        last_error = ""
+        for attempt in range(MAX_RETRIES):
+            try:
+                result = await self.monero.send_payout(
+                    to_address=creator_address,
+                    amount=xmr_to_send,
+                    priority="normal",
+                )
+
+                if result.success:
+                    tx_hash = result.payment_ref
+                    fee = result.raw.get("fee", 0)
+                    self.brand_payments.complete_sweep(sweep_id, tx_reference=tx_hash)
+
+                    return SweepResult(
+                        success=True,
+                        sweep_id=sweep_id,
+                        tx_hash=tx_hash,
+                        status=SweepStatus.COMPLETED,
+                        amount_crypto=xmr_to_send,
+                        fee=fee,
+                        metadata=result.raw,
+                    )
+                else:
+                    last_error = result.error
+
+            except MoneroRPCError as e:
+                last_error = str(e)
+                logger.warning(f"Sweep attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
+
+            if attempt < MAX_RETRIES - 1:
+                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+                await asyncio.sleep(wait)
+
+        self.brand_payments.fail_sweep(sweep_id, last_error)
+        return SweepResult(
+            success=False,
+            sweep_id=sweep_id,
+            error=f"Failed after {MAX_RETRIES} attempts: {last_error}",
+            status=SweepStatus.FAILED,
         )
 
     async def check_pending_sweeps(self) -> list[dict[str, Any]]:
-        """Check status of pending/mixing sweeps and update them."""
+        """Check status of pending crypto sweeps."""
+        if not self.monero:
+            return []
+
+        from monai.payments.monero_provider import MoneroRPCError
+
         pending = self.db.execute(
             "SELECT * FROM brand_profit_sweeps WHERE status IN ('pending', 'mixing')"
         )
@@ -265,12 +413,7 @@ class SweepEngine:
                 if confirmations >= self.config.creator_wallet.min_confirmations_xmr:
                     self.brand_payments.complete_sweep(sweep["id"], tx_ref)
                     sweep["status"] = "completed"
-                    sweep["confirmations"] = confirmations
-                    logger.info(
-                        f"Sweep {sweep['id']} confirmed: {confirmations} confirmations"
-                    )
-                else:
-                    sweep["confirmations"] = confirmations
+                sweep["confirmations"] = confirmations
             except MoneroRPCError as e:
                 sweep["error"] = str(e)
 
@@ -278,11 +421,10 @@ class SweepEngine:
 
         return results
 
-    def _find_sweep_source(self, brand: str) -> dict[str, Any] | None:
-        """Find the best crypto collection account for sweeping.
+    # ── Helpers ─────────────────────────────────────────────────
 
-        Prefers XMR, falls back to BTC.
-        """
+    def _find_sweep_source(self, brand: str) -> dict[str, Any] | None:
+        """Find the best crypto collection account for sweeping."""
         accounts = self.brand_payments.get_collection_accounts(brand)
         xmr = [a for a in accounts if a["provider"] == "crypto_xmr"]
         if xmr:
@@ -300,7 +442,6 @@ class SweepEngine:
             if acc["account_id"] == creator_address:
                 return acc
 
-        # Create one
         acc_id = self.brand_payments.add_sweep_account(
             brand=brand,
             provider="crypto_xmr",
@@ -315,18 +456,30 @@ class SweepEngine:
 
     def get_sweep_summary(self) -> dict[str, Any]:
         """Get overview of sweep status across all brands."""
+        flow = self.get_active_flow()
         total_swept = self.brand_payments.get_total_swept()
         history = self.brand_payments.get_sweep_history(limit=10)
         pending_count = len([
             s for s in history if s["status"] in ("pending", "mixing")
         ])
 
-        return {
+        summary: dict[str, Any] = {
+            "active_flow": flow,
             "total_swept_eur": total_swept,
             "recent_sweeps": len(history),
             "pending_sweeps": pending_count,
-            "creator_xmr_address": self.config.creator_wallet.xmr_address[:12] + "..."
-            if self.config.creator_wallet.xmr_address else "NOT SET",
             "sweep_threshold_eur": self.config.creator_wallet.sweep_threshold_eur,
-            "sweep_interval_hours": self.config.creator_wallet.sweep_interval_hours,
         }
+
+        if flow == "llc_contractor":
+            entity = self.corporate.get_primary_entity()
+            if entity:
+                contractor = self.corporate.get_active_contractor(entity["id"])
+                summary["llc_name"] = entity["name"]
+                summary["contractor_alias"] = contractor["alias"] if contractor else "NOT SET"
+                summary["total_paid_to_contractor"] = self.corporate.get_total_paid_to_contractor()
+        elif flow == "crypto_xmr":
+            addr = self.config.creator_wallet.xmr_address
+            summary["creator_xmr_address"] = addr[:12] + "..." if addr else "NOT SET"
+
+        return summary

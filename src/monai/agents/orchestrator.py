@@ -31,6 +31,7 @@ from monai.agents.provisioner import Provisioner
 from monai.agents.self_improve import SelfImprover
 from monai.agents.spawner import AgentSpawner
 from monai.business.brand_payments import BrandPayments
+from monai.business.corporate import CorporateManager
 from monai.payments.manager import UnifiedPaymentManager
 from monai.business.commercialista import Commercialista
 from monai.business.crm import CRM
@@ -87,6 +88,8 @@ class Orchestrator(BaseAgent):
         self.email_marketing = EmailMarketing(db)
         self.brand_payments = BrandPayments(db)
         self.payment_manager = UnifiedPaymentManager(config, db)
+        self.corporate = CorporateManager(db)
+        self._ensure_llc_setup()
         self.workflow_engine = WorkflowEngine(config, db, llm)
         self.task_router = TaskRouter(config, db, llm)
         # Register utility agents with workflow engine
@@ -305,6 +308,32 @@ class Orchestrator(BaseAgent):
                      outcome="success")
         self.log_action("cycle_complete", json.dumps(cycle_result, default=str)[:1000])
         return cycle_result
+
+    def _ensure_llc_setup(self) -> None:
+        """Auto-provision LLC entity and contractor from config if not in DB."""
+        if not self.config.llc.enabled:
+            return
+
+        entity = self.corporate.get_primary_entity()
+        if not entity:
+            entity_id = self.corporate.create_entity(
+                name=self.config.llc.entity_name or "Holdings LLC",
+                entity_type=self.config.llc.entity_type,
+                jurisdiction=self.config.llc.jurisdiction,
+            )
+            entity = self.corporate.get_entity(entity_id)
+
+        if entity and not self.corporate.get_active_contractor(entity["id"]):
+            if self.config.llc.contractor_alias:
+                self.corporate.create_contractor(
+                    alias=self.config.llc.contractor_alias,
+                    entity_id=entity["id"],
+                    service_description=self.config.llc.contractor_service,
+                    rate_type=self.config.llc.contractor_rate_type,
+                    rate_amount=self.config.llc.contractor_rate_amount,
+                    rate_percentage=self.config.llc.contractor_rate_percentage,
+                    payment_method=self.config.llc.contractor_payment_method,
+                )
 
     def _ensure_infrastructure(self) -> dict[str, Any]:
         """Check and provision any missing infrastructure."""
@@ -881,26 +910,22 @@ class Orchestrator(BaseAgent):
         return self.finance_expert.get_latest_recommendations()
 
     def _run_payment_cycle(self) -> dict[str, Any]:
-        """Run payment processing — check balances and sweep profits to creator.
+        """Run payment processing — track payouts and generate contractor invoices.
 
-        Runs every 3 cycles to avoid excessive RPC calls.
-        Sweeps profits from brand crypto wallets to creator's Monero address.
+        Adapts to configured flow:
+        - LLC+Contractor: track platform payouts, generate monthly invoices
+        - Crypto: sweep XMR from brand wallets to creator
+        Runs every 3 cycles.
         """
         if self._cycle % 3 != 0:
             return {"status": "skipped", "reason": "not_payment_cycle"}
 
-        if not self.config.creator_wallet.xmr_address:
-            return {"status": "skipped", "reason": "no_creator_wallet_configured"}
-
         try:
             loop = asyncio.new_event_loop()
             try:
-                # Run sweep cycle
                 sweep_result = loop.run_until_complete(
                     self.payment_manager.run_sweep_cycle()
                 )
-
-                # Get payment system health
                 health = loop.run_until_complete(
                     self.payment_manager.health_check()
                 )
@@ -913,13 +938,23 @@ class Orchestrator(BaseAgent):
                 "status": self.payment_manager.get_status(),
             }
 
-            if sweep_result.get("sweeps_successful", 0) > 0:
-                xmr_swept = sweep_result.get("total_xmr_swept", 0)
-                self.log_action("payment_sweep",
-                                f"Swept {xmr_swept:.8f} XMR to creator")
-                self.notify_creator(
-                    f"Profit sweep: {xmr_swept:.8f} XMR transferred to your wallet."
-                )
+            flow = sweep_result.get("flow", "")
+
+            # Notify creator based on flow type
+            if flow == "llc_contractor":
+                invoice = sweep_result.get("invoice", {})
+                if invoice.get("status") == "generated":
+                    self.log_action("payment_invoice",
+                                    f"Invoice {invoice['invoice_number']}: €{invoice['amount']:.2f}")
+                    self.notify_creator(
+                        f"Invoice generated: {invoice['invoice_number']} — "
+                        f"€{invoice['amount']:.2f}. Ready for payment."
+                    )
+            elif flow == "crypto_xmr":
+                if sweep_result.get("sweeps_successful", 0) > 0:
+                    xmr = sweep_result.get("total_xmr_swept", 0)
+                    self.log_action("payment_sweep", f"Swept {xmr:.8f} XMR")
+                    self.notify_creator(f"Swept {xmr:.8f} XMR to your wallet.")
 
             return result
 

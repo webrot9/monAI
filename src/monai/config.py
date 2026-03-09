@@ -76,13 +76,31 @@ class CommsConfig:
 
 @dataclass
 class CreatorWalletConfig:
-    """Creator's anonymous wallet addresses for receiving swept profits."""
-    xmr_address: str = ""  # Primary: Monero receive address
-    btc_address: str = ""  # Fallback: Bitcoin receive address
-    sweep_threshold_eur: float = 50.0  # Min amount to trigger a sweep
-    sweep_interval_hours: int = 24  # How often to check for sweepable balances
-    min_confirmations_xmr: int = 10  # Wait for N confirmations
+    """Creator's crypto wallets — optional, only for crypto flow."""
+    xmr_address: str = ""
+    btc_address: str = ""
+    sweep_threshold_eur: float = 50.0
+    sweep_interval_hours: int = 24
+    min_confirmations_xmr: int = 10
     min_confirmations_btc: int = 3
+
+
+@dataclass
+class LLCConfig:
+    """Holding LLC for multi-layer payout (primary method, no crypto needed).
+
+    Flow: Brand platforms auto-payout → LLC bank → Contractor invoice → Creator.
+    """
+    enabled: bool = False  # Set True once LLC is formed
+    entity_name: str = ""  # "XYZ Holdings LLC"
+    entity_type: str = "llc_us"  # llc_us, llc_uk, srl_it
+    jurisdiction: str = "US-WY"  # Wyoming default (no public member disclosure)
+    contractor_alias: str = ""  # Professional alias for invoicing
+    contractor_service: str = "Management consulting and technical advisory"
+    contractor_rate_type: str = "percentage"  # percentage, monthly
+    contractor_rate_percentage: float = 90.0  # 90% of revenue to contractor
+    contractor_rate_amount: float = 0.0  # Fixed amount if monthly
+    contractor_payment_method: str = "bank_transfer"
 
 
 @dataclass
@@ -110,6 +128,7 @@ class Config:
     privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     creator_wallet: CreatorWalletConfig = field(default_factory=CreatorWalletConfig)
+    llc: LLCConfig = field(default_factory=LLCConfig)
     monero: MoneroConfig = field(default_factory=MoneroConfig)
     btcpay: BTCPayConfig = field(default_factory=BTCPayConfig)
     initial_capital: float = 500.0  # €500 initial budget
@@ -134,6 +153,8 @@ class Config:
                 config.telegram = TelegramConfig(**data["telegram"])
             if "creator_wallet" in data:
                 config.creator_wallet = CreatorWalletConfig(**data["creator_wallet"])
+            if "llc" in data:
+                config.llc = LLCConfig(**data["llc"])
             if "monero" in data:
                 config.monero = MoneroConfig(**data["monero"])
             if "btcpay" in data:
@@ -187,6 +208,18 @@ class Config:
                 "creator_chat_id": self.telegram.creator_chat_id,
                 "creator_username": self.telegram.creator_username,
                 "enabled": self.telegram.enabled,
+            },
+            "llc": {
+                "enabled": self.llc.enabled,
+                "entity_name": self.llc.entity_name,
+                "entity_type": self.llc.entity_type,
+                "jurisdiction": self.llc.jurisdiction,
+                "contractor_alias": self.llc.contractor_alias,
+                "contractor_service": self.llc.contractor_service,
+                "contractor_rate_type": self.llc.contractor_rate_type,
+                "contractor_rate_percentage": self.llc.contractor_rate_percentage,
+                "contractor_rate_amount": self.llc.contractor_rate_amount,
+                "contractor_payment_method": self.llc.contractor_payment_method,
             },
             "creator_wallet": {
                 "xmr_address": self.creator_wallet.xmr_address,
