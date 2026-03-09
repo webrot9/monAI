@@ -1,100 +1,126 @@
-# monAI - Fully Autonomous Business Agent
+# monAI - Architecture Evolution Plan
 
 ## Vision
-An AI that runs as an autonomous business operator. It finds clients, sells services, communicates, delivers work, invoices, and scales — all by itself. Diversified across multiple service lines with strict risk/reward controls.
+Evolve monAI from a single-orchestrator system to a multi-team autonomous organization with self-healing engineering, adaptive browser automation, anti-AI-detection capabilities, and diversified revenue channels.
 
-## Architecture
+## New Architecture
 
-### Core System
-1. **Orchestrator** — Master agent that decides which strategies to pursue, allocates resources, monitors performance
-2. **Strategy Agents** — Each one runs an independent service line end-to-end
-3. **Comms Engine** — Handles all client communication (email, platform messaging, chat)
-4. **CRM** — Tracks leads, clients, projects, conversations, follow-ups
-5. **Invoicing & Finance** — Generates invoices, tracks payments, P&L per strategy
-6. **Risk Manager** — Diversification rules, spend limits, ROI thresholds
-
-### Tech Stack
-- **Language**: Python 3.11+
-- **LLM**: OpenAI API (GPT-4o / GPT-4o-mini for cost optimization)
-- **Database**: SQLite (local, simple, no infra cost)
-- **Email**: SMTP + IMAP for outbound/inbound
-- **Platforms**: Upwork API, Fiverr API, LinkedIn, cold email
-- **Invoicing**: PDF generation, Stripe integration (optional)
-- **Scheduling**: APScheduler for recurring tasks
-
-### Service Lines (Strategies)
-
-| # | Service | How It Gets Clients | Deliverable | Risk |
-|---|---------|-------------------|-------------|------|
-| 1 | **Freelance Writing/Copy** | Upwork/Fiverr bids, cold outreach | Articles, copy, blog posts | Very Low |
-| 2 | **Web Dev / Landing Pages** | Upwork bids, cold email to SMBs | Websites, landing pages | Low |
-| 3 | **SEO Audits & Content** | Cold outreach to businesses | SEO reports, optimized content | Low |
-| 4 | **Data Analysis / Reports** | Upwork, LinkedIn outreach | Dashboards, reports, insights | Low |
-| 5 | **Email Marketing** | Cold outreach to ecommerce | Email sequences, campaigns | Low |
-| 6 | **Social Media Management** | Cold outreach to local biz | Content calendars, posts, management | Low-Med |
-| 7 | **Digital Products** | Gumroad, Etsy, own store | Ebooks, templates, prompt packs | Very Low (passive) |
-| 8 | **Lead Gen as a Service** | Cold outreach to agencies/SaaS | Qualified leads, scraped lists | Med |
-
-### Client Acquisition Pipeline
 ```
-Prospecting → Outreach → Conversation → Proposal → Close → Deliver → Invoice → Follow-up
+Orchestrator (CEO)
+├── Engineering Team (self-healing, continuous improvement)
+│   ├── TechLead (reviews errors, prioritizes bugs, assigns work)
+│   └── Engineers x2-3 (fix bugs, improve modules, write tests)
+│
+├── Revenue Squad (one agent per channel, Darwinian selection)
+│   ├── FreelanceAgent (Upwork/Fiverr — existing, needs flesh)
+│   ├── DigitalProductsAgent (Gumroad/Etsy — existing, needs flesh)
+│   ├── ContentSiteAgent (SEO blogs, affiliate content)
+│   ├── MicroSaaSAgent (small tools, API wrappers)
+│   ├── TelegramBotAgent (bots-as-a-service)
+│   └── AffiliateAgent (affiliate marketing content)
+│
+├── Infrastructure Team
+│   ├── BrowserAgent (adaptive automation, learns from failures)
+│   └── PhoneProvisionerAgent (virtual numbers for signups)
+│
+└── Quality Team
+    └── HumanizeAgent (anti-AI-detection, style matching, quality)
 ```
 
-Each strategy agent handles this full pipeline autonomously:
-1. **Prospect**: Find potential clients (scrape, search, platform browse)
-2. **Outreach**: Send personalized cold messages / submit bids
-3. **Converse**: Handle responses, answer questions, negotiate
-4. **Propose**: Generate custom proposals with pricing
-5. **Close**: Confirm scope, get agreement
-6. **Deliver**: Execute the work using AI capabilities
-7. **Invoice**: Generate and send invoice
-8. **Follow-up**: Ask for reviews, upsell, get referrals
+## Implementation Plan
 
-### Risk Rules
-- No single strategy gets >30% of total effort/spend
-- Every outreach campaign must have projected ROI >3x before launch
-- Cap spending per strategy: start at $10/mo, scale on proven revenue
-- Minimum 3 active service lines at all times
-- Track cost-per-acquisition and lifetime value per client
-- Stop any strategy that has negative ROI after 30 days
-- All client comms reviewed for quality before send (initially)
+### Phase A: Engineering Team (self-healing system)
+- [x] Design `EngineeringTeam` architecture
+- [ ] Create `TechLead` agent (`src/monai/agents/eng_team/tech_lead.py`)
+  - Monitors error logs, agent failures, test results
+  - Prioritizes issues by severity and business impact
+  - Assigns work to engineer agents
+  - Reviews fixes before deployment
+  - Reports to orchestrator
+- [ ] Create `Engineer` agent (`src/monai/agents/eng_team/engineer.py`)
+  - Receives bug assignments from TechLead
+  - Uses Coder agent to write fixes + tests
+  - Submits fixes for review
+  - Can be spawned as multiple instances
+- [ ] Create `EngineeringTeam` coordinator (`src/monai/agents/eng_team/__init__.py`)
+  - Manages the team lifecycle
+  - Exposes `run()` that the orchestrator calls
+  - Tracks bug backlog, fix rate, regression rate
+- [ ] Wire into orchestrator cycle (new Phase 6.7: Engineering)
+- [ ] Add DB schema for bug tracking (bugs table)
 
-### Financial Tracking
-- Every dollar spent logged with category and strategy
-- Every dollar earned logged with source and strategy
-- Daily P&L summary
-- Weekly strategy performance review
-- Monthly rebalancing decisions
+### Phase B: Adaptive Browser Automation (learning loop)
+- [ ] Create `BrowserLearner` (`src/monai/agents/browser_learner.py`)
+  - Wraps existing `Browser` class
+  - Logs every action: URL, selector, action type, result, error
+  - Categorizes failures: CAPTCHA, bot_detection, dom_change, timeout, auth_required
+  - Tracks success rates per site, per action type
+  - Generates countermeasures per failure type:
+    - CAPTCHA → route to solving service (2captcha API)
+    - Bot detection → fingerprint rotation, realistic delays, mouse movement
+    - DOM changes → self-healing selectors (find by text/role/aria, not CSS)
+    - Timeout → adaptive wait times
+  - Maintains a "site playbook" — learned interaction patterns per domain
+  - Exposes metrics: success_rate, avg_time, failure_breakdown
+- [ ] Add `browser_actions` DB table (action log with outcomes)
+- [ ] Add `site_playbooks` DB table (learned patterns per domain)
+- [ ] Add CAPTCHA solver integration (2captcha/anti-captcha API)
+- [ ] Add self-healing selector logic (fallback strategies)
 
-## Implementation Phases
+### Phase C: Anti-AI Detection / Humanizer
+- [ ] Create `Humanizer` (`src/monai/agents/humanizer.py`)
+  - Post-processes all outbound content
+  - Analyzes and matches target voice/style
+  - Varies sentence structure (breaks AI-typical patterns)
+  - Injects specificity, opinions, natural imperfections
+  - Maintains style profiles per client/platform
+  - Self-critique loop: draft → analyze → rewrite
+  - Tracks detection scores over time (self-test with detectors)
+- [ ] Add `style_profiles` DB table
+- [ ] Add `content_quality` DB table (tracks detection scores, rewrites)
+- [ ] Integrate into all content-producing agents
 
-### Phase 1: Foundation
-- [ ] Python project structure (src layout, pyproject.toml)
-- [ ] Core agent base class with OpenAI integration
-- [ ] Orchestrator agent (strategy selection, resource allocation)
-- [ ] Configuration system (API keys, budgets, constraints)
-- [ ] SQLite database schema (clients, projects, transactions, comms)
-- [ ] CRM module (leads, clients, pipeline stages)
-- [ ] Finance module (expenses, revenue, invoicing)
-- [ ] Comms engine (email send/receive, template system)
+### Phase D: Multi-Channel Revenue Diversification
+- [ ] Create `ContentSiteAgent` (`src/monai/strategies/content_sites.py`)
+  - SEO blog creation and management
+  - Affiliate content with tracked links
+  - Targets low-competition long-tail keywords
+- [ ] Create `MicroSaaSAgent` (`src/monai/strategies/micro_saas.py`)
+  - Identifies micro-SaaS opportunities
+  - Uses Coder to build small tools/APIs
+  - Deploys on free tiers (Vercel, Railway, etc.)
+- [ ] Create `TelegramBotAgent` (`src/monai/strategies/telegram_bots.py`)
+  - Builds and deploys Telegram bots as paid services
+  - Targets specific niches (productivity, crypto, etc.)
+- [ ] Create `AffiliateAgent` (`src/monai/strategies/affiliate.py`)
+  - Review/comparison content for affiliate programs
+  - Targets high-commission niches
+- [ ] Register all new strategy agents with orchestrator
+- [ ] Update orchestrator to run Darwinian channel selection
 
-### Phase 2: First Service Lines
-- [ ] Freelance writing agent (Upwork/Fiverr integration)
-- [ ] Digital products agent (create & list on marketplaces)
-- [ ] Cold outreach agent (email prospecting for SEO/content services)
+### Phase E: Virtual Phone Provisioning
+- [ ] Create `PhoneProvisioner` (`src/monai/agents/phone_provisioner.py`)
+  - Integrates with SMS API services (TextVerified, SMSPool)
+  - Procures virtual numbers for platform signups
+  - Manages number lifecycle (acquire, use, release)
+  - Routes verification codes to requesting agents
+- [ ] Add `virtual_phones` DB table
+- [ ] Wire into provisioner flow
 
-### Phase 3: Scale & Diversify
-- [ ] Web dev agent
-- [ ] Data analysis agent
-- [ ] Social media management agent
-- [ ] Lead gen agent
+### Phase F: Orchestrator Evolution
+- [ ] Add engineering team phase to cycle
+- [ ] Add Darwinian revenue optimization (shift resources to winners)
+- [ ] Add browser learning metrics to health checks
+- [ ] Add humanizer quality gate for all outbound content
+- [ ] Update cycle to support new agent teams
 
-### Phase 4: Intelligence
-- [ ] Performance-based auto-rebalancing
-- [ ] Client satisfaction scoring
-- [ ] Strategy discovery (find new niches)
-- [ ] Price optimization
-- [ ] Upsell/cross-sell automation
+## Priority Order
+1. **Phase A** (Engineering Team) — enables self-healing, unblocks everything else
+2. **Phase C** (Humanizer) — quality moat, affects all revenue
+3. **Phase B** (Browser Learner) — unblocks platform signups
+4. **Phase D** (Revenue Channels) — diversified income
+5. **Phase E** (Phone Provisioner) — unblocks platform registration
+6. **Phase F** (Orchestrator Evolution) — ties it all together
 
 ## Review
 <!-- Post-completion review -->
