@@ -189,21 +189,27 @@ class PhoneProvisioner(BaseAgent):
         }
 
     def _get_api_key(self, provider: str) -> str | None:
-        """Retrieve API key for the SMS provider from config or identity store."""
-        # Check config first
-        key = self.config.get(f"sms.{provider}_api_key", "")
-        if key:
-            return key
-        # Check identity agent's credential store
+        """Retrieve API key for the SMS provider from identity store."""
+        # Check identity store (encrypted credentials)
         rows = self.db.execute(
-            "SELECT api_key FROM accounts WHERE platform = ? AND status = 'active' LIMIT 1",
+            "SELECT credentials FROM identities "
+            "WHERE platform = ? AND type = 'api_key' AND status = 'active' LIMIT 1",
             (f"sms_{provider}",),
         )
-        if rows:
-            from monai.agents.identity import IdentityManager
-            return IdentityManager.decrypt_value(
-                rows[0]["api_key"], self.config.get("encryption_key", "")
-            )
+        if rows and rows[0]["credentials"]:
+            from monai.utils.crypto import decrypt_value
+            try:
+                import json as _json
+                decrypted = decrypt_value(rows[0]["credentials"])
+                data = _json.loads(decrypted)
+                return data.get("key", "")
+            except Exception:
+                # Try as plaintext fallback
+                try:
+                    data = _json.loads(rows[0]["credentials"])
+                    return data.get("key", "")
+                except Exception:
+                    return None
         return None
 
     # ── SMSPool Integration ──────────────────────────────────────

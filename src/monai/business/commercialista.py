@@ -226,3 +226,119 @@ class Commercialista:
         if budget["balance"] > budget["initial"] * 0.5:
             return "OK: Spending within budget. Focus on generating first revenue."
         return "CAUTION: Over 50% of budget spent. Prioritize revenue-generating activities."
+
+    # ── Auto-Reinvestment Engine ─────────────────────────────────
+
+    def compute_reinvestment(self) -> dict[str, Any]:
+        """Compute profit allocation: reinvest, reserve, and creator sweep.
+
+        Uses config.reinvestment settings to split net profit into:
+        - reinvest_pct → goes back to strategy budgets
+        - reserve_pct → kept as safety buffer
+        - creator_pct → swept to creator wallet/bank
+        """
+        reinv = self.config.reinvestment
+        if not reinv.enabled:
+            return {"status": "disabled"}
+
+        budget = self.get_budget()
+        net_profit = budget["net_profit"]
+
+        if net_profit < reinv.min_profit_to_reinvest:
+            return {
+                "status": "below_threshold",
+                "net_profit": net_profit,
+                "threshold": reinv.min_profit_to_reinvest,
+            }
+
+        # Split the profit
+        reinvest_amount = round(net_profit * (reinv.reinvest_pct / 100), 2)
+        reserve_amount = round(net_profit * (reinv.reserve_pct / 100), 2)
+        creator_amount = round(net_profit * (reinv.creator_pct / 100), 2)
+
+        return {
+            "status": "ready",
+            "net_profit": net_profit,
+            "reinvest": reinvest_amount,
+            "reserve": reserve_amount,
+            "creator_sweep": creator_amount,
+            "split_pct": {
+                "reinvest": reinv.reinvest_pct,
+                "reserve": reinv.reserve_pct,
+                "creator": reinv.creator_pct,
+            },
+        }
+
+    def allocate_to_strategies(self, reinvest_amount: float,
+                               strategy_performance: list[dict]) -> list[dict[str, Any]]:
+        """Allocate reinvestment budget across strategies based on performance.
+
+        Args:
+            reinvest_amount: Total EUR to distribute
+            strategy_performance: List of dicts with keys:
+                - name: strategy name
+                - revenue: total revenue
+                - expenses: total expenses
+                - roi: return on investment ratio
+
+        Returns:
+            List of allocations: [{strategy, amount, reason}]
+        """
+        reinv = self.config.reinvestment
+        if not strategy_performance:
+            return []
+
+        allocations = []
+        remaining = reinvest_amount
+
+        # Separate winners and losers
+        winners = sorted(
+            [s for s in strategy_performance if s.get("roi", 0) > 1.0],
+            key=lambda s: s.get("roi", 0),
+            reverse=True,
+        )
+        losers = [s for s in strategy_performance if s.get("roi", 0) < 0.5]
+        neutral = [s for s in strategy_performance
+                   if 0.5 <= s.get("roi", 0) <= 1.0]
+
+        # Cut losers first (free up budget)
+        if reinv.cut_losers and losers:
+            for loser in losers:
+                allocations.append({
+                    "strategy": loser["name"],
+                    "amount": 0,
+                    "action": "reduce",
+                    "reason": f"ROI {loser.get('roi', 0):.2f}x — below threshold",
+                })
+
+        # Scale winners
+        if reinv.scale_winners and winners and remaining > 0:
+            # Weight by ROI — higher ROI gets proportionally more
+            total_roi = sum(w.get("roi", 1) for w in winners)
+            for winner in winners:
+                share = (winner.get("roi", 1) / total_roi) * remaining
+                amount = min(share, reinv.max_strategy_boost)
+                amount = round(amount, 2)
+                allocations.append({
+                    "strategy": winner["name"],
+                    "amount": amount,
+                    "action": "boost",
+                    "reason": f"ROI {winner.get('roi', 0):.2f}x — scaling up",
+                })
+                remaining -= amount
+
+        # Distribute remainder evenly to neutral strategies
+        if neutral and remaining > 0:
+            per_neutral = round(remaining / len(neutral), 2)
+            for n in neutral:
+                amount = min(per_neutral, reinv.max_strategy_boost)
+                allocations.append({
+                    "strategy": n["name"],
+                    "amount": amount,
+                    "action": "maintain",
+                    "reason": f"ROI {n.get('roi', 0):.2f}x — steady growth",
+                })
+
+        logger.info(f"Reinvestment allocated: €{reinvest_amount:.2f} across "
+                    f"{len(allocations)} strategies")
+        return allocations

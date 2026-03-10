@@ -25,6 +25,30 @@ class RiskConfig:
 
 
 @dataclass
+class CaptchaConfig:
+    """CAPTCHA solving service for autonomous account creation."""
+    provider: str = "twocaptcha"  # twocaptcha, anticaptcha
+    twocaptcha_api_key: str = ""
+    anticaptcha_api_key: str = ""
+    api_key: str = ""  # Fallback: used if provider-specific key is empty
+    max_cost_per_solve_usd: float = 0.01  # Budget guard per CAPTCHA
+    max_daily_solves: int = 50  # Rate limit
+
+
+@dataclass
+class ReinvestmentConfig:
+    """Automatic profit reinvestment rules."""
+    enabled: bool = True
+    reinvest_pct: float = 40.0  # Reinvest 40% of net profit
+    reserve_pct: float = 30.0  # Keep 30% as safety reserve
+    creator_pct: float = 30.0  # 30% to creator (sweep)
+    min_profit_to_reinvest: float = 10.0  # Don't reinvest if profit < €10
+    max_strategy_boost: float = 50.0  # Max € to add to one strategy per cycle
+    scale_winners: bool = True  # Give more budget to high-ROI strategies
+    cut_losers: bool = True  # Reduce budget for negative-ROI strategies
+
+
+@dataclass
 class BudgetConfig:
     max_cycle_cost: float = 5.0  # Max EUR per orchestration cycle
     max_cycle_calls: int = 200  # Max LLM calls per cycle
@@ -185,6 +209,8 @@ class Config:
     monero: MoneroConfig = field(default_factory=MoneroConfig)
     btcpay: BTCPayConfig = field(default_factory=BTCPayConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
+    captcha: CaptchaConfig = field(default_factory=CaptchaConfig)
+    reinvestment: ReinvestmentConfig = field(default_factory=ReinvestmentConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     initial_capital: float = 500.0  # €500 initial budget
     currency: str = "EUR"
@@ -219,6 +245,10 @@ class Config:
                 config.btcpay = BTCPayConfig(**data["btcpay"])
             if "budget" in data:
                 config.budget = BudgetConfig(**data["budget"])
+            if "captcha" in data:
+                config.captcha = CaptchaConfig(**data["captcha"])
+            if "reinvestment" in data:
+                config.reinvestment = ReinvestmentConfig(**data["reinvestment"])
             if "initial_capital" in data:
                 config.initial_capital = data["initial_capital"]
             if "currency" in data:
@@ -317,6 +347,21 @@ class Config:
                 "max_cycle_cost": self.budget.max_cycle_cost,
                 "max_cycle_calls": self.budget.max_cycle_calls,
                 "budget_fraction_per_cycle": self.budget.budget_fraction_per_cycle,
+            },
+            "captcha": {
+                "provider": self.captcha.provider,
+                "max_cost_per_solve_usd": self.captcha.max_cost_per_solve_usd,
+                "max_daily_solves": self.captcha.max_daily_solves,
+            },
+            "reinvestment": {
+                "enabled": self.reinvestment.enabled,
+                "reinvest_pct": self.reinvestment.reinvest_pct,
+                "reserve_pct": self.reinvestment.reserve_pct,
+                "creator_pct": self.reinvestment.creator_pct,
+                "min_profit_to_reinvest": self.reinvestment.min_profit_to_reinvest,
+                "max_strategy_boost": self.reinvestment.max_strategy_boost,
+                "scale_winners": self.reinvestment.scale_winners,
+                "cut_losers": self.reinvestment.cut_losers,
             },
             "initial_capital": self.initial_capital,
             "currency": self.currency,
