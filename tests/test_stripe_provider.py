@@ -172,7 +172,7 @@ class TestStripeWebhook:
         headers = {"stripe-signature": f"t={timestamp},v1={sig}"}
 
         import asyncio
-        event = asyncio.get_event_loop().run_until_complete(
+        event = asyncio.run(
             provider.handle_webhook(payload, headers)
         )
 
@@ -187,7 +187,7 @@ class TestStripeWebhook:
         headers = {"stripe-signature": "t=123,v1=invalidsig"}
 
         import asyncio
-        event = asyncio.get_event_loop().run_until_complete(
+        event = asyncio.run(
             provider.handle_webhook(payload, headers)
         )
 
@@ -203,7 +203,7 @@ class TestStripeWebhook:
         headers = {"stripe-signature": f"t={old_timestamp},v1={sig}"}
 
         import asyncio
-        event = asyncio.get_event_loop().run_until_complete(
+        event = asyncio.run(
             provider.handle_webhook(payload, headers)
         )
 

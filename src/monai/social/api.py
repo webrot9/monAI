@@ -419,11 +419,8 @@ class IndieHackersClient(BasePlatformClient):
                 await browser.stop()
 
         import asyncio
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(_post())
-        finally:
-            loop.close()
+        from monai.agents.base import BaseAgent
+        return BaseAgent._run_async(_post())
 
     def get_post_metrics(self, post_id: str) -> dict[str, Any]:
         """Scrape metrics from an IH post page."""
@@ -457,11 +454,8 @@ class IndieHackersClient(BasePlatformClient):
             finally:
                 await browser.stop()
 
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(_get_metrics())
-        finally:
-            loop.close()
+        from monai.agents.base import BaseAgent
+        return BaseAgent._run_async(_get_metrics())
 
     def get_profile_metrics(self) -> dict[str, Any]:
         return {"followers": 0}

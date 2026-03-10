@@ -193,47 +193,42 @@ class LLCProvisioner(BaseAgent):
 
         # Execute each step in order, skipping completed ones
         steps = self._get_steps(llc_name)
-        loop = asyncio.new_event_loop()
 
-        try:
-            for step in steps:
-                if step["status"] == "completed":
-                    results["steps"][step["step_name"]] = {"status": "completed"}
-                    continue
+        for step in steps:
+            if step["status"] == "completed":
+                results["steps"][step["step_name"]] = {"status": "completed"}
+                continue
 
-                if step["attempts"] >= step["max_attempts"]:
-                    results["steps"][step["step_name"]] = {
-                        "status": "max_attempts_reached",
-                        "error": step.get("error", ""),
-                    }
-                    continue
+            if step["attempts"] >= step["max_attempts"]:
+                results["steps"][step["step_name"]] = {
+                    "status": "max_attempts_reached",
+                    "error": step.get("error", ""),
+                }
+                continue
 
-                self.log_action("llc_step_start", step["step_name"])
+            self.log_action("llc_step_start", step["step_name"])
 
-                try:
-                    step_result = loop.run_until_complete(
-                        self._execute_step(
-                            step["step_name"], llc_name,
-                            jurisdiction, agent_service,
-                        )
+            try:
+                step_result = self._run_async(
+                    self._execute_step(
+                        step["step_name"], llc_name,
+                        jurisdiction, agent_service,
                     )
-                    results["steps"][step["step_name"]] = step_result
+                )
+                results["steps"][step["step_name"]] = step_result
 
-                    if step_result.get("status") != "completed":
-                        # Stop pipeline on failure — next cycle will retry
-                        self.log_action("llc_step_failed",
-                                        f"{step['step_name']}: {step_result.get('error', '')}")
-                        break
-
-                except Exception as e:
-                    logger.error(f"LLC step {step['step_name']} failed: {e}")
-                    self._record_step_failure(llc_name, step["step_name"], str(e))
-                    results["steps"][step["step_name"]] = {
-                        "status": "error", "error": str(e),
-                    }
+                if step_result.get("status") != "completed":
+                    self.log_action("llc_step_failed",
+                                    f"{step['step_name']}: {step_result.get('error', '')}")
                     break
-        finally:
-            loop.close()
+
+            except Exception as e:
+                logger.error(f"LLC step {step['step_name']} failed: {e}")
+                self._record_step_failure(llc_name, step["step_name"], str(e))
+                results["steps"][step["step_name"]] = {
+                    "status": "error", "error": str(e),
+                }
+                break
 
         # Check if all steps completed
         all_done = all(

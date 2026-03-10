@@ -119,7 +119,15 @@ class AutonomousExecutor:
                     "history": self.action_history}
 
         finally:
-            await self.browser.stop()
+            try:
+                await self.browser.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping browser: {e}")
+            try:
+                if hasattr(self.http_client, 'close'):
+                    self.http_client.close()
+            except Exception as e:
+                logger.warning(f"Error closing HTTP client: {e}")
 
     def _think(self, task: str, context: str, step: int) -> dict[str, Any]:
         """Use LLM to decide the next action."""
@@ -202,30 +210,49 @@ class AutonomousExecutor:
                 return await self.browser.get_text()
 
             elif tool == "http_get":
-                self._anonymizer.maybe_rotate()
-                resp = self.http_client.get(
-                    args.get("url", ""),
-                    headers=args.get("headers", {}),
-                )
-                return {"status": resp.status_code, "body": resp.text[:2000]}
+                url = args.get("url", "")
+                if not url.startswith(("http://", "https://")):
+                    return "BLOCKED: only http/https URLs allowed"
+                try:
+                    self._anonymizer.maybe_rotate()
+                    resp = self.http_client.get(
+                        url, headers=args.get("headers", {}), timeout=30,
+                    )
+                    return {"status": resp.status_code, "body": resp.text[:2000]}
+                except Exception as e:
+                    return {"status": 0, "error": str(e)[:200]}
 
             elif tool == "http_post":
-                self._anonymizer.maybe_rotate()
-                resp = self.http_client.post(
-                    args.get("url", ""),
-                    json=args.get("data", {}),
-                    headers=args.get("headers", {}),
-                )
-                return {"status": resp.status_code, "body": resp.text[:2000]}
+                url = args.get("url", "")
+                if not url.startswith(("http://", "https://")):
+                    return "BLOCKED: only http/https URLs allowed"
+                try:
+                    self._anonymizer.maybe_rotate()
+                    resp = self.http_client.post(
+                        url, json=args.get("data", {}),
+                        headers=args.get("headers", {}), timeout=30,
+                    )
+                    return {"status": resp.status_code, "body": resp.text[:2000]}
+                except Exception as e:
+                    return {"status": 0, "error": str(e)[:200]}
 
             elif tool == "shell":
                 cmd = args.get("command", "")
                 if is_action_blocked(cmd):
                     return "BLOCKED: dangerous command"
-                # Sandbox: run shell commands from project workspace only
+                # Validate command against whitelist — no arbitrary shell execution
+                from monai.agents.ethics import is_shell_command_allowed
+                if not is_shell_command_allowed(cmd):
+                    return "BLOCKED: command not in allowed list. Only safe commands permitted."
+                # Sandbox: run as argument list (no shell=True) from workspace only
                 from monai.utils.sandbox import PROJECT_ROOT
+                import shlex
+                try:
+                    cmd_parts = shlex.split(cmd)
+                except ValueError as e:
+                    return f"BLOCKED: invalid command syntax: {e}"
                 result = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, timeout=60,
+                    cmd_parts, shell=False, capture_output=True, text=True, timeout=60,
                     cwd=str(PROJECT_ROOT / "workspace"),
                 )
                 return {"stdout": result.stdout[:2000], "stderr": result.stderr[:500],

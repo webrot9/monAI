@@ -282,9 +282,8 @@ class Orchestrator(BaseAgent):
 
         # Phase 5: Run delegated tasks via sub-agents (parallel)
         if subagent_tasks:
-            loop = asyncio.new_event_loop()
             try:
-                subagent_results = loop.run_until_complete(
+                subagent_results = self._run_async(
                     self.spawner.run_parallel(subagent_tasks)
                 )
                 cycle_result["subagent_results"] = {
@@ -293,8 +292,6 @@ class Orchestrator(BaseAgent):
             except Exception as e:
                 logger.error(f"Sub-agent execution failed: {e}")
                 cycle_result["subagent_results"] = {"error": str(e)}
-            finally:
-                loop.close()
 
         # Phase 5.5: Ethics check — test agents before letting them operate
         cycle_result["ethics"] = self._run_ethics_checks()
@@ -723,13 +720,9 @@ class Orchestrator(BaseAgent):
                 self.collab.start_work(req["id"])
 
                 try:
-                    loop = asyncio.new_event_loop()
-                    try:
-                        results = loop.run_until_complete(
-                            self.spawner.run_parallel(subagent_tasks, max_steps=20)
-                        )
-                    finally:
-                        loop.close()
+                    results = self._run_async(
+                        self.spawner.run_parallel(subagent_tasks, max_steps=20)
+                    )
 
                     task_name = subagent_tasks[0]["name"]
                     result = results.get(task_name, {})
@@ -1085,16 +1078,12 @@ class Orchestrator(BaseAgent):
             return {"status": "skipped", "reason": "not_payment_cycle"}
 
         try:
-            loop = asyncio.new_event_loop()
-            try:
-                sweep_result = loop.run_until_complete(
-                    self.payment_manager.run_sweep_cycle()
-                )
-                health = loop.run_until_complete(
-                    self.payment_manager.health_check()
-                )
-            finally:
-                loop.close()
+            sweep_result = self._run_async(
+                self.payment_manager.run_sweep_cycle()
+            )
+            health = self._run_async(
+                self.payment_manager.health_check()
+            )
 
             result = {
                 "sweep": sweep_result,

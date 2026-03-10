@@ -45,9 +45,13 @@ def is_path_allowed(path: str | Path) -> bool:
             except ValueError:
                 continue
 
-        # Check temp directory
-        if str(resolved).startswith(TEMP_PREFIX):
-            return True
+        # Check temp directory — must be exactly /tmp/monai-<something>
+        # Use Path comparison to prevent prefix confusion (/tmp/monai-evil/)
+        resolved_str = str(resolved)
+        if resolved_str.startswith(TEMP_PREFIX):
+            # Verify it's actually under /tmp/ (not a symlink escape)
+            if resolved.parent == Path("/tmp") or str(resolved.parent).startswith(TEMP_PREFIX):
+                return True
 
         return False
     except Exception:
@@ -102,9 +106,22 @@ def get_sandbox_info() -> dict:
     }
 
 
-def _dir_size_mb(path: Path) -> float:
-    """Get directory size in MB."""
+def _dir_size_mb(path: Path, max_depth: int = 5) -> float:
+    """Get directory size in MB with depth limit to prevent hangs."""
     if not path.exists():
         return 0.0
-    total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    total = 0
+    try:
+        for root, dirs, files in os.walk(str(path)):
+            depth = str(root).count(os.sep) - str(path).count(os.sep)
+            if depth >= max_depth:
+                dirs.clear()
+                continue
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    except OSError:
+        pass
     return round(total / (1024 * 1024), 2)

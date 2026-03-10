@@ -89,6 +89,13 @@ class CostTracker:
         with self._lock:
             self.cycle_cost = 0.0
             self.cycle_calls = 0
+            # Prevent unbounded dict growth — keep only top 100 entries
+            if len(self.cost_by_caller) > 100:
+                sorted_callers = sorted(self.cost_by_caller.items(), key=lambda x: x[1], reverse=True)
+                self.cost_by_caller = dict(sorted_callers[:50])
+            if len(self.cost_by_model) > 50:
+                sorted_models = sorted(self.cost_by_model.items(), key=lambda x: x[1], reverse=True)
+                self.cost_by_model = dict(sorted_models[:25])
 
     def set_cycle_limits(self, max_cost: float, max_calls: int) -> None:
         """Update per-cycle budget limits."""
@@ -363,5 +370,5 @@ class LLM:
                 "VALUES ('expense', 'api_cost', ?, 'EUR', ?)",
                 (cost, f"OpenAI {model}: {input_tokens}in/{output_tokens}out by {self.caller}"),
             )
-        except Exception:
-            pass  # Don't let logging failures break the agent
+        except Exception as e:
+            logger.warning(f"Failed to persist cost to DB: {e}")

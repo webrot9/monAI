@@ -197,4 +197,14 @@ class Browser:
 
 def run_browser_task(config: Config, coro):
     """Helper to run an async browser task from sync code."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result()
+    return asyncio.run(coro)

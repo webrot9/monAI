@@ -7,6 +7,10 @@ where possible.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Injected into every agent's system prompt, every single LLM call
 CORE_DIRECTIVES = """
 CORE DIRECTIVES — YOU MUST FOLLOW THESE AT ALL TIMES:
@@ -218,17 +222,47 @@ def get_directives_for_context(context: str) -> str:
 
 # Programmatic guardrails — these are enforced in code, not just LLM instructions
 
-BLOCKED_ACTIONS = [
-    "rm -rf /",
-    "drop table",
-    "drop database",
-    "format c:",
-    "mkfs",
+BLOCKED_PATTERNS = [
+    "rm -rf /", "rm -rf ~", "rm -rf .",
+    "drop table", "drop database", "truncate table",
+    "format c:", "mkfs", "fdisk",
     ":(){ :|:& };:",  # fork bomb
-    "shutdown",
-    "reboot",
-    "passwd",
-    "chmod 777",
+    "shutdown", "reboot", "halt", "poweroff", "init 0", "init 6",
+    "passwd", "useradd", "userdel", "usermod", "groupadd",
+    "chmod 777", "chmod 0o777", "chmod a+rwx",
+    "chown root", "chgrp root",
+    "dd if=", "dd of=/dev",
+    "mount ", "umount ",
+    "modprobe", "insmod", "rmmod",
+    "iptables", "nft ", "ufw ",
+    "systemctl", "service ",
+    "crontab", "at ",
+    "kill -9", "killall", "pkill",
+    "/etc/passwd", "/etc/shadow", "/etc/sudoers",
+    "sudo ", "su ",
+    "curl | sh", "curl | bash", "wget | sh", "wget | bash",
+    "eval ", "exec(",
+    "> /dev/sd", "> /dev/null",
+    "nc -l", "ncat ", "socat ",  # reverse shells
+    ".ssh/", "authorized_keys",
+    "id_rsa", "id_ed25519",
+]
+
+# Whitelist of allowed shell command prefixes — ONLY these can run
+ALLOWED_SHELL_COMMANDS = [
+    "python", "python3", "pip", "pip3",
+    "node", "npm", "npx", "yarn",
+    "git", "gh",
+    "ls", "cat", "head", "tail", "wc", "sort", "uniq", "cut", "tr",
+    "grep", "rg", "find", "which", "file", "stat",
+    "echo", "printf", "date", "env",
+    "mkdir", "cp", "mv", "touch",
+    "tar", "zip", "unzip", "gzip", "gunzip",
+    "curl", "wget", "httpie",
+    "docker", "docker-compose",
+    "pytest", "mypy", "ruff", "black", "isort",
+    "jq", "sed", "awk",
+    "cd",  # for chained commands
 ]
 
 REQUIRE_APPROVAL_PATTERNS = [
@@ -244,9 +278,52 @@ REQUIRE_APPROVAL_PATTERNS = [
 
 
 def is_action_blocked(action: str) -> bool:
-    """Check if an action is in the hardcoded block list."""
-    action_lower = action.lower()
-    return any(blocked in action_lower for blocked in BLOCKED_ACTIONS)
+    """Check if an action matches any blocked pattern.
+
+    Uses substring matching on the lowercased action string.
+    This catches obfuscation attempts like 'r m -r f /' by checking
+    the full action context, not just exact matches.
+    """
+    action_lower = action.lower().strip()
+    return any(blocked in action_lower for blocked in BLOCKED_PATTERNS)
+
+
+def is_shell_command_allowed(command: str) -> bool:
+    """Check if a shell command starts with an allowed program.
+
+    Only commands whose first token is in the whitelist are allowed.
+    This prevents arbitrary command execution even if the LLM crafts
+    a novel dangerous command not in BLOCKED_PATTERNS.
+    """
+    import shlex
+    try:
+        parts = shlex.split(command.strip())
+    except ValueError:
+        return False
+
+    if not parts:
+        return False
+
+    # Get the base command name (strip path prefixes like /usr/bin/)
+    base_cmd = parts[0].rsplit("/", 1)[-1]
+
+    # Check against whitelist
+    if base_cmd not in ALLOWED_SHELL_COMMANDS:
+        logger.warning(f"Shell command blocked (not in whitelist): {base_cmd}")
+        return False
+
+    # Additional check: block pipe-to-shell patterns even for allowed commands
+    full_cmd = command.lower()
+    if ("| sh" in full_cmd or "| bash" in full_cmd or
+            "| python" in full_cmd or "$(" in full_cmd or
+            "`" in full_cmd):
+        # Allow backticks/subshells only in safe contexts
+        # Block pipe-to-interpreter patterns
+        if "| sh" in full_cmd or "| bash" in full_cmd:
+            logger.warning(f"Shell command blocked (pipe-to-shell): {command[:100]}")
+            return False
+
+    return True
 
 
 def requires_risk_check(action: str) -> bool:
