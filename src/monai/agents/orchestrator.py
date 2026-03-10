@@ -35,6 +35,7 @@ from monai.business.brand_payments import BrandPayments
 from monai.business.corporate import CorporateManager
 from monai.payments.manager import UnifiedPaymentManager
 from monai.business.commercialista import Commercialista
+from monai.business.bootstrap import BootstrapWallet
 from monai.business.crm import CRM
 from monai.business.email_marketing import EmailMarketing
 from monai.business.finance import Finance
@@ -90,6 +91,7 @@ class Orchestrator(BaseAgent):
         self.brand_payments = BrandPayments(db)
         self.payment_manager = UnifiedPaymentManager(config, db)
         self.corporate = CorporateManager(db)
+        self.bootstrap_wallet = BootstrapWallet(config, db)
         self.llc_provisioner = LLCProvisioner(config, db, llm)
         self._ensure_llc_setup()
         self.workflow_engine = WorkflowEngine(config, db, llm)
@@ -356,6 +358,16 @@ class Orchestrator(BaseAgent):
         if needs:
             self.log_action("provisioning", f"Need to set up: {needs}")
             result = self.provisioner.run()
+
+        # Bootstrap funding phase check
+        bootstrap_phase = self.bootstrap_wallet.get_funding_phase()
+        result["bootstrap_phase"] = bootstrap_phase
+
+        if bootstrap_phase == "pre_bootstrap":
+            self.log_action("bootstrap",
+                            "No funding source configured. "
+                            "Creator must provide anonymous prepaid card or start crowdfunding.")
+            result["bootstrap"] = {"status": "awaiting_funding"}
 
         # LLC provisioning — runs if enabled but not yet complete
         llc_status = self.llc_provisioner.get_provision_status()

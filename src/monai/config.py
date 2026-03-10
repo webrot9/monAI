@@ -108,6 +108,29 @@ class LLCConfig:
 
 
 @dataclass
+class BootstrapWalletConfig:
+    """Anonymous prepaid card for monAI's initial bootstrap spending.
+
+    The creator buys a prepaid Visa/Mastercard with CASH at a tabaccheria.
+    No ID required under €150. Used ONLY for the absolute minimum:
+    - 1 domain for crowdfunding landing page (~€10)
+    - 1 month hosting (~€5)
+
+    Once crowdfunding raises funds, the prepaid card is retired.
+    All further spending goes through crowdfunding → LLC → bank.
+    """
+    enabled: bool = False
+    card_type: str = ""  # visa_gift, postepay_usa_getta, generic_prepaid
+    card_number: str = ""
+    card_expiry: str = ""  # MM/YY
+    card_cvv: str = ""
+    card_name: str = ""  # Can be any name for anonymous prepaids
+    loaded_amount: float = 250.0  # Cash loaded onto the card
+    spend_limit_per_tx: float = 50.0  # Low limit — only for domain/hosting
+    retired: bool = False  # True once crowdfunding or LLC bank is active
+
+
+@dataclass
 class MoneroConfig:
     """Monero wallet RPC connection for the brand wallets."""
     wallet_rpc_url: str = "http://127.0.0.1:18082"
@@ -133,6 +156,7 @@ class Config:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     creator_wallet: CreatorWalletConfig = field(default_factory=CreatorWalletConfig)
     llc: LLCConfig = field(default_factory=LLCConfig)
+    bootstrap_wallet: BootstrapWalletConfig = field(default_factory=BootstrapWalletConfig)
     monero: MoneroConfig = field(default_factory=MoneroConfig)
     btcpay: BTCPayConfig = field(default_factory=BTCPayConfig)
     initial_capital: float = 500.0  # €500 initial budget
@@ -159,6 +183,8 @@ class Config:
                 config.creator_wallet = CreatorWalletConfig(**data["creator_wallet"])
             if "llc" in data:
                 config.llc = LLCConfig(**data["llc"])
+            if "bootstrap_wallet" in data:
+                config.bootstrap_wallet = BootstrapWalletConfig(**data["bootstrap_wallet"])
             if "monero" in data:
                 config.monero = MoneroConfig(**data["monero"])
             if "btcpay" in data:
@@ -224,6 +250,21 @@ class Config:
                 "contractor_rate_percentage": self.llc.contractor_rate_percentage,
                 "contractor_rate_amount": self.llc.contractor_rate_amount,
                 "contractor_payment_method": self.llc.contractor_payment_method,
+                "contractor_tax_id": self.llc.contractor_tax_id,
+                "contractor_tax_regime": self.llc.contractor_tax_regime,
+                "multi_llc": self.llc.multi_llc,
+                "expense_budget_monthly": self.llc.expense_budget_monthly,
+            },
+            "bootstrap_wallet": {
+                "enabled": self.bootstrap_wallet.enabled,
+                "card_type": self.bootstrap_wallet.card_type,
+                "card_number": self.bootstrap_wallet.card_number,
+                "card_expiry": self.bootstrap_wallet.card_expiry,
+                "card_cvv": self.bootstrap_wallet.card_cvv,
+                "card_name": self.bootstrap_wallet.card_name,
+                "loaded_amount": self.bootstrap_wallet.loaded_amount,
+                "spend_limit_per_tx": self.bootstrap_wallet.spend_limit_per_tx,
+                "retired": self.bootstrap_wallet.retired,
             },
             "creator_wallet": {
                 "xmr_address": self.creator_wallet.xmr_address,
