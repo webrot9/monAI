@@ -30,12 +30,9 @@ def config():
     cfg = Config()
     cfg.bootstrap_wallet = BootstrapWalletConfig(
         enabled=True,
-        card_type="visa_gift",
-        card_number="4111222233334444",
-        card_expiry="12/27",
-        card_cvv="123",
-        card_name="Anonymous",
-        loaded_amount=250.0,
+        method="paysafecard",
+        paysafecard_pin="1234567890123456",
+        loaded_amount=50.0,
         spend_limit_per_tx=50.0,
         retired=False,
     )
@@ -51,7 +48,7 @@ class TestPrepaidCardSpending:
     def test_can_spend_valid(self, wallet):
         result = wallet.can_spend_prepaid(10.0, "domain")
         assert result["allowed"] is True
-        assert result["remaining_after"] == 240.0
+        assert result["remaining_after"] == 40.0
 
     def test_can_spend_exceeds_limit(self, wallet):
         result = wallet.can_spend_prepaid(100.0, "domain")
@@ -79,20 +76,19 @@ class TestPrepaidCardSpending:
         result = wallet.spend_prepaid(10.0, "monai.fund domain", "domain", "Namecheap")
         assert "error" not in result
         assert result["source"] == "prepaid_card"
-        assert result["remaining"] == 240.0
+        assert result["remaining"] == 40.0
 
     def test_spend_prepaid_tracks_balance(self, wallet):
         wallet.spend_prepaid(10.0, "Domain", "domain")
         wallet.spend_prepaid(5.0, "Hosting", "hosting")
 
         assert wallet.get_prepaid_total_spent() == 15.0
-        assert wallet.get_prepaid_remaining() == 235.0
+        assert wallet.get_prepaid_remaining() == 35.0
 
     def test_spend_prepaid_insufficient(self, wallet):
-        wallet.config.bootstrap_wallet.loaded_amount = 10.0
-        wallet.spend_prepaid(8.0, "Domain", "domain")
+        wallet.spend_prepaid(40.0, "Domain", "domain")
 
-        result = wallet.spend_prepaid(5.0, "Hosting", "hosting")
+        result = wallet.spend_prepaid(15.0, "Hosting", "hosting")
         assert "error" in result
         assert "Insufficient" in result["error"]
 
@@ -216,7 +212,7 @@ class TestBootstrapSummary:
         assert "crowdfunding" in summary
         assert "total_bootstrap_funds" in summary
 
-        assert summary["prepaid_card"]["loaded"] == 250.0
+        assert summary["prepaid_card"]["loaded"] == 50.0
         assert summary["prepaid_card"]["enabled"] is True
 
     def test_summary_with_spending(self, wallet):

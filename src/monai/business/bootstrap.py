@@ -2,10 +2,11 @@
 
 Two-phase bootstrap:
 
-    Phase 1: Anonymous prepaid card (€200-300 cash from tabaccheria)
+    Phase 1: Paysafecard voucher (€50-100 from tabaccheria, no ID required)
         - ONLY for domain + hosting of crowdfunding landing page
         - Retired as soon as crowdfunding or LLC bank is active
         - spend_limit_per_tx enforced (€50 max)
+        - Alternative: Veritas card (Lithuanian, online, IBAN included)
 
     Phase 2: AI Crowdfunding
         - monAI declares itself as an AI and crowdfunds publicly
@@ -177,7 +178,13 @@ class BootstrapWallet:
         if not check["allowed"]:
             return {"error": check["reason"]}
 
-        card_last4 = self.config.bootstrap_wallet.card_number[-4:] if self.config.bootstrap_wallet.card_number else "????"
+        wallet = self.config.bootstrap_wallet
+        if wallet.method == "paysafecard" and wallet.paysafecard_pin:
+            card_last4 = wallet.paysafecard_pin[-4:]
+        elif wallet.card_number:
+            card_last4 = wallet.card_number[-4:]
+        else:
+            card_last4 = "????"
 
         tx_id = self.db.execute_insert(
             "INSERT INTO bootstrap_transactions "

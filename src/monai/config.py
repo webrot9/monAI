@@ -109,23 +109,27 @@ class LLCConfig:
 
 @dataclass
 class BootstrapWalletConfig:
-    """Anonymous prepaid card for monAI's initial bootstrap spending.
+    """Anonymous bootstrap funding for monAI's initial spending.
 
-    The creator buys a prepaid Visa/Mastercard with CASH at a tabaccheria.
-    No ID required under €150. Used ONLY for the absolute minimum:
+    Primary method: Paysafecard voucher from tabaccheria (no ID required).
+    Alternative: Veritas card (Lithuanian, online registration, more capable).
+
+    Used ONLY for the absolute minimum:
     - 1 domain for crowdfunding landing page (~€10)
     - 1 month hosting (~€5)
 
-    Once crowdfunding raises funds, the prepaid card is retired.
+    Once crowdfunding raises funds, the voucher is retired.
     All further spending goes through crowdfunding → LLC → bank.
     """
     enabled: bool = False
-    card_type: str = ""  # visa_gift, postepay_usa_getta, generic_prepaid
+    method: str = ""  # paysafecard, veritas, gift_card
+    # Paysafecard: 16-digit PIN from voucher
+    paysafecard_pin: str = ""
+    # Veritas: card details (if using Veritas instead)
     card_number: str = ""
     card_expiry: str = ""  # MM/YY
     card_cvv: str = ""
-    card_name: str = ""  # Can be any name for anonymous prepaids
-    loaded_amount: float = 250.0  # Cash loaded onto the card
+    loaded_amount: float = 50.0  # Paysafecard voucher amount
     spend_limit_per_tx: float = 50.0  # Low limit — only for domain/hosting
     retired: bool = False  # True once crowdfunding or LLC bank is active
 
@@ -257,11 +261,11 @@ class Config:
             },
             "bootstrap_wallet": {
                 "enabled": self.bootstrap_wallet.enabled,
-                "card_type": self.bootstrap_wallet.card_type,
+                "method": self.bootstrap_wallet.method,
+                "paysafecard_pin": self.bootstrap_wallet.paysafecard_pin,
                 "card_number": self.bootstrap_wallet.card_number,
                 "card_expiry": self.bootstrap_wallet.card_expiry,
                 "card_cvv": self.bootstrap_wallet.card_cvv,
-                "card_name": self.bootstrap_wallet.card_name,
                 "loaded_amount": self.bootstrap_wallet.loaded_amount,
                 "spend_limit_per_tx": self.bootstrap_wallet.spend_limit_per_tx,
                 "retired": self.bootstrap_wallet.retired,

@@ -18,6 +18,7 @@ from monai.agents.browser_learner import BrowserLearner
 from monai.agents.collaboration import CollaborationHub
 from monai.agents.eng_team import EngineeringTeam
 from monai.agents.ethics_test import EthicsTester
+from monai.agents.fact_checker import FactChecker
 from monai.agents.finance_expert import FinanceExpert
 from monai.agents.humanizer import Humanizer
 from monai.agents.marketing_team import MarketingTeam
@@ -79,6 +80,7 @@ class Orchestrator(BaseAgent):
         self.collab = CollaborationHub(config, db)
         self.eng_team = EngineeringTeam(config, db, llm)
         self.humanizer = Humanizer(config, db, llm)
+        self.fact_checker = FactChecker(config, db, llm)
         self.browser_learner = BrowserLearner(config, db, llm)
         self.phone_provisioner = PhoneProvisioner(config, db, llm)
         self.finance_expert = FinanceExpert(config, db, llm, commercialista=self.commercialista)
