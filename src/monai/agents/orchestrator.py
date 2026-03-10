@@ -359,7 +359,53 @@ class Orchestrator(BaseAgent):
         # Persist cost tracker state for session continuity
         get_cost_tracker().save_state(str(self.config.data_dir / "cost_tracker.json"))
 
+        # Phase 10: Auto-alerts to creator via Telegram
+        self._send_auto_alerts(cycle_result, updated_budget)
+
         return cycle_result
+
+    def _send_auto_alerts(self, cycle_result: dict, budget: dict):
+        """Send automatic Telegram alerts for critical events."""
+        if not self.config.telegram.enabled or not self.config.telegram.bot_token:
+            return
+
+        alerts = []
+
+        # Revenue alert — celebrate first money
+        net_profit = cycle_result.get("net_profit", 0)
+        if net_profit > 0:
+            today = self.finance.get_daily_summary()
+            if today.get("revenue", 0) > 0:
+                alerts.append(f"💰 Revenue today: €{today['revenue']:.2f} "
+                              f"(Net: €{today['net']:.2f})")
+
+        # Budget critical
+        if budget.get("balance", 0) <= 0:
+            alerts.append("🚨 BUDGET EXHAUSTED — all spending paused")
+        elif budget.get("days_until_broke") and budget["days_until_broke"] < 3:
+            alerts.append(f"⚠️ {budget['days_until_broke']} days of budget left "
+                          f"(€{budget['balance']:.2f})")
+
+        # Self-sustaining milestone
+        if budget.get("self_sustaining") and self._cycle <= 5:
+            alerts.append("🎉 MILESTONE: monAI is self-sustaining! Revenue ≥ Expenses")
+
+        # Strategy stopped
+        reviews = cycle_result.get("reviews", {})
+        if isinstance(reviews, dict):
+            for strat_name, review in reviews.items():
+                if isinstance(review, dict) and review.get("paused"):
+                    alerts.append(f"⏸ Strategy paused: {strat_name} "
+                                  f"({review.get('reason', 'low performance')})")
+
+        # Send condensed report
+        if alerts:
+            msg = "📊 monAI Cycle Report\n\n" + "\n".join(alerts)
+            msg += f"\n\n💶 Balance: €{budget.get('balance', 0):.2f}"
+            try:
+                self.telegram.send_message(msg)
+            except Exception as e:
+                logger.debug(f"Telegram alert failed: {e}")
 
     def _ensure_llc_setup(self) -> None:
         """Auto-provision LLC entity and contractor from config if not in DB."""
