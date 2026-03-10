@@ -1,20 +1,27 @@
-"""Bootstrap funding — anonymous seed capital for monAI's first operations.
+"""Bootstrap funding — seed capital for monAI's first operations.
 
-Two-phase bootstrap:
+Bootstrap paths (choose one or combine):
 
-    Phase 1: Paysafecard voucher (€50-100 from tabaccheria, no ID required)
+    Path A: Creator donates via crowdfunding (RECOMMENDED)
+        - Creator "donates" on Ko-fi like any other backer
+        - Indistinguishable from organic backers on the platform
+        - No anonymous prepaid card needed — simplest path
+        - Tagged internally as creator_seed for audit trail
+
+    Path B: Paysafecard voucher (€50-100 from tabaccheria, no ID required)
         - ONLY for domain + hosting of crowdfunding landing page
         - Retired as soon as crowdfunding or LLC bank is active
         - spend_limit_per_tx enforced (€50 max)
-        - Alternative: Veritas card (Lithuanian, online, IBAN included)
 
-    Phase 2: AI Crowdfunding
+    Path C: Both — Paysafecard for initial domain, then creator + public crowdfunding
+
+    AI Crowdfunding (all paths):
         - monAI declares itself as an AI and crowdfunds publicly
         - "The first AI-funded startup" — viral marketing angle
         - Funds collected via Ko-fi / Buy Me a Coffee / Gumroad (no LLC needed)
         - Used for: LLC formation, registered agent, bank account, first months
 
-    Phase 3: Self-sustaining (LLC active)
+    Self-sustaining (LLC active):
         - All revenue flows through LLC bank
         - Prepaid card retired, crowdfunding optional
         - monAI pays its own bills from revenue
@@ -219,6 +226,75 @@ class BootstrapWallet:
         self.config.bootstrap_wallet.retired = True
         logger.info("Bootstrap prepaid card retired — switching to crowdfunding/LLC funds")
 
+    # ── Creator Seed Donation ────────────────────────────────────
+
+    def record_creator_donation(self, campaign_id: int, amount: float,
+                                alias: str = "Anonymous") -> dict[str, Any]:
+        """Creator donates to the crowdfunding campaign like any other backer.
+
+        From the platform's perspective, this is a normal donation.
+        Internally tracked as 'creator_seed' for audit trail.
+        The alias should NOT be the creator's real name.
+        """
+        campaign = self.get_campaign(campaign_id)
+        if not campaign:
+            return {"error": f"Campaign {campaign_id} not found"}
+
+        # Record as a normal contribution on the platform side
+        contrib_id = self.db.execute_insert(
+            "INSERT INTO crowdfunding_contributions "
+            "(campaign_id, amount, backer_name, message, platform_tx_id) "
+            "VALUES (?, ?, ?, 'Seed donation', 'creator_seed')",
+            (campaign_id, amount, alias),
+        )
+
+        # Update campaign totals (same as any backer)
+        self.db.execute(
+            "UPDATE crowdfunding_campaigns SET "
+            "raised_amount = raised_amount + ?, "
+            "backer_count = backer_count + 1, "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (amount, campaign_id),
+        )
+
+        # Check if goal reached
+        campaign = self.get_campaign(campaign_id)
+        if campaign and campaign["raised_amount"] >= campaign["goal_amount"]:
+            self.db.execute(
+                "UPDATE crowdfunding_campaigns SET status = 'funded', "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (campaign_id,),
+            )
+
+        # Record as bootstrap transaction with creator_seed source
+        self.db.execute_insert(
+            "INSERT INTO bootstrap_transactions "
+            "(source, amount, description, vendor, category) "
+            "VALUES ('creator_seed', ?, ?, ?, 'crowdfunding_income')",
+            (amount, f"Creator seed donation via {campaign['platform']}",
+             f"campaign_{campaign_id}"),
+        )
+
+        logger.info(f"Creator seed donation: €{amount:.2f} to campaign {campaign_id} as '{alias}'")
+
+        return {
+            "id": contrib_id,
+            "source": "creator_seed",
+            "amount": amount,
+            "campaign_id": campaign_id,
+            "alias_used": alias,
+            "campaign_raised": campaign["raised_amount"],
+        }
+
+    def get_creator_seed_total(self) -> float:
+        """Total amount the creator has seeded via crowdfunding."""
+        rows = self.db.execute(
+            "SELECT COALESCE(SUM(amount), 0) as total "
+            "FROM bootstrap_transactions "
+            "WHERE source = 'creator_seed' AND status = 'completed'"
+        )
+        return rows[0]["total"] if rows else 0.0
+
     # ── Crowdfunding ───────────────────────────────────────────
 
     def create_campaign(self, platform: str, title: str,
@@ -329,10 +405,12 @@ class BootstrapWallet:
         )]
 
     def get_crowdfunding_total_raised(self) -> float:
+        """Total raised from all crowdfunding sources (organic + creator seed)."""
         rows = self.db.execute(
             "SELECT COALESCE(SUM(amount), 0) as total "
             "FROM bootstrap_transactions "
-            "WHERE source = 'crowdfunding' AND amount > 0 AND status = 'completed'"
+            "WHERE source IN ('crowdfunding', 'creator_seed') "
+            "AND amount > 0 AND status = 'completed'"
         )
         return rows[0]["total"] if rows else 0.0
 
@@ -364,7 +442,7 @@ class BootstrapWallet:
         if entity and entity.get("bank_account_id"):
             return "self_sustaining"
 
-        # Check crowdfunding status
+        # Check crowdfunding status (includes creator seed donations)
         campaigns = self.get_active_campaigns()
         if campaigns or self.get_crowdfunding_total_raised() > 0:
             return "crowdfunding"
@@ -383,6 +461,7 @@ class BootstrapWallet:
         prepaid_spent = self.get_prepaid_total_spent()
         crowdfunding_raised = self.get_crowdfunding_total_raised()
         crowdfunding_spent = self.get_crowdfunding_total_spent()
+        creator_seed = self.get_creator_seed_total()
 
         all_txs = self.db.execute(
             "SELECT * FROM bootstrap_transactions ORDER BY created_at DESC LIMIT 10"
@@ -403,6 +482,8 @@ class BootstrapWallet:
             },
             "crowdfunding": {
                 "total_raised": crowdfunding_raised,
+                "creator_seed": creator_seed,
+                "organic_raised": crowdfunding_raised - creator_seed,
                 "total_spent": crowdfunding_spent,
                 "available": crowdfunding_raised - crowdfunding_spent,
                 "campaigns": [dict(c) for c in campaigns],

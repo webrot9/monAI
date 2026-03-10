@@ -226,6 +226,111 @@ class TestBootstrapSummary:
         assert summary["total_bootstrap_spent"] == 15.0
 
 
+class TestCreatorDonation:
+    def test_creator_seed_donation(self, wallet):
+        cid = wallet.create_campaign("kofi", "monAI Bootstrap", "First AI startup", 500.0)
+        result = wallet.record_creator_donation(cid, 200.0, alias="Supporter42")
+
+        assert "error" not in result
+        assert result["source"] == "creator_seed"
+        assert result["amount"] == 200.0
+        assert result["alias_used"] == "Supporter42"
+
+    def test_creator_seed_shows_as_normal_backer(self, wallet):
+        """On the platform side, creator donation looks like any other contribution."""
+        cid = wallet.create_campaign("kofi", "Test", "Test", 500.0)
+        wallet.record_creator_donation(cid, 100.0, alias="EarlyFan")
+
+        contribs = wallet.get_campaign_contributions(cid)
+        assert len(contribs) == 1
+        assert contribs[0]["backer_name"] == "EarlyFan"
+        # Campaign totals reflect it like any backer
+        campaign = wallet.get_campaign(cid)
+        assert campaign["raised_amount"] == 100.0
+        assert campaign["backer_count"] == 1
+
+    def test_creator_seed_counted_in_crowdfunding_total(self, wallet):
+        cid = wallet.create_campaign("kofi", "Test", "Test", 500.0)
+        wallet.record_creator_donation(cid, 150.0)
+        wallet.record_contribution(cid, 50.0, backer_name="RealBacker")
+
+        assert wallet.get_crowdfunding_total_raised() == 200.0
+        assert wallet.get_creator_seed_total() == 150.0
+
+    def test_creator_seed_spendable_as_crowdfunding(self, wallet):
+        """Creator seed funds are spendable just like organic crowdfunding."""
+        cid = wallet.create_campaign("kofi", "Test", "Test", 500.0)
+        wallet.record_creator_donation(cid, 300.0)
+
+        result = wallet.spend_crowdfunding(100.0, "Domain registration", "domain")
+        assert "error" not in result
+        assert result["remaining"] == 200.0
+
+    def test_creator_seed_triggers_crowdfunding_phase(self, wallet):
+        """Creator donation alone should move phase to 'crowdfunding'."""
+        wallet.config.bootstrap_wallet.retired = True
+        cid = wallet.create_campaign("kofi", "Test", "Test", 500.0)
+        wallet.record_creator_donation(cid, 200.0)
+
+        assert wallet.get_funding_phase() == "crowdfunding"
+
+    def test_creator_seed_can_fund_campaign(self, wallet):
+        """Creator donation can push campaign to 'funded' status."""
+        cid = wallet.create_campaign("kofi", "Test", "Test", 100.0)
+        wallet.record_creator_donation(cid, 120.0)
+
+        campaign = wallet.get_campaign(cid)
+        assert campaign["status"] == "funded"
+
+    def test_creator_seed_mixed_with_organic(self, wallet):
+        """Mix of creator seed + organic backers works correctly."""
+        cid = wallet.create_campaign("kofi", "monAI", "Test", 500.0)
+        wallet.record_creator_donation(cid, 200.0, alias="Anonymous")
+        wallet.record_contribution(cid, 100.0, backer_name="Alice")
+        wallet.record_contribution(cid, 50.0, backer_name="Bob")
+
+        campaign = wallet.get_campaign(cid)
+        assert campaign["raised_amount"] == 350.0
+        assert campaign["backer_count"] == 3
+
+        assert wallet.get_creator_seed_total() == 200.0
+        assert wallet.get_crowdfunding_available() == 350.0
+
+    def test_creator_seed_in_summary(self, wallet):
+        cid = wallet.create_campaign("kofi", "Test", "Test", 500.0)
+        wallet.record_creator_donation(cid, 250.0)
+        wallet.record_contribution(cid, 100.0, backer_name="Fan")
+
+        summary = wallet.get_bootstrap_summary()
+        assert summary["crowdfunding"]["creator_seed"] == 250.0
+        assert summary["crowdfunding"]["organic_raised"] == 100.0
+        assert summary["crowdfunding"]["total_raised"] == 350.0
+
+    def test_creator_seed_invalid_campaign(self, wallet):
+        result = wallet.record_creator_donation(999, 100.0)
+        assert "error" in result
+
+    def test_creator_seed_default_alias(self, wallet):
+        """Default alias is 'Anonymous' — no creator name leaked."""
+        cid = wallet.create_campaign("kofi", "Test", "Test", 500.0)
+        wallet.record_creator_donation(cid, 50.0)
+
+        contribs = wallet.get_campaign_contributions(cid)
+        assert contribs[0]["backer_name"] == "Anonymous"
+
+    def test_no_prepaid_needed_with_creator_seed(self, wallet):
+        """Creator can skip prepaid entirely — donate directly to crowdfunding."""
+        wallet.config.bootstrap_wallet.enabled = False
+
+        cid = wallet.create_campaign("kofi", "monAI Bootstrap", "Test", 500.0)
+        wallet.record_creator_donation(cid, 300.0)
+
+        # Can spend from crowdfunding without prepaid card
+        result = wallet.spend_crowdfunding(50.0, "Domain", "domain")
+        assert "error" not in result
+        assert wallet.get_funding_phase() == "crowdfunding"
+
+
 class TestPlatformConfigs:
     def test_kofi_no_llc_required(self):
         assert NO_LLC_PLATFORMS["kofi"]["requires_llc"] is False
