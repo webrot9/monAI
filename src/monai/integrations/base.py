@@ -17,6 +17,7 @@ import httpx
 
 from monai.config import Config
 from monai.db.database import Database
+from monai.utils.privacy import get_anonymizer
 
 logger = logging.getLogger(__name__)
 
@@ -76,15 +77,20 @@ class PlatformConnection:
     @property
     def client(self) -> httpx.Client:
         if self._client is None:
-            headers = {"User-Agent": "monAI/0.1"}
+            anonymizer = get_anonymizer()
+            headers = {"User-Agent": anonymizer.get_user_agent()}
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
-            self._client = httpx.Client(
-                base_url=self.base_url,
-                headers=headers,
-                timeout=30,
-                follow_redirects=True,
-            )
+            proxy_url = anonymizer.get_proxy_url()
+            client_kwargs: dict = {
+                "base_url": self.base_url,
+                "headers": headers,
+                "timeout": 30,
+                "follow_redirects": True,
+            }
+            if proxy_url:
+                client_kwargs["proxy"] = proxy_url
+            self._client = httpx.Client(**client_kwargs)
         return self._client
 
     def close(self):

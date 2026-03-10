@@ -247,7 +247,7 @@ class RedditClient(BasePlatformClient):
                 "username": self._credentials.get("username", ""),
                 "password": self._credentials.get("password", ""),
             },
-            headers={"User-Agent": f"monAI/1.0 by {self._credentials.get('username', '')}"},
+            headers={"User-Agent": "monAI/1.0"},
         )
         if resp.status_code == 200:
             self._access_token = resp.json().get("access_token", "")
@@ -256,7 +256,7 @@ class RedditClient(BasePlatformClient):
         self._ensure_auth()
         return {
             "Authorization": f"Bearer {self._access_token}",
-            "User-Agent": f"monAI/1.0 by {self._credentials.get('username', '')}",
+            "User-Agent": "monAI/1.0",
         }
 
     def post(self, content: str, **kwargs) -> dict[str, Any]:
