@@ -42,6 +42,16 @@ CREATE TABLE IF NOT EXISTS cost_log (
     description TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS reinvestment_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    net_profit_at_time REAL NOT NULL,
+    reinvest_amount REAL NOT NULL,
+    reserve_amount REAL NOT NULL,
+    creator_amount REAL NOT NULL,
+    allocations TEXT,             -- JSON: per-strategy allocation details
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -230,8 +240,9 @@ class Commercialista:
     # ── Auto-Reinvestment Engine ─────────────────────────────────
 
     def compute_reinvestment(self) -> dict[str, Any]:
-        """Compute profit allocation: reinvest, reserve, and creator sweep.
+        """Compute profit allocation for unreinvested profit only.
 
+        Tracks what has already been reinvested so we don't double-allocate.
         Uses config.reinvestment settings to split net profit into:
         - reinvest_pct → goes back to strategy budgets
         - reserve_pct → kept as safety buffer
@@ -244,21 +255,27 @@ class Commercialista:
         budget = self.get_budget()
         net_profit = budget["net_profit"]
 
-        if net_profit < reinv.min_profit_to_reinvest:
+        # Subtract profit already processed in previous reinvestment cycles
+        already_processed = self._get_already_reinvested_profit()
+        unreinvested = net_profit - already_processed
+
+        if unreinvested < reinv.min_profit_to_reinvest:
             return {
                 "status": "below_threshold",
                 "net_profit": net_profit,
+                "unreinvested": round(unreinvested, 2),
                 "threshold": reinv.min_profit_to_reinvest,
             }
 
-        # Split the profit
-        reinvest_amount = round(net_profit * (reinv.reinvest_pct / 100), 2)
-        reserve_amount = round(net_profit * (reinv.reserve_pct / 100), 2)
-        creator_amount = round(net_profit * (reinv.creator_pct / 100), 2)
+        # Split only the unreinvested portion
+        reinvest_amount = round(unreinvested * (reinv.reinvest_pct / 100), 2)
+        reserve_amount = round(unreinvested * (reinv.reserve_pct / 100), 2)
+        creator_amount = round(unreinvested * (reinv.creator_pct / 100), 2)
 
         return {
             "status": "ready",
             "net_profit": net_profit,
+            "unreinvested": round(unreinvested, 2),
             "reinvest": reinvest_amount,
             "reserve": reserve_amount,
             "creator_sweep": creator_amount,
@@ -268,6 +285,26 @@ class Commercialista:
                 "creator": reinv.creator_pct,
             },
         }
+
+    def record_reinvestment(self, reinvest: float, reserve: float,
+                            creator: float, allocations: list[dict] | None = None):
+        """Record that a reinvestment cycle was executed (prevents double-counting)."""
+        net_at_time = self.get_budget()["net_profit"]
+        self.db.execute_insert(
+            "INSERT INTO reinvestment_log "
+            "(net_profit_at_time, reinvest_amount, reserve_amount, creator_amount, allocations) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (net_at_time, reinvest, reserve, creator,
+             json.dumps(allocations) if allocations else None),
+        )
+
+    def _get_already_reinvested_profit(self) -> float:
+        """Sum of net_profit at time of each past reinvestment."""
+        rows = self.db.execute(
+            "SELECT COALESCE(SUM(reinvest_amount + reserve_amount + creator_amount), 0) "
+            "as total FROM reinvestment_log"
+        )
+        return rows[0]["total"]
 
     def allocate_to_strategies(self, reinvest_amount: float,
                                strategy_performance: list[dict]) -> list[dict[str, Any]]:

@@ -46,11 +46,11 @@ CREATE TABLE IF NOT EXISTS email_verifications (
 """
 
 # Patterns for extracting verification codes from emails
+# Ordered from most specific to least specific — first match wins
 CODE_PATTERNS = [
     r'(?:verification|confirm|verify|code|pin|otp)[\s:]*(\d{4,8})',
     r'(?:your code is|enter code|use code)[\s:]*(\d{4,8})',
-    r'\b(\d{6})\b',  # Generic 6-digit code (most common)
-    r'\b(\d{4})\b',  # 4-digit codes
+    r'(?:^|[\s>:])(\d{6})(?:[\s<.]|$)',  # Standalone 6-digit code (not embedded in longer number)
 ]
 
 # Patterns for extracting verification links
@@ -199,7 +199,7 @@ class EmailVerifier:
                     pass
 
     def _get_email_body(self, msg: email.message.Message) -> str:
-        """Extract text body from email message."""
+        """Extract text body from email message, stripping HTML tags."""
         if msg.is_multipart():
             for part in msg.walk():
                 content_type = part.get_content_type()
@@ -211,13 +211,15 @@ class EmailVerifier:
                     payload = part.get_payload(decode=True)
                     if payload:
                         html = payload.decode("utf-8", errors="ignore")
-                        # Strip HTML tags for code extraction
-                        text = re.sub(r'<[^>]+>', ' ', html)
-                        return text
+                        return re.sub(r'<[^>]+>', ' ', html)
         else:
             payload = msg.get_payload(decode=True)
             if payload:
-                return payload.decode("utf-8", errors="ignore")
+                text = payload.decode("utf-8", errors="ignore")
+                # Strip HTML tags if content is HTML
+                if msg.get_content_type() == "text/html":
+                    return re.sub(r'<[^>]+>', ' ', text)
+                return text
         return ""
 
     def _decode_subject(self, raw_subject: str) -> str:

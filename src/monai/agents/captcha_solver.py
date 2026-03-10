@@ -240,63 +240,48 @@ class CaptchaSolver:
     async def _inject_token(self, page: Any, captcha_type: str, token: str):
         """Inject solved CAPTCHA token into the page."""
         if captcha_type in ("recaptcha_v2", "recaptcha_v3"):
-            await page.evaluate(f"""(token) => {{
-                document.getElementById('g-recaptcha-response').value = token;
-                // Also set in hidden textareas
-                document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {{
+            await page.evaluate("""(token) => {
+                const el = document.getElementById('g-recaptcha-response');
+                if (el) el.value = token;
+                document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {
                     el.value = token;
-                }});
-                // Trigger callback if exists
-                if (typeof ___grecaptcha_cfg !== 'undefined') {{
-                    Object.keys(___grecaptcha_cfg.clients).forEach(key => {{
+                });
+                if (typeof ___grecaptcha_cfg !== 'undefined') {
+                    Object.keys(___grecaptcha_cfg.clients).forEach(key => {
                         const client = ___grecaptcha_cfg.clients[key];
-                        // Find callback in nested structure
-                        const findCallback = (obj) => {{
-                            for (const k in obj) {{
+                        const findCallback = (obj) => {
+                            for (const k in obj) {
                                 if (typeof obj[k] === 'function') return obj[k];
-                                if (typeof obj[k] === 'object' && obj[k]) {{
+                                if (typeof obj[k] === 'object' && obj[k]) {
                                     const found = findCallback(obj[k]);
                                     if (found) return found;
-                                }}
-                            }}
-                        }};
+                                }
+                            }
+                        };
                         const cb = findCallback(client);
                         if (cb) cb(token);
-                    }});
-                }}
-            }}""", token)
+                    });
+                }
+            }""", token)
         elif captcha_type == "hcaptcha":
-            await page.evaluate(f"""(token) => {{
-                // Set response in hidden inputs
-                document.querySelectorAll('[name="h-captcha-response"]').forEach(el => {{
+            await page.evaluate("""(token) => {
+                document.querySelectorAll('[name="h-captcha-response"]').forEach(el => {
                     el.value = token;
-                }});
-                document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {{
+                });
+                document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {
                     el.value = token;
-                }});
-                // Trigger hcaptcha callback
-                if (typeof hcaptcha !== 'undefined') {{
-                    // hcaptcha stores callbacks internally
-                    const iframe = document.querySelector('iframe[src*="hcaptcha"]');
-                    if (iframe) {{
-                        iframe.dispatchEvent(new Event('hcaptchaSuccess'));
-                    }}
-                }}
-            }}""", token)
+                });
+            }""", token)
         elif captcha_type == "turnstile":
-            await page.evaluate(f"""(token) => {{
+            await page.evaluate("""(token) => {
                 const input = document.querySelector('[name="cf-turnstile-response"]');
                 if (input) input.value = token;
-                // Trigger turnstile callback
-                if (typeof turnstile !== 'undefined' && turnstile.getResponse) {{
-                    // Cloudflare handles this differently
-                    const widgets = document.querySelectorAll('.cf-turnstile');
-                    widgets.forEach(w => {{
-                        const cb = w.getAttribute('data-callback');
-                        if (cb && typeof window[cb] === 'function') window[cb](token);
-                    }});
-                }}
-            }}""", token)
+                const widgets = document.querySelectorAll('.cf-turnstile');
+                widgets.forEach(w => {
+                    const cb = w.getAttribute('data-callback');
+                    if (cb && typeof window[cb] === 'function') window[cb](token);
+                });
+            }""", token)
 
     # ── 2captcha Integration ────────────────────────────────────
 

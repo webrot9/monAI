@@ -190,12 +190,14 @@ class PhoneProvisioner(BaseAgent):
 
     def _get_api_key(self, provider: str) -> str | None:
         """Retrieve API key for the SMS provider from identity store."""
-        # Check identity store (encrypted credentials)
-        rows = self.db.execute(
-            "SELECT credentials FROM identities "
-            "WHERE platform = ? AND type = 'api_key' AND status = 'active' LIMIT 1",
-            (f"sms_{provider}",),
-        )
+        try:
+            rows = self.db.execute(
+                "SELECT credentials FROM identities "
+                "WHERE platform = ? AND type = 'api_key' AND status = 'active' LIMIT 1",
+                (f"sms_{provider}",),
+            )
+        except Exception:
+            return None  # identities table may not exist yet
         if rows and rows[0]["credentials"]:
             from monai.utils.crypto import decrypt_value
             try:
