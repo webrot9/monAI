@@ -113,25 +113,53 @@ class SaaSAgent(BaseAgent):
         return results
 
     def _discover_opportunities(self) -> dict[str, Any]:
-        """Research SaaS opportunities through market gaps."""
+        """Research REAL SaaS opportunities from Product Hunt, G2, and Capterra."""
+        # Browse real sources for trending/new SaaS products and gaps
+        ph_data = self.browse_and_extract(
+            "https://www.producthunt.com/topics/saas",
+            "Extract the latest trending SaaS products listed on this page. "
+            "For each product, extract: name, tagline, category, upvote count, "
+            "and any listed pricing. Only include REAL data visible on the page. "
+            "Do NOT make up any information. "
+            "Return as JSON: {\"products\": [{\"name\": str, \"tagline\": str, "
+            "\"category\": str, \"upvotes\": int, \"pricing\": str}]}"
+        )
+
+        g2_data = self.browse_and_extract(
+            "https://www.g2.com/categories",
+            "Extract the top software categories and any trending/emerging categories "
+            "visible on this page. For each category, note the name and number of "
+            "products listed. Only include REAL data visible on the page. "
+            "Do NOT make up any information. "
+            "Return as JSON: {\"categories\": [{\"name\": str, \"product_count\": int}]}"
+        )
+
+        capterra_data = self.browse_and_extract(
+            "https://www.capterra.com/browse/",
+            "Extract software categories and any 'emerging' or 'trending' labels. "
+            "Note which categories have fewer solutions (market gaps). "
+            "Only include REAL data visible on the page. Do NOT make up any information. "
+            "Return as JSON: {\"categories\": [{\"name\": str, \"subcategories\": [str], "
+            "\"appears_underserved\": bool}]}"
+        )
+
+        # Use LLM to synthesize the REAL data into opportunity analysis
         opportunities = self.think_json(
-            "Research 5 SaaS product opportunities. For each, analyze:\n"
-            "1. What problem exists that current solutions don't solve well?\n"
-            "2. Who has this problem? (be specific — job titles, company sizes)\n"
-            "3. How do they currently solve it? (workarounds, competitors)\n"
-            "4. Why would they pay for a better solution?\n"
-            "5. How big is the market?\n\n"
-            "Focus on:\n"
-            "- B2B niches (higher willingness to pay)\n"
-            "- Problems with existing solutions that are too expensive or too complex\n"
-            "- Workflows that are still manual/spreadsheet-based\n"
-            "- API-first products (easier to build)\n"
-            "- Vertical SaaS (industry-specific tools)\n\n"
+            f"Based on REAL market research data, identify SaaS opportunities.\n\n"
+            f"Product Hunt trending products:\n{json.dumps(ph_data, default=str)}\n\n"
+            f"G2 categories:\n{json.dumps(g2_data, default=str)}\n\n"
+            f"Capterra categories:\n{json.dumps(capterra_data, default=str)}\n\n"
+            "Using ONLY the real data above, identify 5 SaaS opportunities where:\n"
+            "- There are market gaps (underserved categories)\n"
+            "- Existing solutions are expensive or complex\n"
+            "- A focused tool could compete\n\n"
+            "For each opportunity, explain which real data points support it.\n\n"
             "Return: {\"opportunities\": [{\"name\": str, \"problem\": str, "
             "\"target_market\": str, \"current_solutions\": [str], "
             "\"why_switch\": str, \"market_size\": str, "
             "\"revenue_model\": str, \"estimated_mrr_potential\": float, "
-            "\"build_complexity\": str, \"moat\": str}]}"
+            "\"build_complexity\": str, \"moat\": str, "
+            "\"supporting_data\": str}]}"
         )
 
         # Store promising ones
@@ -153,7 +181,7 @@ class SaaSAgent(BaseAgent):
         return opportunities
 
     def _validate_idea(self) -> dict[str, Any]:
-        """Validate a SaaS idea before building."""
+        """Validate a SaaS idea using REAL competitor pricing, reviews, and market data."""
         products = self.db.execute(
             "SELECT * FROM saas_products WHERE status = 'researching' LIMIT 1"
         )
@@ -161,26 +189,63 @@ class SaaSAgent(BaseAgent):
             return {"status": "no_ideas_to_validate"}
 
         product = dict(products[0])
+
+        # Search for real competitor pricing and reviews
+        competitor_data = self.search_web(
+            f"{product['name']} alternatives competitors pricing",
+            "Extract real competitor products for this market. For each competitor, "
+            "extract: name, URL, pricing tiers (with actual dollar amounts), "
+            "and any review scores or user counts mentioned. "
+            "Only include REAL data visible on the page. Do NOT make up any information. "
+            "Return as JSON: {\"competitors\": [{\"name\": str, \"url\": str, "
+            "\"pricing\": str, \"review_score\": float, \"user_count\": str}]}"
+        )
+
+        # Search for real market size data
+        market_data = self.search_web(
+            f"{product['target_market']} market size TAM SAM SOM",
+            "Extract any real market size figures, growth rates, or industry "
+            "statistics mentioned. Include the source of each figure. "
+            "Only include REAL data visible on the page. Do NOT make up any information. "
+            "Return as JSON: {\"market_figures\": [{\"metric\": str, \"value\": str, "
+            "\"source\": str, \"year\": str}]}"
+        )
+
+        # Search for real user complaints about existing solutions
+        pain_points = self.search_web(
+            f"{product['problem']} software complaints frustrations reddit",
+            "Extract real user complaints and pain points about existing solutions "
+            "in this space. Include the platform where the complaint was found. "
+            "Only include REAL data visible on the page. Do NOT make up any information. "
+            "Return as JSON: {\"complaints\": [{\"complaint\": str, \"platform\": str, "
+            "\"about_product\": str}]}"
+        )
+
+        # Now use LLM to score based on REAL data
         validation = self.think_json(
-            f"Validate this SaaS idea rigorously:\n"
+            f"Validate this SaaS idea using REAL market data:\n"
             f"Name: {product['name']}\n"
             f"Problem: {product['problem']}\n"
             f"Target: {product['target_market']}\n\n"
-            "Score each dimension 1-10:\n"
-            "1. Problem severity (how painful is it?)\n"
-            "2. Market size (enough customers?)\n"
-            "3. Willingness to pay (will they pay $X/month?)\n"
-            "4. Competition (can we differentiate?)\n"
+            f"REAL competitor data:\n{json.dumps(competitor_data, default=str)}\n\n"
+            f"REAL market size data:\n{json.dumps(market_data, default=str)}\n\n"
+            f"REAL user pain points:\n{json.dumps(pain_points, default=str)}\n\n"
+            "Based ONLY on the real data above, score each dimension 1-10:\n"
+            "1. Problem severity (based on real complaints found)\n"
+            "2. Market size (based on real market figures)\n"
+            "3. Willingness to pay (based on real competitor pricing)\n"
+            "4. Competition (based on real competitors found)\n"
             "5. Buildability (can an AI agent build this?)\n"
             "6. Distribution (how do we reach customers?)\n"
             "7. Retention (will they keep paying?)\n\n"
-            "Be BRUTALLY honest. Most ideas fail. Only recommend building if "
-            "the total score is 50+ out of 70.\n\n"
+            "Be BRUTALLY honest. Cite which real data points support each score. "
+            "Most ideas fail. Only recommend building if the total score is 50+ out of 70.\n\n"
             "Return: {\"scores\": {\"problem_severity\": int, \"market_size\": int, "
             "\"willingness_to_pay\": int, \"competition\": int, \"buildability\": int, "
             "\"distribution\": int, \"retention\": int}, \"total_score\": int, "
             "\"verdict\": \"build\"|\"iterate\"|\"kill\", \"reasoning\": str, "
-            "\"risks\": [str], \"suggested_pivot\": str}"
+            "\"risks\": [str], \"suggested_pivot\": str, "
+            "\"data_sources_used\": [str]}"
         )
 
         total = validation.get("total_score", 0)
@@ -205,7 +270,7 @@ class SaaSAgent(BaseAgent):
         return validation
 
     def _competitor_analysis(self) -> dict[str, Any]:
-        """Deep-dive competitor analysis for a product."""
+        """Deep-dive competitor analysis using REAL competitor websites and reviews."""
         products = self.db.execute(
             "SELECT * FROM saas_products WHERE status IN ('researching', 'validated') LIMIT 1"
         )
@@ -213,19 +278,64 @@ class SaaSAgent(BaseAgent):
             return {"status": "no_products_to_analyze"}
 
         product = dict(products[0])
+
+        # Search for real competitors
+        search_results = self.search_web(
+            f"{product['name']} {product['problem']} software tools alternatives",
+            "Extract a list of real competitor products with their URLs. "
+            "Only include REAL data visible on the page. Do NOT make up any information. "
+            "Return as JSON: {\"competitors\": [{\"name\": str, \"url\": str}]}"
+        )
+
+        competitors_analyzed = []
+        for comp in search_results.get("competitors", [])[:5]:
+            url = comp.get("url", "")
+            if not url:
+                continue
+
+            # Browse the actual competitor website for real pricing and features
+            comp_details = self.browse_and_extract(
+                url,
+                f"Extract real information about this SaaS product from its website. "
+                f"Include: product name, pricing tiers with actual prices, "
+                f"key features listed, any customer counts or social proof shown, "
+                f"integrations offered, and target audience. "
+                f"Only include REAL data visible on the page. Do NOT make up any information. "
+                f"Return as JSON: {{\"name\": str, \"url\": str, \"pricing_tiers\": "
+                f"[{{\"name\": str, \"price\": str, \"features\": [str]}}], "
+                f"\"key_features\": [str], \"social_proof\": str, "
+                f"\"integrations\": [str], \"target_audience\": str}}"
+            )
+
+            # Check real reviews on G2
+            review_data = self.browse_and_extract(
+                f"https://www.g2.com/products/{comp['name'].lower().replace(' ', '-')}/reviews",
+                f"Extract real review data for {comp['name']}. Include: "
+                f"overall rating, number of reviews, top positive themes, "
+                f"top negative themes (what users complain about). "
+                f"Only include REAL data visible on the page. Do NOT make up any information. "
+                f"Return as JSON: {{\"rating\": float, \"review_count\": int, "
+                f"\"positive_themes\": [str], \"negative_themes\": [str]}}"
+            )
+
+            comp_details["reviews"] = review_data
+            competitors_analyzed.append(comp_details)
+
+        # Use LLM to synthesize the REAL competitive data
         analysis = self.think_json(
-            f"Deep competitor analysis for: {product['name']}\n"
+            f"Based on REAL competitor research, analyze the competitive landscape for: "
+            f"{product['name']}\n"
             f"Problem: {product['problem']}\n"
             f"Market: {product['target_market']}\n\n"
-            "For each competitor:\n"
-            "1. What they do well\n"
-            "2. What they do poorly (1-star reviews, complaints)\n"
-            "3. Their pricing\n"
-            "4. Their weaknesses we can exploit\n"
-            "5. Their distribution channels\n\n"
+            f"REAL competitor data:\n{json.dumps(competitors_analyzed, default=str)}\n\n"
+            "Using ONLY the real data above:\n"
+            "1. Identify each competitor's real strengths and weaknesses\n"
+            "2. Find gaps in their offerings (based on real user complaints)\n"
+            "3. Recommend our positioning based on real pricing data\n"
+            "4. Suggest pricing based on real competitor prices\n\n"
             "Return: {\"competitors\": [{\"name\": str, \"url\": str, "
             "\"pricing\": str, \"strengths\": [str], \"weaknesses\": [str], "
-            "\"market_position\": str, \"estimated_revenue\": str}], "
+            "\"market_position\": str}], "
             "\"gap_analysis\": str, \"our_positioning\": str, "
             "\"pricing_recommendation\": str}"
         )
@@ -335,7 +445,7 @@ class SaaSAgent(BaseAgent):
         return {"feature": feature["feature_name"], "build_status": build_result.get("status")}
 
     def _create_landing_page(self) -> dict[str, Any]:
-        """Create a landing page for a SaaS product."""
+        """Create and deploy a REAL landing page for a SaaS product."""
         products = self.db.execute(
             "SELECT * FROM saas_products WHERE status IN ('building', 'beta') LIMIT 1"
         )
@@ -343,8 +453,10 @@ class SaaSAgent(BaseAgent):
             return {"status": "no_products_need_landing"}
 
         product = dict(products[0])
-        landing = self.think_json(
-            f"Create a landing page for: {product['name']}\n"
+
+        # Use LLM to plan the landing page content (planning is legitimate LLM use)
+        landing_content = self.think_json(
+            f"Create landing page content for: {product['name']}\n"
             f"Tagline: {product.get('tagline', '')}\n"
             f"Problem: {product['problem']}\n"
             f"Solution: {product['solution']}\n"
@@ -356,11 +468,38 @@ class SaaSAgent(BaseAgent):
             "\"faq\": [{\"q\": str, \"a\": str}]}"
         )
 
-        self.log_action("landing_page_created", product["name"])
-        return landing
+        # Use Coder to build a real landing page from the content
+        landing_spec = (
+            f"Build a production-ready landing page for: {product['name']}\n\n"
+            f"Content:\n{json.dumps(landing_content, default=str)}\n\n"
+            "Requirements:\n"
+            "- Single-page responsive HTML/CSS/JS\n"
+            "- Modern design with Tailwind CSS (via CDN)\n"
+            "- Email capture form (connected to a simple backend endpoint)\n"
+            "- SEO meta tags\n"
+            "- Fast loading, no unnecessary dependencies\n"
+            "- Include all sections: hero, pain points, features, pricing, FAQ, footer\n"
+        )
+        build_result = self.coder.generate_module(landing_spec)
+
+        # Deploy the landing page
+        deploy_result = self.execute_task(
+            f"Deploy the landing page for {product['name']} to a hosting platform",
+            f"The landing page files were generated by the coder. "
+            f"Build result: {json.dumps(build_result, default=str)[:500]}\n"
+            f"Deploy to Vercel, Netlify, or GitHub Pages. Return the live URL."
+        )
+
+        self.log_action("landing_page_deployed", product["name"],
+                        json.dumps(deploy_result, default=str)[:200])
+        return {
+            "content": landing_content,
+            "build": build_result,
+            "deployment": deploy_result,
+        }
 
     def _plan_launch(self) -> dict[str, Any]:
-        """Plan the launch strategy for a SaaS product."""
+        """Execute REAL launch activities using platform actions."""
         products = self.db.execute(
             "SELECT * FROM saas_products WHERE status IN ('building', 'beta') LIMIT 1"
         )
@@ -368,18 +507,73 @@ class SaaSAgent(BaseAgent):
             return {"status": "no_products_to_launch"}
 
         product = dict(products[0])
-        return self.think_json(
-            f"Plan launch strategy for: {product['name']}\n"
+
+        # Use LLM to plan launch content (planning is legitimate LLM use)
+        launch_plan = self.think_json(
+            f"Create launch copy and strategy for: {product['name']}\n"
+            f"Tagline: {product.get('tagline', '')}\n"
+            f"Problem: {product['problem']}\n"
+            f"Solution: {product['solution']}\n"
             f"Target: {product['target_market']}\n\n"
-            "Include:\n"
-            "1. Pre-launch (waitlist, beta users)\n"
-            "2. Launch channels (Product Hunt, HN, Reddit, Twitter)\n"
-            "3. Content marketing plan\n"
-            "4. Pricing and discount strategy\n"
-            "5. First 30 days growth targets\n\n"
-            "Return: {\"pre_launch\": [str], \"launch_channels\": [{\"channel\": str, "
-            "\"strategy\": str, \"expected_signups\": int}], "
-            "\"content_plan\": [str], \"pricing\": {\"free_tier\": str, "
-            "\"pro_tier\": str, \"pro_price\": float}, "
-            "\"day_30_target\": {\"users\": int, \"paying\": int, \"mrr\": float}}"
+            "Create specific, ready-to-post content for each channel.\n\n"
+            "Return: {\"product_hunt_tagline\": str, "
+            "\"product_hunt_description\": str, "
+            "\"twitter_launch_thread\": [str], "
+            "\"reddit_post_title\": str, \"reddit_post_body\": str, "
+            "\"hacker_news_title\": str, "
+            "\"directory_description\": str}"
         )
+
+        launch_results = {}
+
+        # Submit to Product Hunt
+        self.ensure_platform_account("producthunt")
+        ph_result = self.platform_action(
+            "producthunt",
+            f"Submit a new product to Product Hunt",
+            f"Product name: {product['name']}\n"
+            f"Tagline: {launch_plan.get('product_hunt_tagline', product.get('tagline', ''))}\n"
+            f"Description: {launch_plan.get('product_hunt_description', product['solution'])}\n"
+            f"Website URL: (use the deployed landing page URL)\n"
+            f"Topics: SaaS, {product['target_market']}"
+        )
+        launch_results["product_hunt"] = ph_result
+
+        # Post on Twitter/X
+        self.ensure_platform_account("twitter")
+        twitter_thread = launch_plan.get("twitter_launch_thread", [])
+        if twitter_thread:
+            tw_result = self.platform_action(
+                "twitter",
+                "Post a launch thread on Twitter/X",
+                f"Thread content (post as a thread, each item is a tweet):\n"
+                + "\n---\n".join(twitter_thread)
+            )
+            launch_results["twitter"] = tw_result
+
+        # Submit to SaaS directories
+        directories = [
+            "https://www.saashub.com",
+            "https://www.betalist.com",
+            "https://alternativeto.net",
+        ]
+        for directory_url in directories:
+            dir_result = self.execute_task(
+                f"Submit {product['name']} to the SaaS directory at {directory_url}",
+                f"Product name: {product['name']}\n"
+                f"Description: {launch_plan.get('directory_description', product['solution'])}\n"
+                f"Category: SaaS, {product['target_market']}\n"
+                f"Register an account if needed, then submit the product listing."
+            )
+            launch_results[directory_url] = dir_result
+
+        # Update product status
+        self.db.execute(
+            "UPDATE saas_products SET status = 'launched', launched_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (product["id"],),
+        )
+
+        self.log_action("product_launched", product["name"],
+                        json.dumps(launch_results, default=str)[:500])
+        return {"launch_plan": launch_plan, "launch_results": launch_results}

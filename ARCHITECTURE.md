@@ -129,7 +129,13 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 ## Key Technical Details
 
 ### Agent System
-- All agents inherit from `BaseAgent` (LLM reasoning, collaboration, learning, journaling)
+- All agents inherit from `BaseAgent` which provides:
+  - LLM reasoning (think, think_json, think_cheap)
+  - Real-world actions (execute_task, browse_and_extract, search_web, platform_action)
+  - Self-provisioning (ensure_platform_account, get_platform_credentials)
+  - Lazy-loaded executor, identity manager, provisioner, and coder
+  - Collaboration, learning, journaling
+- **ZERO simulation**: All strategy agents use real browser automation and API calls — never LLM hallucination for market data
 - Orchestrator manages lifecycle of all agents
 - Agents collaborate via `CollaborationHub` and `SharedMemory`
 - Ethics enforced at BaseAgent level; `EthicsTester` destroys agents that fail
@@ -216,8 +222,24 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `webhook_server.py` | Webhook handler for all providers |
 
 ### Strategies (`src/monai/strategies/`)
-13 strategy agents, each implementing an autonomous revenue channel:
-freelance_writing, digital_products, content_sites, micro_saas, saas, affiliate, newsletter, lead_gen, social_media, course_creation, domain_flipping, print_on_demand, telegram_bots
+13 strategy agents, each implementing a FULLY FUNCTIONAL autonomous revenue channel.
+All strategies use real browser automation and APIs — zero simulation:
+
+| Strategy | Real Actions |
+|----------|-------------|
+| `freelance_writing` | Browses Upwork/Fiverr/Freelancer for real gigs, submits real proposals, delivers work on platforms |
+| `digital_products` | Creates products, lists on real Gumroad via API, tracks real sales |
+| `content_sites` | Researches keywords via real SEO tools, writes content, finds real affiliate programs |
+| `micro_saas` | Builds MVPs, deploys to Railway/Render/Vercel, creates landing pages |
+| `saas` | Researches real competitors on G2/Capterra, builds and deploys real products |
+| `affiliate` | Browses real affiliate networks (ShareASale, CJ, Amazon), writes real reviews |
+| `newsletter` | Researches Substack/Beehiiv trends, writes real issues, finds real sponsors |
+| `lead_gen` | Scrapes real business directories, enriches leads via web, qualifies with real data |
+| `social_media` | Posts real content via social APIs (Twitter, LinkedIn, Reddit) |
+| `course_creation` | Researches real Udemy/Skillshare trends, writes lessons, lists on platforms |
+| `domain_flipping` | Browses real expired domain sites, checks real metrics, lists on Sedo/Dan.com |
+| `print_on_demand` | Researches real POD trends, generates designs, lists on Redbubble/TeeSpring |
+| `telegram_bots` | Researches real bot market, builds bots, deploys via BotFather |
 
 ### Integrations (`src/monai/integrations/`)
 | Module | Purpose |
@@ -269,6 +291,8 @@ freelance_writing, digital_products, content_sites, micro_saas, saas, affiliate,
 ### What's Been Built (as of 2026-03-10)
 Everything listed above is implemented, tested, and passing. The codebase is functional from config through to payment sweep.
 
+**Major refactor completed 2026-03-10**: All 13 strategy agents rewired from simulated/hallucinated operations to REAL browser automation and API integrations. BaseAgent now provides `execute_task()`, `browse_and_extract()`, `search_web()`, `ensure_platform_account()`, and `platform_action()` to all agents. Zero simulation remaining.
+
 ### What's Next
 1. **Crowdfunding landing page** — monAI's first website for the AI crowdfunding campaign
 2. **Ko-fi campaign setup** — automated campaign creation and monitoring
@@ -286,6 +310,8 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 - **Config encryption**: Fernet with auto-generated key at `~/.monai/.config_key`
 - **Per-agent connections**: Each agent manages its own platform connections with rate limiting
 - **Strategy state machine**: Formal lifecycle (pending→active→paused→stopped) prevents invalid transitions
+- **Zero simulation**: All strategies use real browser/API actions, never LLM hallucination for market data
+- **Only OpenAI key provided**: Agents self-provision all other credentials via browser automation
 
 ### Creator Preferences (Italian)
 - Currency: USD (with EUR conversion when needed)

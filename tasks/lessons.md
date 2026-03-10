@@ -79,3 +79,19 @@
 - **Mistake**: Used USD, no initial budget set, no self-sustainability requirement
 - **Root cause**: Didn't ask about budget and currency
 - **Rule**: Initial budget is €500. Currency is EUR. Once the budget runs out, monAI must fund itself from its own revenue. If it needs resources (servers, domains, tools), it pays with money it earned. Agents procure resources in their own name, not the creator's. The commercialista ensures the books balance.
+
+### 2026-03-10 - ZERO simulation — everything must be real
+- **Mistake**: Strategy agents asked the LLM to "generate" fake data (job postings, affiliate programs, keyword research, competitor data, domain valuations) instead of getting real data from real websites. Methods like `_deliver_work()` were placeholder stubs that logged but did nothing.
+- **Root cause**: Developer laziness — using LLM hallucination as a shortcut instead of wiring up real browser automation and API integrations that already existed in the codebase (AutonomousExecutor, BrowserLearner, Provisioner, GumroadIntegration).
+- **Rule**: ZERO simulation, ZERO hallucinated data, ZERO placeholder stubs. Every strategy agent must:
+  1. Use `browse_and_extract()` or `search_web()` for ALL market research (real websites, real data)
+  2. Use `platform_action()` or real API integrations for ALL delivery/listing actions
+  3. Use `ensure_platform_account()` to auto-register on platforms when needed
+  4. NEVER ask the LLM to "generate" or "suggest" data that should come from the real world
+  5. LLM is ONLY for planning decisions and content creation — never for faking market data
+  The distinction: "What should I do next?" = legitimate LLM planning. "Generate 5 affiliate programs with commission rates" = hallucination that must use real web data instead.
+
+### 2026-03-10 - Agents get their own credentials — only OpenAI key provided
+- **Mistake**: Assumed the creator would provide API credentials for platforms (Gumroad, Stripe, Twitter, etc.)
+- **Root cause**: Traditional developer mindset — someone hands you the keys
+- **Rule**: The ONLY API key the creator provides is OpenAI. Everything else — Gumroad, social media, hosting, domain registrars, payment processors — the agents figure out themselves. They use browser automation to sign up, get API keys, and store credentials via IdentityManager. Full autonomy means full self-provisioning.

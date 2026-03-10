@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -43,6 +44,9 @@ class BaseAgent(ABC):
         self.logger = logging.getLogger(f"monai.{self.name}")
         self._cycle: int = 0
         self._coder = None  # Lazy-loaded
+        self._executor = None  # Lazy-loaded
+        self._identity = None  # Lazy-loaded
+        self._provisioner = None  # Lazy-loaded
 
     @property
     def coder(self):
@@ -52,10 +56,174 @@ class BaseAgent(ABC):
             self._coder = Coder(self.config, self.db, self.llm)
         return self._coder
 
+    @property
+    def executor(self):
+        """Lazy-load executor — any agent can take real-world actions."""
+        if self._executor is None:
+            from monai.agents.executor import AutonomousExecutor
+            self._executor = AutonomousExecutor(self.config, self.db, self.llm)
+        return self._executor
+
+    @executor.setter
+    def executor(self, value):
+        self._executor = value
+
+    @property
+    def identity(self):
+        """Lazy-load identity manager — credential and account management."""
+        if self._identity is None:
+            from monai.agents.identity import IdentityManager
+            self._identity = IdentityManager(self.config, self.db, self.llm)
+        return self._identity
+
+    @identity.setter
+    def identity(self, value):
+        self._identity = value
+
+    @property
+    def provisioner(self):
+        """Lazy-load provisioner — platform registration and setup."""
+        if self._provisioner is None:
+            from monai.agents.provisioner import Provisioner
+            self._provisioner = Provisioner(self.config, self.db, self.llm)
+        return self._provisioner
+
+    @provisioner.setter
+    def provisioner(self, value):
+        self._provisioner = value
+
     def write_code(self, spec: str, project_dir: str | None = None,
                    language: str = "python") -> dict:
         """Write tested code. Returns only if tests pass."""
         return self.coder.generate_module(spec, project_dir, language)
+
+    # ── Real-World Actions ───────────────────────────────────────
+
+    def execute_task(self, task: str, context: str = "") -> dict[str, Any]:
+        """Execute a real-world task via the autonomous executor.
+
+        Uses browser automation, HTTP calls, shell commands to accomplish
+        tasks in the real world. NOT simulated.
+        """
+        identity_info = json.dumps(self.identity.get_identity(), default=str)
+        full_context = f"Agent: {self.name}\nIdentity: {identity_info}"
+        if context:
+            full_context += f"\n{context}"
+
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                self.executor.execute_task(task, full_context)
+            )
+        finally:
+            loop.close()
+
+        self.log_action("execute_task", task[:200], json.dumps(result, default=str)[:500])
+        return result
+
+    def browse_and_extract(self, url: str, extraction_prompt: str) -> dict[str, Any]:
+        """Browse a real URL and extract structured data from it.
+
+        Args:
+            url: The real URL to browse
+            extraction_prompt: What data to extract from the page
+
+        Returns:
+            Extracted structured data from the real web page
+        """
+        task = (
+            f"Navigate to {url} and extract the following information:\n"
+            f"{extraction_prompt}\n\n"
+            "Read the actual page content carefully. Extract ONLY real data "
+            "visible on the page. Do NOT make up or hallucinate any data. "
+            "Return the extracted data as JSON via the done() tool."
+        )
+        return self.execute_task(task)
+
+    def search_web(self, query: str, extraction_prompt: str,
+                   num_results: int = 5) -> dict[str, Any]:
+        """Search the web for real information and extract structured data.
+
+        Args:
+            query: Search query
+            extraction_prompt: What to extract from search results
+            num_results: How many results to process
+
+        Returns:
+            Extracted data from real search results
+        """
+        task = (
+            f"Search the web for: {query}\n\n"
+            f"Browse the top {num_results} results and extract:\n"
+            f"{extraction_prompt}\n\n"
+            "Use ONLY real data from actual web pages. "
+            "Do NOT make up or hallucinate any information. "
+            "Return extracted data as JSON via the done() tool."
+        )
+        return self.execute_task(task)
+
+    def ensure_platform_account(self, platform: str) -> dict[str, Any]:
+        """Ensure we have an account on a platform, registering if needed.
+
+        Args:
+            platform: Platform name (e.g., 'upwork', 'gumroad', 'fiverr')
+
+        Returns:
+            Account info dict, or registration result
+        """
+        existing = self.identity.get_account(platform)
+        if existing:
+            self.log_action("account_check", f"Already have {platform} account")
+            return {"status": "exists", "account": existing}
+
+        self.log_action("account_provision", f"Registering on {platform}")
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                self.provisioner.register_on_platform(platform)
+            )
+        finally:
+            loop.close()
+
+        return result
+
+    def get_platform_credentials(self, platform: str) -> dict[str, str]:
+        """Get stored credentials for a platform.
+
+        Returns empty dict if no credentials found — caller should
+        trigger ensure_platform_account() first.
+        """
+        account = self.identity.get_account(platform)
+        if account and account.get("credentials"):
+            return account["credentials"]
+        return {}
+
+    def platform_action(self, platform: str, action_description: str,
+                        context: str = "") -> dict[str, Any]:
+        """Execute a real action on a platform (post, submit, deliver, etc.).
+
+        Ensures account exists first, then uses executor to perform the action.
+
+        Args:
+            platform: Platform name
+            action_description: What to do on the platform
+            context: Additional context (content to post, work to deliver, etc.)
+        """
+        # Ensure we have an account
+        account = self.ensure_platform_account(platform)
+        if account.get("status") == "exists":
+            creds = account.get("account", {})
+        else:
+            creds = account
+
+        creds_context = json.dumps(creds, default=str)
+        task = (
+            f"On {platform}, do the following:\n{action_description}\n\n"
+            f"Account info: {creds_context}\n"
+            f"Additional context: {context}\n\n"
+            "This is a REAL action on a REAL platform. Execute it fully."
+        )
+        return self.execute_task(task)
 
     # ── Core Actions ────────────────────────────────────────────
 

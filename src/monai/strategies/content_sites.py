@@ -57,17 +57,60 @@ class ContentSiteAgent(BaseAgent):
         return results
 
     def _research_keywords(self) -> dict[str, Any]:
-        """Find low-competition long-tail keywords to target."""
+        """Find low-competition long-tail keywords using REAL web data."""
+        self.log_action("keyword_research", "Fetching real keyword data from the web")
+
+        # Pull trending topics from Google Trends
+        trends_data = self.browse_and_extract(
+            "https://trends.google.com/trending?geo=US",
+            "Extract all trending search topics and queries visible on this page. "
+            "For each, include the topic name/query and any category or volume "
+            "indicators shown. Only include REAL data visible on the page. "
+            "Do NOT make up any information. "
+            "Return as JSON: {\"trends\": [{\"query\": str, \"category\": str, "
+            "\"volume_indicator\": str}]}"
+        )
+
+        # Search for low-competition keyword opportunities via free SEO tools
+        keyword_data = self.search_web(
+            "low competition long tail keywords with buying intent 2026",
+            "Extract any keyword ideas, search volume estimates, and competition "
+            "levels mentioned. Only include REAL data visible on the page. "
+            "Do NOT make up any information. "
+            "Return as JSON: {\"keyword_ideas\": [{\"keyword\": str, "
+            "\"volume_estimate\": str, \"competition\": str, \"source\": str}]}"
+        )
+
+        # Try Ubersuggest for additional keyword data
+        ubersuggest_data = self.browse_and_extract(
+            "https://neilpatel.com/ubersuggest/",
+            "Extract any keyword suggestions, search volume data, SEO difficulty "
+            "scores, and content ideas shown on this page. Only include REAL data "
+            "visible on the page. Do NOT make up any information. "
+            "Return as JSON: {\"suggestions\": [{\"keyword\": str, "
+            "\"volume\": str, \"seo_difficulty\": str}]}"
+        )
+
+        # Now use LLM to PLAN which keywords to target based on the real data
+        raw_data = {
+            "trends": trends_data,
+            "keyword_ideas": keyword_data,
+            "ubersuggest": ubersuggest_data,
+        }
         keywords = self.think_json(
-            "Research 10 low-competition long-tail keywords for content sites. "
+            "Based on the following REAL keyword research data from the web, "
+            "select the 10 best low-competition long-tail keywords to target.\n\n"
+            f"Raw research data:\n{json.dumps(raw_data, default=str)[:3000]}\n\n"
             "Focus on:\n"
             "- 'How to' queries with buying intent\n"
             "- 'Best X for Y' comparison queries\n"
             "- Problems people search for solutions to\n"
             "- Niches where affiliate programs exist\n\n"
-            "Return: {\"keywords\": [{\"keyword\": str, \"search_volume_estimate\": str, "
-            "\"competition\": \"low\"|\"medium\", \"monetization\": str, "
-            "\"article_angle\": str}]}"
+            "IMPORTANT: Only recommend keywords that are supported by the real "
+            "data above. Do not invent keywords.\n\n"
+            "Return: {\"keywords\": [{\"keyword\": str, \"source\": str, "
+            "\"search_volume_estimate\": str, \"competition\": \"low\"|\"medium\", "
+            "\"monetization\": str, \"article_angle\": str}]}"
         )
         self.share_knowledge(
             "opportunity", "keyword_research",
@@ -126,17 +169,60 @@ class ContentSiteAgent(BaseAgent):
         return {"keyword": keyword, "sections": len(sections)}
 
     def _find_affiliate_programs(self) -> dict[str, Any]:
-        """Research affiliate programs to monetize content."""
+        """Research affiliate programs using REAL data from affiliate networks."""
+        self.log_action("affiliate_research", "Browsing real affiliate networks")
+
+        # Browse ShareASale for real programs
+        shareasale_data = self.browse_and_extract(
+            "https://www.shareasale.com/info/",
+            "Extract any affiliate program listings, merchant names, commission "
+            "rates, categories, and program details shown on this page. "
+            "Only include REAL data visible on the page. Do NOT make up any "
+            "information. Return as JSON: {\"programs\": [{\"name\": str, "
+            "\"commission_rate\": str, \"category\": str, \"details\": str}]}"
+        )
+
+        # Browse CJ Affiliate for real programs
+        cj_data = self.browse_and_extract(
+            "https://www.cj.com/",
+            "Extract any affiliate program listings, advertiser names, commission "
+            "structures, and categories shown on this page. Only include REAL data "
+            "visible on the page. Do NOT make up any information. "
+            "Return as JSON: {\"programs\": [{\"name\": str, "
+            "\"commission_rate\": str, \"category\": str, \"details\": str}]}"
+        )
+
+        # Search for high-commission affiliate programs
+        search_data = self.search_web(
+            "best high commission affiliate programs 2026 content sites",
+            "Extract affiliate program names, commission rates, cookie durations, "
+            "niches, and signup URLs mentioned. Only include REAL data visible on "
+            "the page. Do NOT make up any information. "
+            "Return as JSON: {\"programs\": [{\"name\": str, "
+            "\"commission_rate\": str, \"cookie_days\": str, \"niche\": str, "
+            "\"signup_url\": str}]}"
+        )
+
+        # Use LLM to select the best programs from real data
+        raw_data = {
+            "shareasale": shareasale_data,
+            "cj": cj_data,
+            "web_search": search_data,
+        }
         programs = self.think_json(
-            "Research 5 affiliate programs suitable for a content site. "
+            "Based on the following REAL affiliate program data from the web, "
+            "select the 5 best programs for a content site.\n\n"
+            f"Raw research data:\n{json.dumps(raw_data, default=str)[:3000]}\n\n"
             "Focus on programs with:\n"
             "- Good commission rates (>5%)\n"
             "- Cookie duration >30 days\n"
             "- Reputable brands\n"
             "- Products people actually buy\n\n"
+            "IMPORTANT: Only include programs that appeared in the real data above. "
+            "Do not invent programs.\n\n"
             "Return: {\"programs\": [{\"name\": str, \"commission_rate\": str, "
             "\"cookie_days\": int, \"niche\": str, \"signup_url\": str, "
-            "\"avg_order_value\": str}]}"
+            "\"avg_order_value\": str, \"source\": str}]}"
         )
         self.share_knowledge(
             "opportunity", "affiliate_programs",
@@ -146,13 +232,27 @@ class ContentSiteAgent(BaseAgent):
         return programs
 
     def _plan_new_site(self) -> dict[str, Any]:
-        """Plan a new content site from scratch."""
+        """Plan a new content site using real keyword data for validation."""
+        # Gather real market data to inform the plan
+        market_data = self.search_web(
+            "profitable blog niches low competition 2026",
+            "Extract any niche ideas, traffic estimates, monetization strategies, "
+            "and competition assessments mentioned. Only include REAL data visible "
+            "on the page. Do NOT make up any information. "
+            "Return as JSON: {\"niches\": [{\"niche\": str, \"competition\": str, "
+            "\"monetization\": str, \"notes\": str}]}"
+        )
+
         plan = self.think_json(
-            "Plan a new content site. Consider:\n"
+            "Plan a new content site. Use the following REAL market research "
+            "data to inform your plan:\n\n"
+            f"Market data:\n{json.dumps(market_data, default=str)[:2000]}\n\n"
+            "Consider:\n"
             "- What niche has demand but low competition?\n"
             "- Can it be monetized with affiliates + ads?\n"
             "- Can we produce 20+ articles for it?\n"
             "- What's the estimated monthly traffic potential?\n\n"
+            "IMPORTANT: Base your niche selection on the real data above.\n\n"
             "Return: {\"niche\": str, \"domain_suggestions\": [str], "
             "\"content_pillars\": [str], \"monetization_plan\": str, "
             "\"initial_articles\": int, \"estimated_monthly_traffic\": str, "

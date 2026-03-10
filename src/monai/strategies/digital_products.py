@@ -1,7 +1,7 @@
 """Digital products strategy agent.
 
-Creates and sells digital products: ebooks, templates, prompt packs, tools, guides.
-Low risk, passive income potential.
+Creates and sells digital products on REAL marketplaces (Gumroad, etc.).
+Uses the Gumroad integration for actual product listing and sales tracking.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from typing import Any
 from monai.agents.base import BaseAgent
 from monai.config import Config
 from monai.db.database import Database
+from monai.integrations.gumroad import GumroadIntegration
 from monai.utils.llm import LLM
 
 
@@ -20,13 +21,63 @@ class DigitalProductsAgent(BaseAgent):
     name = "digital_products"
     description = (
         "Creates and sells digital products — ebooks, templates, prompt packs, "
-        "guides, tools. Identifies trending niches, creates products, and lists them."
+        "guides, tools. Lists them on REAL marketplaces and tracks real sales."
     )
 
     def __init__(self, config: Config, db: Database, llm: LLM):
         super().__init__(config, db, llm)
         self.products_dir = config.data_dir / "products"
         self.products_dir.mkdir(parents=True, exist_ok=True)
+        self._gumroad = None  # Lazy-loaded
+
+    @property
+    def gumroad(self) -> GumroadIntegration:
+        """Lazy-load Gumroad integration with stored credentials."""
+        if self._gumroad is None:
+            access_token = self.identity.get_api_key("gumroad") or ""
+            self._gumroad = GumroadIntegration(
+                self.config, self.db, access_token=access_token,
+            )
+        return self._gumroad
+
+    def _ensure_gumroad_account(self) -> bool:
+        """Ensure we have a Gumroad account with API access.
+
+        Returns True if Gumroad is configured and accessible.
+        """
+        # Check if we already have a working token
+        token = self.identity.get_api_key("gumroad")
+        if token:
+            health = self.gumroad.health_check()
+            if health.get("status") == "ok":
+                return True
+
+        # No token — register on Gumroad and get API access
+        self.log_action("gumroad_setup", "Setting up Gumroad account and API access")
+        account_result = self.ensure_platform_account("gumroad")
+
+        if account_result.get("status") in ("exists", "completed"):
+            # Now get the API token via the developer settings
+            result = self.execute_task(
+                "Navigate to https://app.gumroad.com/settings/advanced#application-form "
+                "and create an API application to get an access token. "
+                "If already created, go to https://app.gumroad.com/settings/advanced "
+                "and copy the access token. "
+                "Return the access token in the result.",
+            )
+            if result.get("status") == "completed":
+                token_value = result.get("result", "")
+                if isinstance(token_value, dict):
+                    token_value = token_value.get("access_token", token_value.get("token", ""))
+                if token_value and isinstance(token_value, str) and len(token_value) > 10:
+                    self.identity.store_api_key("gumroad", "gumroad_access_token", token_value)
+                    # Reset the cached integration to use new token
+                    self._gumroad = None
+                    self.log_action("gumroad_setup", "Gumroad API token acquired")
+                    return True
+
+        self.log_action("gumroad_setup_failed", "Could not set up Gumroad API access")
+        return False
 
     def plan(self) -> list[str]:
         """Plan product creation and listing cycle."""
@@ -34,8 +85,8 @@ class DigitalProductsAgent(BaseAgent):
         plan = self.think_json(
             f"I have {len(existing)} digital products. Plan my next actions. "
             "Return: {\"steps\": [str]}. "
-            "Possible: research_niches, create_product, list_product, optimize_listings, "
-            "analyze_sales, create_bundle.",
+            "Possible: research_niches, create_product, list_product, check_sales, "
+            "optimize_listings, create_bundle.",
         )
         steps = plan.get("steps", ["research_niches"])
         self.log_action("plan", f"Planned {len(steps)} steps")
@@ -53,25 +104,53 @@ class DigitalProductsAgent(BaseAgent):
                 results["create"] = self._create_product()
             elif step == "list_product":
                 results["list"] = self._list_product()
+            elif step == "check_sales":
+                results["sales"] = self._check_sales()
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results
 
     def _research_niches(self) -> dict[str, Any]:
-        """Find profitable niches for digital products."""
+        """Find profitable niches by browsing REAL marketplace data."""
+        # Browse real Gumroad trending/discover to see what sells
+        trending_result = self.browse_and_extract(
+            "https://gumroad.com/discover",
+            "Extract the top trending product categories and specific products.\n"
+            "For each, get: category, product name, creator, price, number of ratings/sales if visible.\n"
+            "Return JSON: {\"trending\": [{\"category\": str, \"product_name\": str, "
+            "\"creator\": str, \"price\": str, \"ratings\": str}]}\n"
+            "Only include REAL products visible on the page.",
+        )
+
+        # Also check Product Hunt for digital product trends
+        ph_result = self.browse_and_extract(
+            "https://www.producthunt.com/topics/digital-products",
+            "Extract trending digital products. For each get:\n"
+            "name, tagline, category, upvotes.\n"
+            "Return JSON: {\"products\": [{\"name\": str, \"tagline\": str, "
+            "\"category\": str, \"upvotes\": int}]}\n"
+            "Only include REAL products visible on the page.",
+        )
+
+        # Combine real data and use LLM to identify opportunity gaps
+        real_data = {
+            "gumroad_trending": trending_result.get("result", {}),
+            "product_hunt": ph_result.get("result", {}),
+        }
+
         niches = self.think_json(
-            "Research and suggest 5 profitable niches for digital products "
-            "(ebooks, templates, prompt packs, Notion templates, spreadsheet tools, etc). "
-            "Focus on niches with proven demand and low competition. "
+            "Based on this REAL marketplace data, identify 5 profitable niches "
+            "for digital products I can create and sell. Focus on gaps where "
+            "demand exists but competition is moderate.\n\n"
+            f"Real marketplace data:\n{json.dumps(real_data, default=str)[:3000]}\n\n"
             "Return: {\"niches\": [{\"niche\": str, \"product_type\": str, "
-            "\"estimated_price\": float, \"demand_score\": int, \"reasoning\": str}]}"
+            "\"estimated_price\": float, \"reasoning\": str}]}",
         )
         self.log_action("research_niches", json.dumps(niches.get("niches", []))[:500])
         return niches
 
     def _create_product(self) -> dict[str, Any]:
         """Create a digital product based on research."""
-        # First, decide what to create
         product_spec = self.think_json(
             "Design a specific digital product to create right now. "
             "It should be something I can generate with AI and sell immediately. "
@@ -89,7 +168,8 @@ class DigitalProductsAgent(BaseAgent):
                 [
                     {"role": "system", "content": (
                         "You are creating a premium digital product. Write detailed, "
-                        "actionable, high-value content that people would gladly pay for."
+                        "actionable, high-value content that people would gladly pay for. "
+                        "The quality must be indistinguishable from expert human work."
                     )},
                     {"role": "user", "content": (
                         f"Product: {title}\nWrite this section: {section}\n"
@@ -100,7 +180,7 @@ class DigitalProductsAgent(BaseAgent):
             )
             content_parts.append({"section": section, "content": part})
 
-        # Save product
+        # Save product locally
         safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title).strip()
         product_path = self.products_dir / f"{safe_title}.json"
         product_data = {
@@ -117,24 +197,97 @@ class DigitalProductsAgent(BaseAgent):
         return {"product": title, "sections": len(sections)}
 
     def _list_product(self) -> dict[str, Any]:
-        """Prepare product listing for marketplaces."""
-        # Find unlisted products
+        """List products on REAL Gumroad marketplace."""
+        # Ensure Gumroad is set up
+        gumroad_ready = self._ensure_gumroad_account()
+
         products = list(self.products_dir.glob("*.json"))
         listed = 0
+
         for product_path in products:
             data = json.loads(product_path.read_text())
-            if data.get("status") == "created":
-                spec = data["spec"]
-                listing = self.think_json(
-                    f"Create a compelling marketplace listing for this product. "
-                    f"Product: {json.dumps(spec)}\n"
-                    "Return: {\"title\": str, \"tagline\": str, \"description\": str, "
-                    "\"tags\": [str], \"platforms\": [str]}"
+            if data.get("status") != "created":
+                continue
+
+            spec = data["spec"]
+            title = spec.get("title", "Untitled")
+            price_usd = spec.get("price", 9.99)
+            price_cents = int(price_usd * 100)
+            description = spec.get("description", "")
+
+            # Generate a compelling marketplace description
+            listing = self.think(
+                f"Write a compelling Gumroad product listing description for:\n"
+                f"Product: {title}\n"
+                f"Type: {spec.get('type', 'digital product')}\n"
+                f"Target audience: {spec.get('target_audience', 'professionals')}\n\n"
+                "Write a description that sells. Include benefits, what's included, "
+                "and a clear value proposition. Use markdown formatting."
+            )
+
+            if gumroad_ready:
+                # List on REAL Gumroad via API
+                try:
+                    gumroad_product = self.gumroad.create_product(
+                        agent_name=self.name,
+                        name=title,
+                        price=price_cents,
+                        description=listing,
+                    )
+                    data["gumroad_id"] = gumroad_product.get("id", "")
+                    data["gumroad_url"] = gumroad_product.get("short_url", "")
+                    data["listing"] = listing
+                    data["status"] = "listed"
+                    product_path.write_text(json.dumps(data, indent=2))
+                    listed += 1
+                    self.log_action("list_product",
+                                    f"Listed on Gumroad: {title} (${price_usd:.2f})")
+                except Exception as e:
+                    self.log_action("list_product_failed",
+                                    f"Gumroad API error for {title}: {e}")
+                    self.learn_from_error(e, f"Listing {title} on Gumroad")
+            else:
+                # Fallback: use browser to list on Gumroad
+                result = self.platform_action(
+                    "gumroad",
+                    f"Create a new product listing:\n"
+                    f"Name: {title}\n"
+                    f"Price: ${price_usd:.2f}\n"
+                    f"Description: {listing[:1000]}\n\n"
+                    "Navigate to https://app.gumroad.com/products/new and fill in the form.",
+                    context=listing,
                 )
-                data["listing"] = listing
-                data["status"] = "listed"
-                product_path.write_text(json.dumps(data, indent=2))
-                listed += 1
-                self.log_action("list_product", f"Listed: {spec.get('title')}")
+                if result.get("status") == "completed":
+                    data["listing"] = listing
+                    data["status"] = "listed"
+                    product_path.write_text(json.dumps(data, indent=2))
+                    listed += 1
 
         return {"products_listed": listed}
+
+    def _check_sales(self) -> dict[str, Any]:
+        """Check real sales data from Gumroad."""
+        if not self._ensure_gumroad_account():
+            return {"status": "gumroad_not_configured"}
+
+        try:
+            summary = self.gumroad.get_revenue_summary(self.name)
+
+            # Record any new revenue
+            for product in summary.get("products", []):
+                if product.get("revenue_usd", 0) > 0:
+                    self.log_action("sales_data",
+                                    f"{product['name']}: ${product['revenue_usd']:.2f} "
+                                    f"({product['sales']} sales)")
+
+            if summary.get("total_revenue_usd", 0) > 0:
+                self.record_revenue(
+                    summary["total_revenue_usd"],
+                    "product_sales",
+                    f"Gumroad sales: {summary['total_sales']} total",
+                )
+
+            return summary
+        except Exception as e:
+            self.log_action("check_sales_failed", str(e))
+            return {"status": "error", "error": str(e)}
