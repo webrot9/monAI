@@ -399,11 +399,28 @@ def _check_dangerous_args(base_cmd: str, parts: list[str], full_cmd: str) -> str
     return None
 
 
+# Extra commands added at runtime via config — mutable set
+_extra_allowed_commands: set[str] = set()
+
+
+def extend_allowed_commands(commands: list[str]) -> None:
+    """Add extra commands to the whitelist at runtime (from config).
+
+    These are ADDED to the base whitelist, not replacements.
+    Cannot override blocked patterns or argument restrictions.
+    """
+    for cmd in commands:
+        cmd = cmd.strip()
+        if cmd:
+            _extra_allowed_commands.add(cmd)
+            logger.info(f"Shell whitelist extended: '{cmd}'")
+
+
 def is_shell_command_allowed(command: str) -> bool:
     """Check if a shell command is allowed to run.
 
     Three layers of validation:
-    1. Base command must be in the whitelist
+    1. Base command must be in the whitelist (base + config extras)
     2. No pipe-to-interpreter or subshell patterns
     3. Per-command argument restrictions (e.g. no python -c, no curl -o /etc/...)
     """
@@ -416,10 +433,11 @@ def is_shell_command_allowed(command: str) -> bool:
     if not parts:
         return False
 
-    # Layer 1: base command whitelist
+    # Layer 1: base command whitelist + config extras
     base_cmd = parts[0].rsplit("/", 1)[-1]
+    full_whitelist = set(ALLOWED_SHELL_COMMANDS) | _extra_allowed_commands
 
-    if base_cmd not in ALLOWED_SHELL_COMMANDS:
+    if base_cmd not in full_whitelist:
         logger.warning(f"Shell command blocked (not in whitelist): {base_cmd}")
         return False
 

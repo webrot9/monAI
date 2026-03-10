@@ -161,6 +161,18 @@ class BTCPayConfig:
 
 
 @dataclass
+class SandboxConfig:
+    """Shell command execution sandbox configuration.
+
+    The base whitelist is always active. extra_allowed_commands lets
+    you extend it for deployment-specific needs without touching code.
+    """
+    extra_allowed_commands: list[str] = field(default_factory=list)
+    subprocess_timeout: int = 60  # Default timeout for shell commands
+    enable_namespace_isolation: bool = True  # Use Linux unshare if available
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -173,6 +185,7 @@ class Config:
     monero: MoneroConfig = field(default_factory=MoneroConfig)
     btcpay: BTCPayConfig = field(default_factory=BTCPayConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     initial_capital: float = 500.0  # €500 initial budget
     currency: str = "EUR"
     data_dir: Path = field(default_factory=lambda: CONFIG_DIR)

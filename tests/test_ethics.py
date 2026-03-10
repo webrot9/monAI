@@ -4,6 +4,8 @@ from monai.agents.ethics import (
     BLOCKED_PATTERNS,
     CORE_DIRECTIVES,
     REQUIRE_APPROVAL_PATTERNS,
+    _extra_allowed_commands,
+    extend_allowed_commands,
     get_directives_for_context,
     get_full_directives,
     is_action_blocked,
@@ -284,6 +286,33 @@ class TestArgumentValidation:
 
     def test_allows_normal_awk(self):
         assert is_shell_command_allowed("awk '{print $1}' file.txt") is True
+
+
+class TestExtendAllowedCommands:
+    def setup_method(self):
+        """Clear extra commands before each test."""
+        _extra_allowed_commands.clear()
+
+    def teardown_method(self):
+        """Clear extra commands after each test."""
+        _extra_allowed_commands.clear()
+
+    def test_extend_allows_new_command(self):
+        assert is_shell_command_allowed("rustc --version") is False
+        extend_allowed_commands(["rustc"])
+        assert is_shell_command_allowed("rustc --version") is True
+
+    def test_extend_still_blocked_by_patterns(self):
+        """Extended commands still go through Layer 2 and 3 checks."""
+        extend_allowed_commands(["custom_tool"])
+        # Layer 2: injection patterns still block
+        assert is_shell_command_allowed("custom_tool && rm -rf /") is False
+        # Custom tool accessing sensitive paths still blocked
+        assert is_shell_command_allowed("custom_tool /etc/shadow") is False
+
+    def test_extend_empty_string_ignored(self):
+        extend_allowed_commands(["", "  "])
+        assert len(_extra_allowed_commands) == 0
 
 
 class TestGetFullDirectives:

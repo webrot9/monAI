@@ -25,7 +25,7 @@ from monai.db.database import Database
 from monai.utils.browser import Browser
 from monai.utils.llm import LLM
 from monai.utils.privacy import get_anonymizer
-from monai.utils.sandbox import is_path_allowed, safe_read, safe_write
+from monai.utils.sandbox import is_path_allowed, safe_read, safe_write, sandbox_run
 
 logger = logging.getLogger(__name__)
 
@@ -244,19 +244,14 @@ class AutonomousExecutor:
                 from monai.agents.ethics import is_shell_command_allowed
                 if not is_shell_command_allowed(cmd):
                     return "BLOCKED: command not in allowed list. Only safe commands permitted."
-                # Sandbox: run as argument list (no shell=True) from workspace only
-                from monai.utils.sandbox import PROJECT_ROOT
+                # Parse and execute in OS-level sandbox (namespace isolation +
+                # sanitized env + forced cwd + no shell=True)
                 import shlex
                 try:
                     cmd_parts = shlex.split(cmd)
                 except ValueError as e:
                     return f"BLOCKED: invalid command syntax: {e}"
-                result = subprocess.run(
-                    cmd_parts, shell=False, capture_output=True, text=True, timeout=60,
-                    cwd=str(PROJECT_ROOT / "workspace"),
-                )
-                return {"stdout": result.stdout[:2000], "stderr": result.stderr[:500],
-                        "returncode": result.returncode}
+                return sandbox_run(cmd_parts)
 
             elif tool == "write_file":
                 path = args.get("path", "")
@@ -286,13 +281,13 @@ class AutonomousExecutor:
 
             elif tool == "run_tests":
                 test_path = args.get("path", "")
-                result = subprocess.run(
+                result = sandbox_run(
                     ["python", "-m", "pytest", test_path, "-v", "--tb=short"],
-                    capture_output=True, text=True, timeout=60,
+                    timeout=120,
                 )
                 return {
-                    "passed": result.returncode == 0,
-                    "output": result.stdout + result.stderr,
+                    "passed": result["returncode"] == 0,
+                    "output": result["stdout"] + result["stderr"],
                 }
 
             elif tool == "wait":
