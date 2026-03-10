@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS virtual_phones (
     status TEXT NOT NULL DEFAULT 'active',  -- active, used, expired, released
     used_for_platform TEXT,             -- which platform signup used this number
     used_by_agent TEXT,                 -- which agent requested it
+    order_id TEXT,                      -- provider order/transaction ID for polling
     verification_code TEXT,             -- received code (if any)
     cost REAL DEFAULT 0.0,
     acquired_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -135,31 +136,170 @@ class PhoneProvisioner(BaseAgent):
         if not provider_info:
             return {"status": "error", "reason": f"Unknown provider: {provider}"}
 
-        # Record the intent — actual API call would go here
-        # For now, log the attempt so the system knows what's needed
-        self.log_action(
-            "acquire_number",
-            f"Provider: {provider}, Platform: {platform}, Country: {country}",
-            "API integration needed",
+        api_key = self._get_api_key(provider)
+        if not api_key:
+            return {
+                "status": "error",
+                "reason": f"No API key configured for {provider}. "
+                          f"Set sms.{provider}_api_key in config or store via identity agent.",
+            }
+
+        try:
+            if provider == "smspool":
+                result = self._acquire_smspool(api_key, platform, country)
+            elif provider == "textverified":
+                result = self._acquire_textverified(api_key, platform, country)
+            else:
+                return {"status": "error", "reason": f"No acquisition logic for: {provider}"}
+        except Exception as e:
+            logger.error(f"SMS acquisition failed ({provider}): {e}")
+            self.log_action("acquire_number_failed", str(e))
+            return {"status": "error", "reason": str(e)}
+
+        if result.get("status") != "acquired":
+            return result
+
+        # Record in DB
+        phone_id = self.db.execute_insert(
+            "INSERT INTO virtual_phones "
+            "(provider, phone_number, country, status, used_for_platform, "
+            "used_by_agent, order_id, cost, expires_at) "
+            "VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)",
+            (provider, result["phone_number"], country, platform,
+             requesting_agent, result.get("order_id", ""),
+             result.get("cost", 0), result.get("expires_at")),
         )
 
-        # Record expense estimate
-        estimated_cost = provider_info["avg_cost_usd"]
         self.record_expense(
-            estimated_cost, "phone_verification",
+            result.get("cost", 0), "phone_verification",
             f"Virtual number for {platform} via {provider}",
+        )
+        self.log_action(
+            "acquire_number",
+            f"Got {result['phone_number']} from {provider} for {platform}",
         )
 
         return {
-            "status": "pending_api_integration",
+            "status": "acquired",
+            "phone_number": result["phone_number"],
             "provider": provider,
-            "platform": platform,
-            "estimated_cost_usd": estimated_cost,
-            "note": (
-                f"SMS provider {provider} API integration needed. "
-                f"Endpoint: {provider_info['base_url']}"
-            ),
+            "phone_id": phone_id,
+            "order_id": result.get("order_id"),
+            "cost": result.get("cost", 0),
         }
+
+    def _get_api_key(self, provider: str) -> str | None:
+        """Retrieve API key for the SMS provider from config or identity store."""
+        # Check config first
+        key = self.config.get(f"sms.{provider}_api_key", "")
+        if key:
+            return key
+        # Check identity agent's credential store
+        rows = self.db.execute(
+            "SELECT api_key FROM accounts WHERE platform = ? AND status = 'active' LIMIT 1",
+            (f"sms_{provider}",),
+        )
+        if rows:
+            from monai.agents.identity import IdentityManager
+            return IdentityManager.decrypt_value(
+                rows[0]["api_key"], self.config.get("encryption_key", "")
+            )
+        return None
+
+    # ── SMSPool Integration ──────────────────────────────────────
+
+    def _acquire_smspool(self, api_key: str, platform: str,
+                         country: str) -> dict[str, Any]:
+        """Acquire a number via SMSPool API (https://api.smspool.net)."""
+        base = SMS_PROVIDERS["smspool"]["base_url"]
+
+        # Step 1: Purchase SMS
+        resp = self._http.post(
+            f"{base}/purchase/sms",
+            data={
+                "key": api_key,
+                "country": self._smspool_country_id(country),
+                "service": self._smspool_service_id(platform),
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("success") == 0:
+            return {"status": "error", "reason": data.get("message", "SMSPool error")}
+
+        return {
+            "status": "acquired",
+            "phone_number": data.get("phonenumber", data.get("number", "")),
+            "order_id": str(data.get("order_id", "")),
+            "cost": float(data.get("cost", data.get("price", 0))),
+            "expires_at": None,  # SMSPool orders auto-expire after ~15 min
+        }
+
+    def _smspool_country_id(self, country: str) -> str:
+        """Map ISO country code to SMSPool country ID."""
+        mapping = {"US": "1", "UK": "10", "CA": "36", "DE": "43", "FR": "16"}
+        return mapping.get(country.upper(), "1")
+
+    def _smspool_service_id(self, platform: str) -> str:
+        """Map platform name to SMSPool service ID."""
+        mapping = {
+            "twitter": "1", "google": "9", "facebook": "3",
+            "instagram": "6", "whatsapp": "15", "telegram": "14",
+            "linkedin": "50", "fiverr": "283", "upwork": "619",
+            "gumroad": "0", "stripe": "0",  # "0" = any service
+        }
+        return mapping.get(platform.lower(), "0")
+
+    # ── TextVerified Integration ─────────────────────────────────
+
+    def _acquire_textverified(self, api_key: str, platform: str,
+                              country: str) -> dict[str, Any]:
+        """Acquire a number via TextVerified API."""
+        base = SMS_PROVIDERS["textverified"]["base_url"]
+
+        # TextVerified uses bearer auth + service-based ordering
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # Create verification
+        resp = self._http.post(
+            f"{base}/Verifications",
+            headers=headers,
+            json={
+                "id": self._textverified_service_name(platform),
+                "capability": "sms",
+                "method": "Standard",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if "number" not in data:
+            return {"status": "error", "reason": data.get("message", "TextVerified error")}
+
+        return {
+            "status": "acquired",
+            "phone_number": data["number"],
+            "order_id": str(data.get("id", "")),
+            "cost": float(data.get("cost", 1.0)),
+            "expires_at": data.get("expires_at"),
+        }
+
+    def _textverified_service_name(self, platform: str) -> str:
+        """Map platform name to TextVerified service name."""
+        mapping = {
+            "twitter": "Twitter", "google": "Google", "facebook": "Facebook",
+            "instagram": "Instagram", "whatsapp": "WhatsApp", "telegram": "Telegram",
+            "linkedin": "LinkedIn", "fiverr": "Fiverr", "upwork": "Upwork",
+        }
+        return mapping.get(platform.lower(), platform.title())
+
+    # ── Verification Code Polling ────────────────────────────────
 
     def check_verification(self, phone_id: int) -> dict[str, Any]:
         """Check if a verification code has been received."""
@@ -177,10 +317,100 @@ class PhoneProvisioner(BaseAgent):
                 "phone_number": phone["phone_number"],
             }
 
+        # Poll the provider for new SMS
+        code = self._poll_provider(phone)
+        if code:
+            self.db.execute(
+                "UPDATE virtual_phones SET verification_code = ?, status = 'used' "
+                "WHERE id = ?",
+                (code, phone_id),
+            )
+            return {
+                "status": "received",
+                "code": code,
+                "phone_number": phone["phone_number"],
+            }
+
         return {
             "status": "waiting",
             "phone_number": phone["phone_number"],
         }
+
+    def wait_for_code(self, phone_id: int, timeout: int = 120,
+                      poll_interval: int = 5) -> dict[str, Any]:
+        """Block until a verification code is received or timeout."""
+        import time as _time
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            result = self.check_verification(phone_id)
+            if result["status"] == "received":
+                return result
+            if result["status"] == "not_found":
+                return result
+            _time.sleep(poll_interval)
+        return {"status": "timeout", "phone_id": phone_id}
+
+    def _poll_provider(self, phone: dict) -> str | None:
+        """Poll the SMS provider API for verification code."""
+        provider = phone.get("provider", "")
+        api_key = self._get_api_key(provider)
+        if not api_key:
+            return None
+
+        try:
+            if provider == "smspool":
+                return self._poll_smspool(api_key, phone)
+            elif provider == "textverified":
+                return self._poll_textverified(api_key, phone)
+        except Exception as e:
+            logger.warning(f"SMS poll failed ({provider}): {e}")
+        return None
+
+    def _poll_smspool(self, api_key: str, phone: dict) -> str | None:
+        """Check SMSPool for received SMS."""
+        base = SMS_PROVIDERS["smspool"]["base_url"]
+        order_id = phone.get("order_id", "")
+        if not order_id:
+            return None
+
+        resp = self._http.post(
+            f"{base}/sms/check",
+            data={"key": api_key, "orderid": order_id},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("success") == 1 and data.get("sms"):
+            return self._extract_code(data["sms"])
+        return None
+
+    def _poll_textverified(self, api_key: str, phone: dict) -> str | None:
+        """Check TextVerified for received SMS."""
+        base = SMS_PROVIDERS["textverified"]["base_url"]
+        order_id = phone.get("order_id", "")
+        if not order_id:
+            return None
+
+        resp = self._http.get(
+            f"{base}/Verifications/{order_id}",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        sms_text = data.get("sms") or data.get("code") or ""
+        if sms_text:
+            return self._extract_code(sms_text)
+        return None
+
+    def _extract_code(self, sms_text: str) -> str:
+        """Extract verification code from SMS text."""
+        import re
+        # Match 4-8 digit codes
+        match = re.search(r'\b(\d{4,8})\b', sms_text)
+        return match.group(1) if match else sms_text.strip()
 
     def release_number(self, phone_id: int):
         """Release a number that's no longer needed."""

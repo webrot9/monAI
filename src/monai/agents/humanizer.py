@@ -73,10 +73,82 @@ class Humanizer(BaseAgent):
             conn.executescript(HUMANIZER_SCHEMA)
 
     def plan(self) -> list[str]:
-        return ["review_quality"]
+        """Plan autonomous quality review cycle."""
+        steps = []
+        # Check if there are recent low-quality outputs
+        rows = self.db.execute(
+            "SELECT COUNT(*) as cnt FROM content_quality WHERE final_score < 0.7"
+        )
+        low_quality = rows[0]["cnt"] if rows else 0
+        if low_quality > 0:
+            steps.append("review_low_quality_content")
+
+        # Check for profiles that haven't been updated recently
+        stale = self.db.execute(
+            "SELECT COUNT(*) as cnt FROM style_profiles "
+            "WHERE updated_at < datetime('now', '-7 days')"
+        )
+        if stale and stale[0]["cnt"] > 0:
+            steps.append("refresh_stale_profiles")
+
+        # Always report quality stats
+        steps.append("generate_quality_report")
+        return steps
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
-        return {"status": "ready"}
+        """Autonomous cycle: review quality trends and improve profiles."""
+        self.log_action("run", "Starting humanizer autonomous cycle")
+        results: dict[str, Any] = {}
+
+        # 1. Review low-quality content and update AI-tell patterns
+        low_quality = self.db.execute(
+            "SELECT issues_found, style_profile FROM content_quality "
+            "WHERE final_score < 0.7 ORDER BY created_at DESC LIMIT 20"
+        )
+        if low_quality:
+            # Aggregate common issues to improve detection
+            all_issues: list[str] = []
+            for row in low_quality:
+                try:
+                    issues = json.loads(row["issues_found"] or "[]")
+                    all_issues.extend(issues)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # Find recurring patterns not yet in AI_TELLS
+            from collections import Counter
+            counts = Counter(all_issues)
+            new_tells = [
+                pattern for pattern, cnt in counts.most_common(10)
+                if cnt >= 2 and pattern not in self.AI_TELLS
+            ]
+            if new_tells:
+                self.AI_TELLS.extend(new_tells)
+                self.log_action("tells_updated", f"Added {len(new_tells)} new AI-tell patterns")
+            results["low_quality_reviewed"] = len(low_quality)
+            results["new_patterns_added"] = new_tells
+
+        # 2. Refresh stale style profiles with updated avoid_patterns
+        stale_profiles = self.db.execute(
+            "SELECT * FROM style_profiles "
+            "WHERE updated_at < datetime('now', '-7 days')"
+        )
+        refreshed = 0
+        for profile in stale_profiles:
+            current_avoid = json.loads(profile["avoid_patterns"] or "[]")
+            merged = list(set(current_avoid) | set(self.AI_TELLS))
+            if len(merged) > len(current_avoid):
+                self.db.execute(
+                    "UPDATE style_profiles SET avoid_patterns = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (json.dumps(merged), profile["id"]),
+                )
+                refreshed += 1
+        results["profiles_refreshed"] = refreshed
+
+        # 3. Quality report
+        results["quality_stats"] = self.get_quality_stats()
+        self.log_action("run_complete", json.dumps(results, default=str)[:500])
+        return results
 
     def humanize(self, content: str, style_profile: str = "default",
                  context: str = "") -> str:
