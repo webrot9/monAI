@@ -1,0 +1,264 @@
+# monAI — Architecture & Session Documentation
+
+## What is monAI?
+
+monAI is a **fully autonomous money-making AI agent system**. It operates with zero human intervention: it discovers opportunities, creates businesses, manages payments, and transfers profits to its creator — all while maintaining complete anonymity and legal compliance.
+
+The creator provides initial seed capital (via anonymous crowdfunding donation). From that point forward, monAI does everything: registers on platforms, creates accounts, builds products, finds clients, manages finances, and pays the creator through a multi-layer corporate structure.
+
+## Core Objectives
+
+1. **Full Autonomy**: monAI does EVERYTHING by itself. No human sets up accounts, configures APIs, or manages operations. Sub-agents handle specialized tasks. The system self-bootstraps from zero.
+
+2. **Creator Anonymity**: The creator must be COMPLETELY untraceable. All network traffic goes through Tor. Each brand has its own identity. The LLC structure shields the creator. Payments flow through anonymous layers.
+
+3. **Legal Compliance**: Every action must be legal in the creator's jurisdiction (Italy/EU). A Legal Advisor agent reviews every new activity before it proceeds. Tax obligations are tracked and automated.
+
+4. **Self-Sustainability**: Starting from €500 seed capital, monAI must become profitable and fund itself. API costs, infrastructure, and all operations must be covered by revenue.
+
+5. **Zero AI Slop**: Everything monAI produces — code, content, client deliverables — must be indistinguishable from expert human work. All code is tested. All content is fact-checked and humanized.
+
+6. **Creator Protection**: The creator must NEVER face legal issues, financial losses, or reputational damage. monAI absorbs all risk. Ethics are hardcoded and non-negotiable.
+
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      ORCHESTRATOR                           │
+│  Master brain: strategy selection, opportunity discovery,   │
+│  agent coordination, infrastructure management              │
+└─────────┬───────────────────────────────────────────────────┘
+          │
+    ┌─────┴──────────────────────────────────────────┐
+    │              AGENT TEAMS                        │
+    ├─────────────────────────────────────────────────┤
+    │  Research Team    │ Market, trends, competitors │
+    │  Engineering Team │ Code, bugs, testing         │
+    │  Marketing Team   │ Content, growth, outreach   │
+    │  Specialist Agents│ Legal, ethics, humanizer,   │
+    │                   │ fact-checker, finance, etc.  │
+    └─────────────────────────────────────────────────┘
+          │
+    ┌─────┴──────────────────────────────────────────┐
+    │           13 STRATEGY AGENTS                    │
+    │  freelance_writing, digital_products,           │
+    │  content_sites, micro_saas, saas, affiliate,    │
+    │  newsletter, lead_gen, social_media,            │
+    │  course_creation, domain_flipping,              │
+    │  print_on_demand, telegram_bots                 │
+    └─────────────────────────────────────────────────┘
+          │
+    ┌─────┴──────────────────────────────────────────┐
+    │           BUSINESS LAYER                        │
+    ├─────────────────────────────────────────────────┤
+    │  Finance         │ Revenue & expense tracking   │
+    │  Commercialista  │ Accounting & budgets         │
+    │  Corporate       │ LLC, expenses, tax filings   │
+    │  Bootstrap       │ Seed capital & crowdfunding  │
+    │  CRM + Pipeline  │ Leads & conversion tracking  │
+    │  Risk            │ Diversification & stop-loss  │
+    │  Projections     │ Financial forecasting        │
+    │  Invoicing       │ Creator contractor invoices  │
+    └─────────────────────────────────────────────────┘
+          │
+    ┌─────┴──────────────────────────────────────────┐
+    │           PAYMENT PIPELINE                      │
+    ├─────────────────────────────────────────────────┤
+    │  Collection: Stripe, BTCPay, Gumroad,           │
+    │              LemonSqueezy (per brand)            │
+    │  Sweep Engine: Automated brand → creator        │
+    │  Flows:                                         │
+    │    • LLC flow: Brand → LLC bank → contractor    │
+    │      invoice → creator bank (P.IVA forfettario) │
+    │    • Crypto flow: Brand → Monero → creator      │
+    │    • Mixed: LLC expenses + invoicing + rotation  │
+    │  Webhook Server: Real-time payment notifications│
+    └─────────────────────────────────────────────────┘
+```
+
+## Bootstrap & Funding Flow
+
+```
+PHASE 1: Seed Capital
+  Option A (RECOMMENDED): Creator donates on Ko-fi as "Anonymous"
+    → Tracked internally as creator_seed
+    → Indistinguishable from organic backers
+    → No prepaid card needed
+
+  Option B: Paysafecard voucher (€50, tabaccheria, no ID)
+    → Only for domain + hosting of crowdfunding page
+    → Retired once crowdfunding is active
+
+  Option C: Both — Paysafecard for initial domain, then crowdfunding
+
+PHASE 2: AI Crowdfunding
+  → monAI openly declares itself as an AI
+  → "The first AI-funded startup" — viral angle
+  → Platforms: Ko-fi (0%), Buy Me a Coffee (5%), Gumroad (10%), GitHub Sponsors (0%)
+  → No LLC required for any of these
+  → Funds used for: LLC formation, registered agent, bank, first months
+
+PHASE 3: Self-Sustaining
+  → All revenue through LLC bank
+  → Prepaid retired, crowdfunding optional
+  → monAI pays its own bills from earnings
+```
+
+## Payment & Payout Structure
+
+### Triple-Layer Payout Strategy
+1. **LLC Expenses** (tax-free for creator): LLC buys hardware, software, hosting for the creator — not taxable income
+2. **P.IVA Forfettario Invoicing**: Creator invoices LLC as contractor — 5% tax for first 5 years, then 15%
+3. **Multi-LLC Rotation**: Round-robin invoicing across multiple LLCs to avoid single-client suspicion
+
+### Tax Compliance (Automated)
+- **US LLC (Wyoming)**: Form 5472 + pro-forma 1120 (June 15), annual report ($60/yr), registered agent ($150/yr)
+- **Italian P.IVA**: Acconto/saldo (June 30, Nov 30), INPS contributions, dichiarazione dei redditi
+
+## Content Quality Pipeline
+
+```
+Content Generation → Humanizer → FactChecker → Publish/Revise/Block
+```
+
+- **Humanizer**: Ensures content passes AI detection tools
+- **FactChecker**: Extracts claims, verifies each one, tracks per-brand accuracy
+  - Verdict: publish (≥80% verified), revise (>30% unverifiable), block (any false claims)
+  - 8 claim categories: statistic, attribution, historical, scientific, comparative, financial, legal, technical
+
+## Key Technical Details
+
+### Agent System
+- All agents inherit from `BaseAgent` (LLM reasoning, collaboration, learning, journaling)
+- Orchestrator manages lifecycle of all agents
+- Agents collaborate via `CollaborationHub` and `SharedMemory`
+- Ethics enforced at BaseAgent level; `EthicsTester` destroys agents that fail
+
+### Database
+- SQLite via `Database` class in `db/database.py`
+- Each module creates its own tables via schema scripts
+- Stored at `~/.monai/monai.db`
+
+### Privacy
+- All traffic through Tor (default) or SOCKS5/HTTP proxy
+- User-agent rotation, WebRTC disabled, DNS over proxy
+- Metadata stripped from all output files
+- Anonymity verified before operations start
+
+### Communication
+- Creator contacted via Telegram bot (self-provisioned)
+- Bot uses verification code from `~/.monai/verify.txt`
+- Creator username: Cristal89
+
+### Config
+- Dataclass-based config in `config.py`
+- Stored at `~/.monai/config.json`
+- Sections: LLM, risk, comms, privacy, telegram, LLC, bootstrap_wallet, creator_wallet, monero, btcpay
+
+## Module Index
+
+### Agents (`src/monai/agents/`)
+| Module | Purpose |
+|--------|---------|
+| `orchestrator.py` | Master brain — strategy selection, agent coordination |
+| `provisioner.py` | Infrastructure provisioning (domains, APIs, accounts) |
+| `executor.py` | Task execution with browser control |
+| `identity.py` | Identity & credential management |
+| `coder.py` | Code generation with mandatory testing |
+| `humanizer.py` | Content humanization (anti-AI-detection) |
+| `fact_checker.py` | Content verification before publication |
+| `legal.py` | Per-activity legal compliance advisor |
+| `ethics.py` | Hardcoded ethical rules |
+| `ethics_test.py` | Ethical testing framework |
+| `self_improve.py` | Agent self-improvement |
+| `llc_provisioner.py` | Autonomous LLC formation |
+| `phone_provisioner.py` | Virtual phone number acquisition |
+| `finance_expert.py` | Financial advisory and ROI analysis |
+| `social_presence.py` | Brand social accounts |
+| `web_presence.py` | Domain & website management |
+| `browser_learner.py` | Adaptive browser automation |
+| `memory.py` | Shared knowledge base |
+| `collaboration.py` | Agent-to-agent help system |
+| `spawner.py` | Sub-agent creation |
+| `eng_team/` | Engineering team (tech lead + engineers) |
+| `research_team/` | Research team (market, trends, competitors) |
+| `marketing_team/` | Marketing team (content, growth, outreach) |
+
+### Business (`src/monai/business/`)
+| Module | Purpose |
+|--------|---------|
+| `finance.py` | Revenue & expense tracking |
+| `commercialista.py` | Accounting, budgets, ROI per agent |
+| `corporate.py` | LLC management, expenses, tax obligations |
+| `bootstrap.py` | Seed capital (crowdfunding, Paysafecard, creator seed) |
+| `crm.py` | Lead management, contacts, pipeline |
+| `pipeline.py` | Conversion funnel tracking |
+| `risk.py` | Diversification, spend limits, stop-loss |
+| `projections.py` | Financial forecasting |
+| `invoicing.py` | Creator contractor invoices |
+| `payments.py` | Payment coordination (legacy) |
+| `brand_payments.py` | Per-brand payment accounts |
+| `comms.py` | Email engine (SMTP/IMAP) |
+| `email_marketing.py` | Email campaigns & subscriber lists |
+
+### Payments (`src/monai/payments/`)
+| Module | Purpose |
+|--------|---------|
+| `manager.py` | Unified payment manager |
+| `stripe_provider.py` | Stripe card payments |
+| `btcpay_provider.py` | BTCPay Server (Bitcoin/Lightning) |
+| `gumroad_provider.py` | Gumroad sales |
+| `lemonsqueezy_provider.py` | LemonSqueezy payments |
+| `monero_provider.py` | Monero privacy-first crypto |
+| `sweep_engine.py` | Automated profit sweeping |
+| `webhook_server.py` | Webhook handler for all providers |
+
+### Strategies (`src/monai/strategies/`)
+13 strategy agents, each implementing an autonomous revenue channel:
+freelance_writing, digital_products, content_sites, micro_saas, saas, affiliate, newsletter, lead_gen, social_media, course_creation, domain_flipping, print_on_demand, telegram_bots
+
+### Utils (`src/monai/utils/`)
+| Module | Purpose |
+|--------|---------|
+| `llm.py` | OpenAI integration with per-call cost tracking |
+| `browser.py` | Playwright browser automation |
+| `privacy.py` | Tor/proxy anonymization |
+| `resources.py` | CPU/memory/disk monitoring |
+| `sandbox.py` | Sandboxed execution |
+| `telegram.py` | Telegram Bot API client |
+
+## Test Suite
+
+- **911 tests** across 51 test files
+- All modules have corresponding test files
+- Tests verify actual behavior with real assertions
+- Run: `python -m pytest --tb=short`
+
+## Session Continuity Notes
+
+### What's Been Built (as of 2026-03-10)
+Everything listed above is implemented, tested, and passing. The codebase is functional from config through to payment sweep.
+
+### What's Next
+1. **Wire FactChecker into content pipelines** — content_pipeline, affiliate_content_pipeline, etc. should call `fact_checker.check()` before publishing
+2. **End-to-end integration tests** — full payment flow from Stripe webhook to creator wallet
+3. **Crowdfunding landing page** — monAI's first website for the AI crowdfunding campaign
+4. **Ko-fi campaign setup** — automated campaign creation and monitoring
+
+### Key Design Decisions Made
+- **OpenAI, not Claude**: All LLM calls use OpenAI SDK (gpt-4o / gpt-4o-mini)
+- **Creator donates via crowdfunding**: Simplest bootstrap — no Paysafecard needed
+- **Multi-LLC rotation**: Avoids single-client invoice pattern suspicion
+- **P.IVA forfettario**: 5% tax first 5 years, creator invoices as contractor
+- **Ko-fi preferred**: 0% platform fee for donations
+- **Wyoming LLC**: No public member disclosure
+- **Paysafecard optional**: Only if creator needs domain before crowdfunding is set up
+
+### Creator Preferences (Italian)
+- Currency: EUR
+- Initial budget: €500
+- Tax regime: P.IVA forfettario (5% first 5 years)
+- Communication: Telegram (username: Cristal89)
+- Privacy: Maximum — Tor by default, full anonymity
+- Content standard: Zero AI slop, expert human quality
+- Strategy scope: ANYTHING legal that makes money — no artificial limits

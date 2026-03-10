@@ -1,5 +1,13 @@
 # monAI - Claude Code Rules
 
+## Project Overview
+monAI is a fully autonomous money-making AI agent system. Read `ARCHITECTURE.md` for the complete system architecture, module index, bootstrap flow, payment structure, and session continuity notes. **Keep ARCHITECTURE.md up to date** — update it whenever you add new modules, change architecture, or make design decisions.
+
+## Key References
+- `ARCHITECTURE.md` — Full system architecture, module index, design decisions
+- `tasks/lessons.md` — Mistakes made and rules to prevent them
+- `tasks/todo.md` — Current task status and next steps
+
 ## Workflow Orchestration
 
 ### 1. Plan Mode Default
@@ -45,6 +53,7 @@
 - **Explain Changes**: High-level summary at each step
 - **Document Results**: Add review section to tasks/todo.md
 - **Capture Lessons**: Update tasks/lessons.md after corrections
+- **Update Docs**: After adding modules or changing architecture, update ARCHITECTURE.md
 
 ## Core Principles
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
