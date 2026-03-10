@@ -62,8 +62,10 @@ class MoneroProvider(CryptoProvider):
     def _get_client(self) -> httpx.AsyncClient:
         """Create httpx client with optional proxy for Tor routing."""
         kwargs: dict[str, Any] = {"timeout": 30.0}
-        if self.proxy_url:
-            kwargs["proxy"] = self.proxy_url
+        from monai.payments.base import _resolve_proxy_url
+        proxy = _resolve_proxy_url(self.proxy_url)
+        if proxy:
+            kwargs["proxy"] = proxy
         if self.rpc_user and self.rpc_password:
             kwargs["auth"] = (self.rpc_user, self.rpc_password)
         return httpx.AsyncClient(**kwargs)

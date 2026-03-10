@@ -60,8 +60,10 @@ class StripeProvider(PaymentProvider):
                 "Content-Type": "application/x-www-form-urlencoded",
             },
         }
-        if self.proxy_url:
-            kwargs["proxy"] = self.proxy_url
+        from monai.payments.base import _resolve_proxy_url
+        proxy = _resolve_proxy_url(self.proxy_url)
+        if proxy:
+            kwargs["proxy"] = proxy
         return httpx.AsyncClient(**kwargs)
 
     async def _api_call(self, method: str, endpoint: str,

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import random
 import secrets
 import struct
@@ -312,8 +313,13 @@ class NetworkAnonymizer:
     def startup_check(self) -> dict[str, Any]:
         """Run full anonymity check at startup. Must pass before any operations."""
         if self.privacy.proxy_type == "none":
-            logger.warning("PRIVACY: proxy_type=none — operating WITHOUT anonymization")
-            return {"anonymous": False, "reason": "proxy disabled"}
+            if not os.environ.get("MONAI_ALLOW_NO_PROXY"):
+                raise AnonymityError(
+                    "PRIVACY: proxy_type=none is dangerous — all traffic exposes your real IP. "
+                    "Set MONAI_ALLOW_NO_PROXY=1 environment variable to explicitly allow this."
+                )
+            logger.warning("PRIVACY: proxy_type=none — operating WITHOUT anonymization (explicitly allowed)")
+            return {"anonymous": False, "reason": "proxy disabled (explicit override)"}
 
         # Capture real IP first (direct connection, no proxy)
         self._real_ip = self.get_real_ip()

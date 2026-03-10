@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
+
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -226,44 +226,27 @@ class Coder:
         return result
 
     def _run_tests(self, test_path: Path, work_dir: Path) -> dict[str, Any]:
-        try:
-            from monai.utils.sandbox import _make_clean_env
-            clean_env = _make_clean_env()
-            clean_env["PYTHONPATH"] = str(work_dir)
-            result = subprocess.run(
-                ["python", "-m", "pytest", str(test_path), "-v", "--tb=short"],
-                capture_output=True, text=True, timeout=60,
-                cwd=str(work_dir),
-                env=clean_env,
-            )
-            return {
-                "passed": result.returncode == 0,
-                "output": result.stdout + result.stderr,
-                "returncode": result.returncode,
-            }
-        except subprocess.TimeoutExpired:
-            return {"passed": False, "output": "Tests timed out after 60s", "returncode": -1}
-        except Exception as e:
-            return {"passed": False, "output": str(e), "returncode": -1}
+        from monai.utils.sandbox import sandbox_run
+        result = sandbox_run(
+            ["python", "-m", "pytest", str(test_path), "-v", "--tb=short"],
+            cwd=work_dir,
+            timeout=60,
+            allowed_paths=[work_dir],
+        )
+        return {
+            "passed": result["returncode"] == 0,
+            "output": result["stdout"] + result["stderr"],
+            "returncode": result["returncode"],
+        }
 
     def _run_script(self, script_path: Path) -> dict[str, Any]:
-        try:
-            from monai.utils.sandbox import _make_clean_env
-            clean_env = _make_clean_env()
-            clean_env["PYTHONPATH"] = str(script_path.parent)
-            result = subprocess.run(
-                ["python", str(script_path)],
-                capture_output=True, text=True, timeout=60,
-                cwd=str(script_path.parent),
-                env=clean_env,
-            )
-            return {
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode,
-            }
-        except Exception as e:
-            return {"stdout": "", "stderr": str(e), "returncode": -1}
+        from monai.utils.sandbox import sandbox_run
+        return sandbox_run(
+            ["python", str(script_path)],
+            cwd=script_path.parent,
+            timeout=60,
+            allowed_paths=[script_path.parent],
+        )
 
     def _clean_code(self, code: str) -> str:
         """Remove markdown code fences if present."""

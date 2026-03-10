@@ -40,9 +40,11 @@ class GumroadProvider(PaymentProvider):
         self.proxy_url = proxy_url
 
     def _get_client(self) -> httpx.AsyncClient:
+        from monai.payments.base import _resolve_proxy_url
         kwargs: dict[str, Any] = {"timeout": 30.0}
-        if self.proxy_url:
-            kwargs["proxy"] = self.proxy_url
+        proxy = _resolve_proxy_url(self.proxy_url)
+        if proxy:
+            kwargs["proxy"] = proxy
         return httpx.AsyncClient(**kwargs)
 
     async def _api_call(self, method: str, endpoint: str,
