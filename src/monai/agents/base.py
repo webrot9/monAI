@@ -6,13 +6,17 @@ import json
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, TypeVar
+
+from pydantic import BaseModel
 
 from monai.agents.ethics import CORE_DIRECTIVES, get_directives_for_context, is_action_blocked
 from monai.agents.memory import SharedMemory
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.llm import LLM
+
+T = TypeVar("T", bound=BaseModel)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +115,51 @@ class BaseAgent(ABC):
         ]
         response = self.llm.chat_json(messages)
         self.log_action("think_json", prompt[:200], str(response)[:500])
+        return response
+
+    def think_structured(
+        self,
+        prompt: str,
+        response_model: type[T],
+        context: str = "",
+    ) -> T:
+        """Use LLM to reason and return a validated pydantic model instance."""
+        system = self._build_system_prompt()
+        if context:
+            prompt = f"Context:\n{context}\n\nQuestion:\n{prompt}"
+
+        enrichment = self._get_context_enrichment(prompt)
+        if enrichment:
+            prompt = f"{enrichment}\n\n{prompt}"
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+        result = self.llm.chat_structured(messages, response_model)
+        self.log_action("think_structured", prompt[:200], str(result.model_dump())[:500])
+        return result
+
+    def think_cheap(self, prompt: str, context: str = "") -> str:
+        """Use nano model for simple decisions — 25x cheaper than full model."""
+        system = self._build_system_prompt()
+        if context:
+            prompt = f"Context:\n{context}\n\nQuestion:\n{prompt}"
+        response = self.llm.nano(prompt, system=system)
+        self.log_action("think_cheap", prompt[:200], response[:500])
+        return response
+
+    def think_cheap_json(self, prompt: str, context: str = "") -> dict:
+        """Use nano model for simple JSON extraction — 25x cheaper."""
+        system = self._build_system_prompt() + "\nRespond with valid JSON only."
+        if context:
+            prompt = f"Context:\n{context}\n\nQuestion:\n{prompt}"
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+        response = self.llm.chat_json(messages, model=self.llm.get_model("nano"))
+        self.log_action("think_cheap_json", prompt[:200], str(response)[:500])
         return response
 
     def _build_system_prompt(self) -> str:

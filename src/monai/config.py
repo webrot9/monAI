@@ -7,6 +7,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from monai.utils.crypto import decrypt_config_fields, encrypt_config_fields
+
 CONFIG_DIR = Path.home() / ".monai"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DB_PATH = CONFIG_DIR / "monai.db"
@@ -20,6 +22,13 @@ class RiskConfig:
     min_roi_threshold: float = 1.0  # Minimum 1x ROI to keep strategy active
     max_monthly_spend_new_strategy: float = 10.0  # Start small, scale on results
     review_period_days: int = 30  # Re-evaluate strategies every 30 days
+
+
+@dataclass
+class BudgetConfig:
+    max_cycle_cost: float = 5.0  # Max EUR per orchestration cycle
+    max_cycle_calls: int = 200  # Max LLM calls per cycle
+    budget_fraction_per_cycle: float = 0.1  # Never spend >10% of remaining budget in one cycle
 
 
 @dataclass
@@ -163,6 +172,7 @@ class Config:
     bootstrap_wallet: BootstrapWalletConfig = field(default_factory=BootstrapWalletConfig)
     monero: MoneroConfig = field(default_factory=MoneroConfig)
     btcpay: BTCPayConfig = field(default_factory=BTCPayConfig)
+    budget: BudgetConfig = field(default_factory=BudgetConfig)
     initial_capital: float = 500.0  # €500 initial budget
     currency: str = "EUR"
     data_dir: Path = field(default_factory=lambda: CONFIG_DIR)
@@ -173,6 +183,7 @@ class Config:
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE) as f:
                 data = json.load(f)
+            data = decrypt_config_fields(data)
             if "llm" in data:
                 config.llm = LLMConfig(**data["llm"])
             if "risk" in data:
@@ -193,6 +204,8 @@ class Config:
                 config.monero = MoneroConfig(**data["monero"])
             if "btcpay" in data:
                 config.btcpay = BTCPayConfig(**data["btcpay"])
+            if "budget" in data:
+                config.budget = BudgetConfig(**data["budget"])
             if "initial_capital" in data:
                 config.initial_capital = data["initial_capital"]
             if "currency" in data:
@@ -287,8 +300,14 @@ class Config:
                 "server_url": self.btcpay.server_url,
                 "store_id": self.btcpay.store_id,
             },
+            "budget": {
+                "max_cycle_cost": self.budget.max_cycle_cost,
+                "max_cycle_calls": self.budget.max_cycle_calls,
+                "budget_fraction_per_cycle": self.budget.budget_fraction_per_cycle,
+            },
             "initial_capital": self.initial_capital,
             "currency": self.currency,
         }
+        data = encrypt_config_fields(data)
         with open(CONFIG_FILE, "w") as f:
             json.dump(data, f, indent=2)

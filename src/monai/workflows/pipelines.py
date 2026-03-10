@@ -2,6 +2,10 @@
 
 These are reusable pipeline definitions that wire agents together
 for end-to-end workflows.
+
+IMPORTANT: Every content pipeline MUST include a fact_check step.
+Flow: content generation → fact_check → humanize → distribute.
+No content leaves monAI without verification.
 """
 
 from __future__ import annotations
@@ -10,18 +14,20 @@ from monai.workflows.engine import Pipeline, Step, StepType
 
 
 def content_pipeline() -> Pipeline:
-    """Content creation → humanization → distribution pipeline.
+    """Content creation → fact-check → humanize → distribution pipeline.
 
-    Flow: Research keywords → Write article → Humanize → Distribute to
-    newsletter + social media + content site.
+    Flow: Research keywords → Write article → Fact-check → Humanize →
+    Distribute to newsletter + social media + content site.
     """
     return (
         Pipeline("content_pipeline", description="End-to-end content creation and distribution")
         .step("research_keywords", agent="content_sites", action="_research_keywords")
         .step("write_article", agent="content_sites", action="_create_article",
               depends_on=["research_keywords"])
-        .step("humanize", agent="humanizer", action="humanize",
+        .step("fact_check", agent="fact_checker", action="check",
               depends_on=["write_article"])
+        .step("humanize", agent="humanizer", action="humanize",
+              depends_on=["fact_check"])
         .parallel("distribute", steps=[
             Step("to_newsletter", agent="newsletter", action="_write_issue"),
             Step("to_social", agent="social_media", action="_create_content_batch"),
@@ -33,7 +39,7 @@ def product_launch_pipeline() -> Pipeline:
     """Full product launch: research → validate → build → launch.
 
     Flow: Market research → Validation → Competitor analysis →
-    Architecture → Build MVP → Create landing page → Launch.
+    Architecture → Build MVP → Create landing page → Fact-check → Launch.
     """
     return (
         Pipeline("product_launch", description="SaaS product discovery to launch")
@@ -55,11 +61,13 @@ def product_launch_pipeline() -> Pipeline:
               depends_on=["design"], max_retries=5)
         .step("landing_page", agent="saas", action="_create_landing_page",
               depends_on=["build_mvp"])
+        .step("fact_check_landing", agent="fact_checker", action="check",
+              depends_on=["landing_page"])
         .parallel("launch_marketing", steps=[
             Step("newsletter_announce", agent="newsletter", action="_write_issue"),
             Step("social_announce", agent="social_media", action="_create_content_batch"),
             Step("launch_plan", agent="saas", action="_plan_launch"),
-        ], depends_on=["landing_page"])
+        ], depends_on=["fact_check_landing"])
     )
 
 
@@ -86,10 +94,10 @@ def client_acquisition_pipeline() -> Pipeline:
 
 
 def affiliate_content_pipeline() -> Pipeline:
-    """Research products → Write reviews → Humanize → Distribute.
+    """Research products → Write reviews → Fact-check → Humanize → Distribute.
 
     Flow: Find affiliate programs → Research products → Write reviews/comparisons →
-    Humanize → Publish on content site + newsletter.
+    Fact-check → Humanize → Publish on content site + newsletter.
     """
     return (
         Pipeline("affiliate_content", description="Affiliate content creation pipeline")
@@ -100,8 +108,10 @@ def affiliate_content_pipeline() -> Pipeline:
             Step("write_review", agent="affiliate", action="_write_review"),
             Step("write_comparison", agent="affiliate", action="_write_comparison"),
         ], depends_on=["research_products"])
-        .step("humanize_content", agent="humanizer", action="humanize",
+        .step("fact_check_content", agent="fact_checker", action="check",
               depends_on=["create_content"])
+        .step("humanize_content", agent="humanizer", action="humanize",
+              depends_on=["fact_check_content"])
         .parallel("publish", steps=[
             Step("to_site", agent="content_sites", action="_create_article"),
             Step("to_newsletter", agent="newsletter", action="_write_issue"),
@@ -110,7 +120,7 @@ def affiliate_content_pipeline() -> Pipeline:
 
 
 def course_creation_pipeline() -> Pipeline:
-    """Research topic → Design curriculum → Write lessons → Humanize → Publish.
+    """Research topic → Design curriculum → Write lessons → Fact-check → Humanize → Publish.
 
     Full course creation from topic research to publication.
     """
@@ -121,8 +131,10 @@ def course_creation_pipeline() -> Pipeline:
               depends_on=["research_topics"])
         .step("write_lessons", agent="course_creation", action="_write_lessons",
               depends_on=["design_curriculum"], max_retries=5)
-        .step("humanize_lessons", agent="humanizer", action="humanize",
+        .step("fact_check_lessons", agent="fact_checker", action="check",
               depends_on=["write_lessons"])
+        .step("humanize_lessons", agent="humanizer", action="humanize",
+              depends_on=["fact_check_lessons"])
     )
 
 

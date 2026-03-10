@@ -42,9 +42,10 @@ from monai.business.email_marketing import EmailMarketing
 from monai.business.finance import Finance
 from monai.business.pipeline import Pipeline
 from monai.business.risk import RiskManager
+from monai.business.strategy_lifecycle import StrategyLifecycle
 from monai.config import Config
 from monai.db.database import Database
-from monai.utils.llm import LLM, get_cost_tracker
+from monai.utils.llm import LLM, BudgetExceededError, get_cost_tracker
 from monai.workflows.engine import WorkflowEngine
 from monai.workflows.pipelines import get_pipeline, list_pipelines, PIPELINE_REGISTRY
 from monai.workflows.router import TaskRouter
@@ -95,11 +96,16 @@ class Orchestrator(BaseAgent):
         self.corporate = CorporateManager(db)
         self.bootstrap_wallet = BootstrapWallet(config, db)
         self.llc_provisioner = LLCProvisioner(config, db, llm)
+        self.strategy_lifecycle = StrategyLifecycle(db)
         self._ensure_llc_setup()
+        # Load persisted cost tracker state
+        cost_state_path = str(config.data_dir / "cost_tracker.json")
+        get_cost_tracker().load_state(cost_state_path)
         self.workflow_engine = WorkflowEngine(config, db, llm)
         self.task_router = TaskRouter(config, db, llm)
         # Register utility agents with workflow engine
         self.workflow_engine.register_agent("humanizer", self.humanizer)
+        self.workflow_engine.register_agent("fact_checker", self.fact_checker)
         self.workflow_engine.register_agent("finance_expert", self.finance_expert)
         self.workflow_engine.register_agent("research_team", self.research_team)
         self.workflow_engine.register_agent("marketing_team", self.marketing_team)
@@ -199,6 +205,44 @@ class Orchestrator(BaseAgent):
                         f"€{budget['balance']:.2f} remaining, "
                         f"burn: €{budget['burn_rate_daily']:.4f}/day")
 
+        # Set per-cycle budget limits based on remaining balance
+        tracker = get_cost_tracker()
+        tracker.reset_cycle()
+        max_cycle_cost = min(
+            self.config.budget.max_cycle_cost,
+            budget["balance"] * self.config.budget.budget_fraction_per_cycle,
+        )
+        tracker.set_cycle_limits(
+            max_cost=max_cycle_cost,
+            max_calls=self.config.budget.max_cycle_calls,
+        )
+        self.log_action("cycle_budget",
+                        f"Cycle limits: €{max_cycle_cost:.2f} cost, "
+                        f"{self.config.budget.max_cycle_calls} calls")
+
+        try:
+            return self._execute_cycle(cycle_result, budget)
+        except BudgetExceededError as exc:
+            self.log_action("CYCLE_BUDGET_EXCEEDED", str(exc))
+            self.learn(
+                "alert", "Cycle budget exceeded",
+                str(exc),
+                rule="Reduce LLM calls per cycle — use cheaper models or fewer calls",
+                severity="warning",
+            )
+            cycle_result["status"] = "budget_exceeded"
+            cycle_result["budget_error"] = str(exc)
+            # Still run the commercialista report so we have financial data
+            cycle_result["timestamp"] = datetime.now().isoformat()
+            api_costs = get_cost_tracker().get_summary()
+            cycle_result["api_costs_session"] = api_costs
+            cycle_result["budget_after"] = self.commercialista.get_budget()
+            self.journal("execute", f"Cycle {self._cycle} ended early (budget exceeded)",
+                         {"error": str(exc)}, outcome="budget_exceeded")
+            return cycle_result
+
+    def _execute_cycle(self, cycle_result: dict, budget: dict) -> dict[str, Any]:
+        """Execute the main cycle phases. Separated to allow BudgetExceededError handling."""
         # Phase 0: Start cycle for all registered agents (process messages, load lessons)
         for agent in self._strategy_agents.values():
             agent.start_cycle(self._cycle)
@@ -267,12 +311,13 @@ class Orchestrator(BaseAgent):
         # Phase 6.5: Self-improvement — analyze and improve agents
         cycle_result["self_improvement"] = self._run_self_improvement()
 
-        # Phase 6.6: Finance + Research + Marketing + Social + Web teams
-        cycle_result["finance_analysis"] = self._run_finance_expert()
-        cycle_result["market_research"] = self._run_market_research()
-        cycle_result["marketing"] = self._run_marketing_team()
-        cycle_result["social_presence"] = self._run_social_presence()
-        cycle_result["web_presence"] = self._run_web_presence()
+        # Phase 6.6: Finance + Research + Marketing + Social + Web teams (parallelized)
+        team_results = self._run_teams_parallel()
+        cycle_result["finance_analysis"] = team_results.get("finance", {})
+        cycle_result["market_research"] = team_results.get("research", {})
+        cycle_result["marketing"] = team_results.get("marketing", {})
+        cycle_result["social_presence"] = team_results.get("social", {})
+        cycle_result["web_presence"] = team_results.get("web", {})
 
         # Phase 6.7: Engineering team — self-healing bug fixes
         cycle_result["engineering"] = self._run_engineering_team()
@@ -313,6 +358,10 @@ class Orchestrator(BaseAgent):
                      {"net_profit": cycle_result["net_profit"]},
                      outcome="success")
         self.log_action("cycle_complete", json.dumps(cycle_result, default=str)[:1000])
+
+        # Persist cost tracker state for session continuity
+        get_cost_tracker().save_state(str(self.config.data_dir / "cost_tracker.json"))
+
         return cycle_result
 
     def _ensure_llc_setup(self) -> None:
@@ -404,10 +453,23 @@ class Orchestrator(BaseAgent):
         return {"provisioned": needs, "result": result}
 
     def discover_opportunities(self) -> list[dict[str, Any]]:
-        """Discover new money-making opportunities."""
+        """Discover new money-making opportunities.
+
+        Enriched with research team findings — if research briefs exist,
+        they're included in the context so the LLM can prioritize validated niches.
+        """
         current = self.db.execute("SELECT name, category, status FROM strategies")
         current_list = [dict(r) for r in current]
         identity = self.identity.get_identity()
+
+        # Pull actionable research briefs to inform opportunity discovery
+        research_briefs = self.research_team.get_pursue_briefs()
+        research_context = ""
+        if research_briefs:
+            research_context = (
+                "\n\nRESEARCH TEAM FINDINGS (validated opportunities):\n"
+                + json.dumps(research_briefs[:5], default=str)[:1500]
+            )
 
         response = self.think_json(
             "Brainstorm 5 NEW money-making opportunities. Think creatively. "
@@ -415,12 +477,17 @@ class Orchestrator(BaseAgent):
             "affiliate marketing, SaaS, automation, consulting, reselling, "
             "domain flipping, social media, courses, newsletter monetization, "
             "API services, data products, and anything else. "
+            "PRIORITIZE opportunities backed by research team findings if available. "
             "For each: {\"opportunities\": [{\"name\": str, \"category\": str, "
             "\"description\": str, \"how_to_start\": str, "
             "\"estimated_monthly_revenue\": float, \"startup_cost\": float, "
             "\"risk_level\": str, \"time_to_first_revenue_days\": int, "
             "\"platforms_needed\": [str], \"can_automate\": bool}]}",
-            context=f"Current strategies: {json.dumps(current_list)}\nIdentity: {json.dumps(identity, default=str)}",
+            context=(
+                f"Current strategies: {json.dumps(current_list)}\n"
+                f"Identity: {json.dumps(identity, default=str)}"
+                f"{research_context}"
+            ),
         )
         opportunities = response.get("opportunities", [])
         self.log_action("discover", f"Found {len(opportunities)} opportunities")
@@ -441,10 +508,13 @@ class Orchestrator(BaseAgent):
             }
             if pause_check["should_pause"]:
                 self.log_action("pause_strategy", s["name"], json.dumps(pause_check["reasons"]))
-                self.db.execute(
-                    "UPDATE strategies SET status = 'paused', updated_at = ? WHERE id = ?",
-                    (datetime.now().isoformat(), s["id"]),
-                )
+                try:
+                    self.strategy_lifecycle.pause(
+                        s["id"],
+                        reason="; ".join(pause_check["reasons"][:3]),
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not pause strategy {s['name']}: {e}")
             reviews.append(review)
         return reviews
 
@@ -940,6 +1010,54 @@ class Orchestrator(BaseAgent):
         except Exception as e:
             logger.error(f"Web presence failed: {e}")
             return {"status": "error", "error": str(e)}
+
+    def _run_teams_parallel(self) -> dict[str, Any]:
+        """Run finance, research, marketing, social, and web teams in parallel.
+
+        Uses asyncio to run independent team operations concurrently,
+        reducing total cycle time compared to sequential execution.
+        """
+        import concurrent.futures
+
+        teams = {
+            "finance": self._run_finance_expert,
+            "research": self._run_market_research,
+            "marketing": self._run_marketing_team,
+            "social": self._run_social_presence,
+            "web": self._run_web_presence,
+        }
+
+        results = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(fn): name
+                for name, fn in teams.items()
+            }
+            for future in concurrent.futures.as_completed(futures):
+                name = futures[future]
+                try:
+                    results[name] = future.result(timeout=120)
+                except Exception as e:
+                    logger.error(f"Team {name} failed in parallel execution: {e}")
+                    results[name] = {"status": "error", "error": str(e)}
+
+        # Wire research findings into next discovery cycle
+        research = results.get("research", {})
+        if research.get("briefs"):
+            pursue_briefs = [
+                b for b in research["briefs"]
+                if b.get("recommended_action") == "pursue"
+            ]
+            if pursue_briefs:
+                self.share_knowledge(
+                    "opportunity", "research_recommendations",
+                    json.dumps(pursue_briefs, default=str)[:2000],
+                    tags=["research", "actionable"],
+                )
+                self.log_action("research_wired",
+                                f"{len(pursue_briefs)} actionable research briefs shared")
+
+        return results
 
     def request_research(self, topic: str) -> dict[str, Any]:
         """Request on-demand market research. Available to all agents."""

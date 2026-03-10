@@ -10,9 +10,22 @@
 - [x] Tax compliance automation (US LLC + Italian P.IVA obligations)
 - [x] Expense tracking through LLC
 - [x] Creator seed donation via crowdfunding
+- [x] Fix environment (socksio, optional monero/weasyprint/playwright deps)
+- [x] Wire FactChecker into all content pipelines
+- [x] Budget-aware cycle management (per-cycle cost/call limits)
+- [x] Per-agent platform integrations (Gumroad first)
+- [x] Config encryption (Fernet for secrets at rest)
+- [x] Structured LLM outputs (Pydantic response models)
+- [x] Integration tests for orchestrator cycle (17 tests)
+- [x] Cost tracking with minor costs + save/load persistence
+- [x] Parallelize research/market team execution
+- [x] Optimize costs (model tiers: FULL/MINI/NANO)
+- [x] Strategy lifecycle state machine
+- [x] Phone provisioner lazy HTTP client fix
 
 ## Next Up
-- [ ] Wire FactChecker into content pipelines (content_pipeline, affiliate_content_pipeline, etc.)
-- [ ] End-to-end integration tests for the full payment flow
 - [ ] Crowdfunding landing page generation (monAI's first website)
 - [ ] Ko-fi campaign setup automation
+- [ ] End-to-end integration tests for the full payment flow
+- [ ] More platform integrations (LemonSqueezy, Stripe, etc.)
+- [ ] Research wiring into opportunity discovery

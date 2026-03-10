@@ -118,7 +118,7 @@ PHASE 3: Self-Sustaining
 ## Content Quality Pipeline
 
 ```
-Content Generation → Humanizer → FactChecker → Publish/Revise/Block
+Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 ```
 
 - **Humanizer**: Ensures content passes AI detection tools
@@ -152,8 +152,9 @@ Content Generation → Humanizer → FactChecker → Publish/Revise/Block
 
 ### Config
 - Dataclass-based config in `config.py`
-- Stored at `~/.monai/config.json`
-- Sections: LLM, risk, comms, privacy, telegram, LLC, bootstrap_wallet, creator_wallet, monero, btcpay
+- Stored at `~/.monai/config.json` (secrets encrypted at rest via Fernet)
+- Sections: LLM, risk, comms, privacy, telegram, LLC, bootstrap_wallet, creator_wallet, monero, btcpay, budget
+- Structured LLM outputs via Pydantic models in `models.py`
 
 ## Module Index
 
@@ -195,6 +196,7 @@ Content Generation → Humanizer → FactChecker → Publish/Revise/Block
 | `pipeline.py` | Conversion funnel tracking |
 | `risk.py` | Diversification, spend limits, stop-loss |
 | `projections.py` | Financial forecasting |
+| `strategy_lifecycle.py` | Strategy state machine (pending→active→paused→stopped) |
 | `invoicing.py` | Creator contractor invoices |
 | `payments.py` | Payment coordination (legacy) |
 | `brand_payments.py` | Per-brand payment accounts |
@@ -217,19 +219,47 @@ Content Generation → Humanizer → FactChecker → Publish/Revise/Block
 13 strategy agents, each implementing an autonomous revenue channel:
 freelance_writing, digital_products, content_sites, micro_saas, saas, affiliate, newsletter, lead_gen, social_media, course_creation, domain_flipping, print_on_demand, telegram_bots
 
+### Integrations (`src/monai/integrations/`)
+| Module | Purpose |
+|--------|---------|
+| `base.py` | PlatformConnection + PlatformIntegration ABC (per-agent connections, rate limiting, retry) |
+| `gumroad.py` | Gumroad API (products CRUD, sales, subscribers, revenue) |
+
 ### Utils (`src/monai/utils/`)
 | Module | Purpose |
 |--------|---------|
-| `llm.py` | OpenAI integration with per-call cost tracking |
+| `llm.py` | OpenAI integration, model tiers (FULL/MINI/NANO), CostTracker with save/load, BudgetExceededError |
+| `crypto.py` | Fernet config encryption (auto-key, sensitive field detection, ENC: prefix) |
 | `browser.py` | Playwright browser automation |
 | `privacy.py` | Tor/proxy anonymization |
 | `resources.py` | CPU/memory/disk monitoring |
 | `sandbox.py` | Sandboxed execution |
 | `telegram.py` | Telegram Bot API client |
 
+## Cost Management
+
+### Model Tiers
+- **FULL** (`gpt-4o`): Complex reasoning, strategy decisions, evaluations
+- **MINI** (`gpt-4o-mini`): Content generation, research summaries, standard tasks
+- **NANO** (`gpt-4.1-nano`): Classification, tagging, simple extraction, bulk operations
+
+### Budget Enforcement
+- Per-cycle cost limit (`max_cycle_cost`, default €5)
+- Per-cycle call limit (`max_cycle_calls`, default 200)
+- Never spend >10% of remaining budget in one cycle
+- `BudgetExceededError` gracefully stops cycle when limits hit
+- CostTracker persists state to `~/.monai/cost_tracker.json`
+- Minor costs tracked: platform fees, subscriptions, tools, hosting
+
+### Platform Integrations
+- Each agent owns its platform connections (no shared clients)
+- `PlatformConnection`: lazy httpx.Client, rate limiting, automatic retry
+- Rate limits tracked in DB per platform
+- First integration: Gumroad (products, sales, subscribers)
+
 ## Test Suite
 
-- **911 tests** across 51 test files
+- **928 tests** across 52 test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
@@ -240,23 +270,26 @@ freelance_writing, digital_products, content_sites, micro_saas, saas, affiliate,
 Everything listed above is implemented, tested, and passing. The codebase is functional from config through to payment sweep.
 
 ### What's Next
-1. **Wire FactChecker into content pipelines** — content_pipeline, affiliate_content_pipeline, etc. should call `fact_checker.check()` before publishing
-2. **End-to-end integration tests** — full payment flow from Stripe webhook to creator wallet
-3. **Crowdfunding landing page** — monAI's first website for the AI crowdfunding campaign
-4. **Ko-fi campaign setup** — automated campaign creation and monitoring
+1. **Crowdfunding landing page** — monAI's first website for the AI crowdfunding campaign
+2. **Ko-fi campaign setup** — automated campaign creation and monitoring
+3. **End-to-end integration tests** — full payment flow from Stripe webhook to creator wallet
+4. **More platform integrations** — LemonSqueezy, Stripe connect, etc.
 
 ### Key Design Decisions Made
-- **OpenAI, not Claude**: All LLM calls use OpenAI SDK (gpt-4o / gpt-4o-mini)
+- **OpenAI, not Claude**: All LLM calls use OpenAI SDK (gpt-4o / gpt-4o-mini / gpt-4.1-nano)
 - **Creator donates via crowdfunding**: Simplest bootstrap — no Paysafecard needed
 - **Multi-LLC rotation**: Avoids single-client invoice pattern suspicion
 - **P.IVA forfettario**: 5% tax first 5 years, creator invoices as contractor
 - **Ko-fi preferred**: 0% platform fee for donations
 - **Wyoming LLC**: No public member disclosure
 - **Paysafecard optional**: Only if creator needs domain before crowdfunding is set up
+- **Config encryption**: Fernet with auto-generated key at `~/.monai/.config_key`
+- **Per-agent connections**: Each agent manages its own platform connections with rate limiting
+- **Strategy state machine**: Formal lifecycle (pending→active→paused→stopped) prevents invalid transitions
 
 ### Creator Preferences (Italian)
-- Currency: EUR
-- Initial budget: €500
+- Currency: USD (with EUR conversion when needed)
+- Initial budget: $500
 - Tax regime: P.IVA forfettario (5% first 5 years)
 - Communication: Telegram (username: Cristal89)
 - Privacy: Maximum — Tor by default, full anonymity

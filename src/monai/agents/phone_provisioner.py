@@ -72,10 +72,17 @@ class PhoneProvisioner(BaseAgent):
     def __init__(self, config: Config, db: Database, llm: LLM):
         super().__init__(config, db, llm)
         self._anonymizer = get_anonymizer(config)
-        self._http = self._anonymizer.create_http_client(timeout=30)
+        self.__http = None  # Lazy — only created when needed
 
         with db.connect() as conn:
             conn.executescript(PHONE_SCHEMA)
+
+    @property
+    def _http(self):
+        """Lazy http client — avoids import errors when socksio isn't installed."""
+        if self.__http is None:
+            self.__http = self._anonymizer.create_http_client(timeout=30)
+        return self.__http
 
     def plan(self) -> list[str]:
         return ["check_inventory", "fulfill_requests"]
