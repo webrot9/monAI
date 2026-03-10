@@ -288,12 +288,124 @@ def is_action_blocked(action: str) -> bool:
     return any(blocked in action_lower for blocked in BLOCKED_PATTERNS)
 
 
-def is_shell_command_allowed(command: str) -> bool:
-    """Check if a shell command starts with an allowed program.
+# ── Per-command argument restrictions ────────────────────────────────
+# Commands that can execute arbitrary code need argument-level checks.
+# The key insight: `python` is safe, `python -c 'os.system("rm -rf /")'` is not.
 
-    Only commands whose first token is in the whitelist are allowed.
-    This prevents arbitrary command execution even if the LLM crafts
-    a novel dangerous command not in BLOCKED_PATTERNS.
+# Arguments that enable arbitrary code execution in otherwise-safe commands
+_DANGEROUS_ARG_PATTERNS: dict[str, list[str]] = {
+    # python/python3: block -c (inline code) and -m with dangerous modules
+    "python": ["-c", "--command"],
+    "python3": ["-c", "--command"],
+    # pip: block install from URLs or git repos (setup.py runs arbitrary code)
+    "pip": ["install+http", "install+git", "install+ssh"],
+    "pip3": ["install+http", "install+git", "install+ssh"],
+    # curl/wget: block output to sensitive paths
+    "curl": ["-o", "--output", "-O", "--remote-name"],
+    "wget": ["-O", "--output-document"],
+    # find: block -exec, -execdir (runs arbitrary commands)
+    "find": ["-exec", "-execdir", "-ok", "-okdir"],
+    # sed/awk: block in-place editing outside workspace
+    "sed": ["-i"],
+    "awk": ["system(", "system ("],
+    # git: block hooks and arbitrary command execution
+    "git": ["--upload-pack", "--exec", "filter-branch"],
+    # docker: block privileged and host-mount
+    "docker": ["--privileged", "--pid=host", "--net=host"],
+}
+
+# Paths that must never appear as arguments (read or write)
+_SENSITIVE_PATHS = [
+    "/etc/passwd", "/etc/shadow", "/etc/sudoers", "/etc/hosts",
+    "/etc/cron", "/root/", "/var/spool/cron",
+    ".ssh/", "authorized_keys", "id_rsa", "id_ed25519",
+    ".gnupg/", ".aws/", ".config/gcloud",
+    "/proc/", "/sys/", "/dev/",
+    "/boot/", "/sbin/", "/usr/sbin/",
+]
+
+# Commands that need additional output-path validation
+_FILE_WRITE_COMMANDS = {"curl", "wget", "cp", "mv", "tar"}
+
+
+def _check_dangerous_args(base_cmd: str, parts: list[str], full_cmd: str) -> str | None:
+    """Check if a whitelisted command has dangerous arguments.
+
+    Returns None if safe, or a reason string if blocked.
+    """
+    patterns = _DANGEROUS_ARG_PATTERNS.get(base_cmd)
+    if patterns:
+        for pattern in patterns:
+            if "+" in pattern:
+                # Compound pattern: e.g. "install+http" means arg "install" followed
+                # by something starting with "http"
+                action_part, prefix = pattern.split("+", 1)
+                for i, arg in enumerate(parts[1:], 1):
+                    if arg == action_part and i + 1 < len(parts):
+                        next_arg = parts[i + 1].lower()
+                        if next_arg.startswith(prefix):
+                            return f"'{base_cmd} {action_part}' from URL/remote source blocked"
+            else:
+                for arg in parts[1:]:
+                    arg_l = arg.lower()
+                    pat_l = pattern.lower()
+                    # Exact match, prefix match, or substring match (for patterns like "system(")
+                    if arg_l == pat_l or arg_l.startswith(pat_l) or pat_l in arg_l:
+                        return f"dangerous argument '{pattern}' for '{base_cmd}'"
+
+    # Docker-specific: block volume mounts from sensitive host paths
+    if base_cmd == "docker":
+        for i, arg in enumerate(parts[1:], 1):
+            # -v /host/path:/container/path or --volume=/host/path:...
+            if (arg.startswith("-v") or arg.startswith("--volume")) and ":" in arg:
+                # Could be -v=/path:... or just -v with next arg
+                vol_spec = arg.split("=", 1)[-1] if "=" in arg else arg[2:] if len(arg) > 2 else ""
+                if not vol_spec and i + 1 < len(parts):
+                    vol_spec = parts[i + 1]
+                host_path = vol_spec.split(":")[0] if ":" in vol_spec else vol_spec
+                # Block mounting /, /etc, /root, /var, /usr, /home from host
+                if host_path in ("/", "/etc", "/root", "/var", "/usr", "/home", "/boot",
+                                 "/proc", "/sys", "/dev"):
+                    return f"docker volume mount from sensitive host path: {host_path}"
+            if arg == "-v" and i + 1 < len(parts):
+                vol_spec = parts[i + 1]
+                host_path = vol_spec.split(":")[0] if ":" in vol_spec else vol_spec
+                if host_path in ("/", "/etc", "/root", "/var", "/usr", "/home", "/boot",
+                                 "/proc", "/sys", "/dev"):
+                    return f"docker volume mount from sensitive host path: {host_path}"
+
+    # Check for sensitive paths in any argument
+    for arg in parts[1:]:
+        arg_lower = arg.lower()
+        for sensitive in _SENSITIVE_PATHS:
+            if sensitive in arg_lower:
+                return f"access to sensitive path '{sensitive}' blocked"
+
+    # For file-writing commands, validate the output path is in workspace
+    if base_cmd in _FILE_WRITE_COMMANDS:
+        from monai.utils.sandbox import is_path_allowed
+        for i, arg in enumerate(parts[1:], 1):
+            # Check -o/--output for curl, -O for wget, destination for cp/mv
+            if base_cmd in ("curl", "wget") and arg in ("-o", "-O", "--output", "--output-document"):
+                if i + 1 < len(parts):
+                    output_path = parts[i + 1]
+                    if not is_path_allowed(output_path):
+                        return f"'{base_cmd}' output path outside sandbox: {output_path}"
+            # For cp/mv/tar, the last argument is typically the destination
+            if base_cmd in ("cp", "mv") and i == len(parts) - 1:
+                if not is_path_allowed(arg):
+                    return f"'{base_cmd}' destination outside sandbox: {arg}"
+
+    return None
+
+
+def is_shell_command_allowed(command: str) -> bool:
+    """Check if a shell command is allowed to run.
+
+    Three layers of validation:
+    1. Base command must be in the whitelist
+    2. No pipe-to-interpreter or subshell patterns
+    3. Per-command argument restrictions (e.g. no python -c, no curl -o /etc/...)
     """
     import shlex
     try:
@@ -304,24 +416,35 @@ def is_shell_command_allowed(command: str) -> bool:
     if not parts:
         return False
 
-    # Get the base command name (strip path prefixes like /usr/bin/)
+    # Layer 1: base command whitelist
     base_cmd = parts[0].rsplit("/", 1)[-1]
 
-    # Check against whitelist
     if base_cmd not in ALLOWED_SHELL_COMMANDS:
         logger.warning(f"Shell command blocked (not in whitelist): {base_cmd}")
         return False
 
-    # Additional check: block pipe-to-shell patterns even for allowed commands
     full_cmd = command.lower()
-    if ("| sh" in full_cmd or "| bash" in full_cmd or
-            "| python" in full_cmd or "$(" in full_cmd or
-            "`" in full_cmd):
-        # Allow backticks/subshells only in safe contexts
-        # Block pipe-to-interpreter patterns
-        if "| sh" in full_cmd or "| bash" in full_cmd:
-            logger.warning(f"Shell command blocked (pipe-to-shell): {command[:100]}")
+
+    # Layer 2: block shell injection patterns in the full command string
+    # These bypass argument parsing by using shell metacharacters
+    shell_injection_patterns = [
+        "| sh", "| bash", "| python", "| perl", "| ruby",
+        "| /bin/", "| /usr/bin/",
+        "$(", "`",           # command substitution
+        "&&", "||", ";",     # command chaining (we use shell=False, but defense in depth)
+        "> /etc/", "> /root/", "> /var/",  # redirect to sensitive dirs
+        ">> /etc/", ">> /root/",
+    ]
+    for pattern in shell_injection_patterns:
+        if pattern in full_cmd:
+            logger.warning(f"Shell command blocked (injection pattern '{pattern}'): {command[:100]}")
             return False
+
+    # Layer 3: per-command argument restrictions
+    reason = _check_dangerous_args(base_cmd, parts, full_cmd)
+    if reason:
+        logger.warning(f"Shell command blocked ({reason}): {command[:100]}")
+        return False
 
     return True
 
