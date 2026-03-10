@@ -256,7 +256,12 @@ class NetworkAnonymizer:
             client.close()
 
     def get_real_ip(self) -> str | None:
-        """Get the real IP (bypassing proxy) — called once at startup for verification."""
+        """Get the real IP (bypassing proxy) — called once at startup for verification.
+
+        SECURITY: This makes ONE direct connection to check the real IP.
+        The IP is stored in memory for comparison only and is NEVER logged
+        in plaintext. Only a hash is logged for debugging.
+        """
         try:
             resp = httpx.get("https://api.ipify.org?format=json", timeout=10)
             if resp.status_code == 200:
@@ -312,7 +317,13 @@ class NetworkAnonymizer:
 
         # Capture real IP first (direct connection, no proxy)
         self._real_ip = self.get_real_ip()
-        logger.info(f"Real IP detected: {self._real_ip or 'unknown'}")
+        # NEVER log the real IP in plaintext — only a hash for debugging
+        if self._real_ip:
+            import hashlib
+            ip_hash = hashlib.sha256(self._real_ip.encode()).hexdigest()[:12]
+            logger.info(f"Real IP detected (hash: {ip_hash}...)")
+        else:
+            logger.info("Real IP: could not determine")
 
         # Now verify through proxy
         try:

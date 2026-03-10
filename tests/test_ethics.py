@@ -236,6 +236,14 @@ class TestArgumentValidation:
         assert is_shell_command_allowed("find . -name '*.py'") is True
         assert is_shell_command_allowed("find . -type f -name '*.log'") is True
 
+    def test_blocks_find_absolute_path_outside_sandbox(self):
+        assert is_shell_command_allowed("find / -name '*.py'") is False
+        assert is_shell_command_allowed("find /etc -name passwd") is False
+        assert is_shell_command_allowed("find /home -type f") is False
+
+    def test_blocks_find_delete(self):
+        assert is_shell_command_allowed("find . -name '*.tmp' -delete") is False
+
     # ── sed -i ─────────────────────────────────────────────────
     def test_blocks_sed_inplace(self):
         assert is_shell_command_allowed("sed -i 's/foo/bar/' file.txt") is False

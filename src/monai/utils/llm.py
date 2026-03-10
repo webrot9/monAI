@@ -195,10 +195,28 @@ class LLM:
 
     def __init__(self, config: Config | None = None, caller: str = "unknown"):
         self.config = config or Config.load()
-        self.client = OpenAI(api_key=self.config.llm.api_key)
+        # Route OpenAI API calls through proxy to protect creator's IP
+        client_kwargs: dict[str, Any] = {"api_key": self.config.llm.api_key}
+        if self.config.privacy.proxy_type != "none":
+            proxy_url = self._get_proxy_url()
+            if proxy_url:
+                import httpx as _httpx
+                client_kwargs["http_client"] = _httpx.Client(proxy=proxy_url, timeout=120)
+        self.client = OpenAI(**client_kwargs)
         self.caller = caller  # Which agent/module is making the call
         self.tracker = _global_tracker
         self._db = None  # Lazy — set when DB is available
+
+    def _get_proxy_url(self) -> str | None:
+        """Get proxy URL from privacy config."""
+        cfg = self.config.privacy
+        if cfg.proxy_type == "tor":
+            return f"socks5://127.0.0.1:{cfg.tor_socks_port}"
+        elif cfg.proxy_type == "socks5":
+            return cfg.socks5_proxy or None
+        elif cfg.proxy_type == "http":
+            return cfg.http_proxy or None
+        return None
 
     def get_model(self, tier: str = "mini") -> str:
         """Get the appropriate model for a cost tier.

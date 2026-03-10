@@ -303,8 +303,8 @@ _DANGEROUS_ARG_PATTERNS: dict[str, list[str]] = {
     # curl/wget: block output to sensitive paths
     "curl": ["-o", "--output", "-O", "--remote-name"],
     "wget": ["-O", "--output-document"],
-    # find: block -exec, -execdir (runs arbitrary commands)
-    "find": ["-exec", "-execdir", "-ok", "-okdir"],
+    # find: block -exec, -execdir (runs arbitrary commands), -delete
+    "find": ["-exec", "-execdir", "-ok", "-okdir", "-delete"],
     # sed/awk: block in-place editing outside workspace
     "sed": ["-i"],
     "awk": ["system(", "system ("],
@@ -352,6 +352,16 @@ def _check_dangerous_args(base_cmd: str, parts: list[str], full_cmd: str) -> str
                     # Exact match, prefix match, or substring match (for patterns like "system(")
                     if arg_l == pat_l or arg_l.startswith(pat_l) or pat_l in arg_l:
                         return f"dangerous argument '{pattern}' for '{base_cmd}'"
+
+    # find-specific: starting path must be relative or in workspace
+    if base_cmd == "find" and len(parts) > 1:
+        start_path = parts[1]
+        # Allow relative paths (., .., ./subdir) or no path (defaults to .)
+        # Block absolute paths outside workspace (find / , find /etc, etc.)
+        if start_path.startswith("/"):
+            from monai.utils.sandbox import is_path_allowed
+            if not is_path_allowed(start_path):
+                return f"'find' starting path outside sandbox: {start_path}"
 
     # Docker-specific: block volume mounts from sensitive host paths
     if base_cmd == "docker":
