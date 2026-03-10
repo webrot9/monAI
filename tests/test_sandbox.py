@@ -12,6 +12,7 @@ from monai.utils.sandbox import (
     DATA_DIR,
     TEMP_PREFIX,
     _SAFE_ENV_KEYS,
+    _CAN_BWRAP,
     _make_clean_env,
     is_path_allowed,
     safe_read,
@@ -222,3 +223,40 @@ class TestSandboxRun:
         """Non-existent commands should fail gracefully."""
         result = sandbox_run(["nonexistent_command_xyz"])
         assert result["returncode"] != 0
+
+    @pytest.mark.skipif(not _CAN_BWRAP, reason="bubblewrap not available")
+    def test_bwrap_blocks_etc_passwd(self):
+        """With bwrap, /etc/passwd should NOT be readable."""
+        result = sandbox_run([
+            "python3", "-c",
+            "import os; print('exists' if os.path.exists('/etc/passwd') else 'hidden')"
+        ])
+        assert result["returncode"] == 0
+        assert "hidden" in result["stdout"]
+
+    @pytest.mark.skipif(not _CAN_BWRAP, reason="bubblewrap not available")
+    def test_bwrap_blocks_home_directory(self):
+        """With bwrap, real home directory should NOT be accessible."""
+        real_home = str(Path.home())
+        result = sandbox_run([
+            "python3", "-c",
+            f"import os; print('exists' if os.path.isdir('{real_home}') else 'hidden')"
+        ])
+        assert result["returncode"] == 0
+        assert "hidden" in result["stdout"]
+
+    @pytest.mark.skipif(not _CAN_BWRAP, reason="bubblewrap not available")
+    def test_bwrap_workspace_writable(self, tmp_path):
+        """Workspace directory should still be writable under bwrap."""
+        result = sandbox_run(
+            ["python3", "-c", "open('test_write.txt', 'w').write('ok'); print('wrote')"],
+            cwd=tmp_path,
+        )
+        assert result["returncode"] == 0
+        assert "wrote" in result["stdout"]
+
+    def test_get_sandbox_info_has_backend(self):
+        """get_sandbox_info should include the isolation backend."""
+        info = get_sandbox_info()
+        assert "isolation_backend" in info
+        assert info["isolation_backend"] in ("bubblewrap", "unshare", "none")

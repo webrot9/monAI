@@ -7,10 +7,11 @@ This is an absolute rule. Agents can only operate within:
 
 NOTHING else on the creator's computer. Ever.
 
-For subprocess execution, we use Linux namespace isolation (unshare)
-when available. This provides OS-level enforcement that cannot be
-bypassed by the child process, unlike argument validation which is
-a best-effort application-level check.
+For subprocess execution, we use bubblewrap (bwrap) when available for
+real mount-namespace isolation — the child process literally cannot see
+files outside the bind-mounted paths. Falls back to unshare --user when
+bwrap is unavailable (weaker: no mount isolation), then to plain
+subprocess with sanitized env as last resort.
 """
 
 from __future__ import annotations
@@ -49,11 +50,26 @@ _SAFE_ENV_KEYS = {
     "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
 }
 
-# Detect whether we can use Linux namespaces for real isolation
+# ── Detect available isolation backends ─────────────────────────────
+
+_BWRAP_PATH = shutil.which("bwrap")
+_CAN_BWRAP = False
+
+if _BWRAP_PATH:
+    try:
+        r = subprocess.run(
+            [_BWRAP_PATH, "--ro-bind", "/", "/", "--dev", "/dev",
+             "--proc", "/proc", "--", "true"],
+            capture_output=True, timeout=5,
+        )
+        _CAN_BWRAP = r.returncode == 0
+    except Exception:
+        pass
+
 _UNSHARE_PATH = shutil.which("unshare")
 _CAN_NAMESPACE = False
 
-if _UNSHARE_PATH:
+if not _CAN_BWRAP and _UNSHARE_PATH:
     try:
         r = subprocess.run(
             [_UNSHARE_PATH, "--user", "--map-root-user", "--", "true"],
@@ -63,13 +79,39 @@ if _UNSHARE_PATH:
     except Exception:
         pass
 
-if _CAN_NAMESPACE:
-    logger.info("OS-level sandbox available (Linux user namespaces via unshare)")
+if _CAN_BWRAP:
+    logger.info("OS-level sandbox available (bubblewrap with mount namespace)")
+elif _CAN_NAMESPACE:
+    logger.warning(
+        "bubblewrap not available, falling back to unshare --user "
+        "(no mount isolation — world-readable files still visible)"
+    )
 else:
     logger.warning(
         "OS-level sandbox NOT available. Falling back to application-level "
-        "argument validation only. Install 'util-linux' for unshare support."
+        "argument validation only. Install 'bubblewrap' for full isolation."
     )
+
+# Read-only system paths to bind-mount inside bwrap.
+# Only what's needed to run Python/Node scripts.
+_BWRAP_RO_BINDS = [
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/bin",
+    "/sbin",
+    "/etc/alternatives",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/ssl",           # TLS certs for HTTPS
+    "/etc/ca-certificates",
+    "/etc/resolv.conf",   # DNS resolution
+    "/etc/nsswitch.conf",
+    "/etc/hosts",
+    "/etc/localtime",
+    "/etc/python3",
+]
 
 
 def _make_clean_env() -> dict[str, str]:
@@ -94,6 +136,71 @@ def _make_clean_env() -> dict[str, str]:
     return clean
 
 
+def _build_bwrap_cmd(
+    cmd: list[str],
+    cwd: str,
+    clean_env: dict[str, str],
+    allowed_paths: list[Path] | None = None,
+) -> list[str]:
+    """Build a bwrap command with minimal filesystem visibility.
+
+    The child process can ONLY see:
+    - System libs/binaries (read-only)
+    - /dev, /proc (minimal)
+    - Its workspace directory (read-write)
+    - /tmp (read-write, for temp files)
+    - Any additional allowed_paths (read-write)
+    """
+    bwrap = [_BWRAP_PATH]
+
+    # Bind system paths read-only (only those that exist)
+    for path in _BWRAP_RO_BINDS:
+        if os.path.exists(path):
+            bwrap += ["--ro-bind", path, path]
+
+    # /dev and /proc
+    bwrap += ["--dev", "/dev"]
+    bwrap += ["--proc", "/proc"]
+
+    # /tmp as tmpfs first (fresh empty /tmp)
+    bwrap += ["--tmpfs", "/tmp"]
+
+    # Workspace directory (read-write) — AFTER tmpfs /tmp so it
+    # overlays correctly if cwd is under /tmp
+    bwrap += ["--bind", cwd, cwd]
+
+    # Virtualenv (read-only) if active
+    venv = clean_env.get("VIRTUAL_ENV")
+    if venv and os.path.isdir(venv):
+        bwrap += ["--ro-bind", venv, venv]
+
+    # Additional allowed paths
+    if allowed_paths:
+        for p in allowed_paths:
+            p_str = str(p.resolve())
+            if os.path.exists(p_str):
+                bwrap += ["--bind", p_str, p_str]
+
+    # Isolation flags
+    bwrap += [
+        "--unshare-all",      # All namespaces (user, mount, pid, net, etc.)
+        "--share-net",        # Re-share network (scripts may need HTTP)
+        "--die-with-parent",  # Kill child if parent dies
+        "--chdir", cwd,
+    ]
+
+    # Set environment variables
+    # First clear everything, then set only clean vars
+    bwrap += ["--clearenv"]
+    for key, val in clean_env.items():
+        bwrap += ["--setenv", key, val]
+
+    bwrap += ["--"]
+    bwrap += cmd
+
+    return bwrap
+
+
 def sandbox_run(
     cmd: list[str],
     *,
@@ -103,15 +210,23 @@ def sandbox_run(
 ) -> dict[str, Any]:
     """Execute a command in a sandboxed subprocess.
 
-    Security layers (applied in order):
-    1. Environment sanitization (no secrets leak to child process)
-    2. Working directory forced to workspace
-    3. OS-level namespace isolation via unshare (if available):
-       - User namespace: process runs as mapped root, cannot access
-         files owned by other users
-       - The process inherits a read-only view of the filesystem
-         (no mount namespace manipulation needed because we use
-         cwd restriction + clean env)
+    Security layers (applied in order of preference):
+
+    1. **bubblewrap** (best): Full mount-namespace isolation.
+       Child process only sees bind-mounted paths. Cannot read
+       /etc/passwd, ~/.ssh, or anything outside the workspace.
+
+    2. **unshare --user** (fallback): User namespace only.
+       Prevents privilege escalation but does NOT hide the filesystem.
+       World-readable files like /etc/passwd are still visible.
+
+    3. **Plain subprocess** (last resort): Only env sanitization.
+       No OS-level isolation at all.
+
+    All backends apply:
+    - Environment sanitization (no secrets leak to child process)
+    - Working directory forced to workspace
+    - Timeout enforcement
 
     Args:
         cmd: Command as list of strings (NO shell=True ever)
@@ -136,11 +251,16 @@ def sandbox_run(
     clean_env["TMPDIR"] = "/tmp"
 
     try:
-        if _CAN_NAMESPACE:
-            # Wrap command with unshare for user namespace isolation.
-            # The child process gets its own user namespace with a fake
-            # root mapping. It can't escalate privileges or access files
-            # that require the real user's permissions outside the workspace.
+        if _CAN_BWRAP:
+            wrapped = _build_bwrap_cmd(cmd, cwd, clean_env, allowed_paths)
+            result = subprocess.run(
+                wrapped,
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        elif _CAN_NAMESPACE:
             wrapped = [
                 _UNSHARE_PATH,
                 "--user",
@@ -258,12 +378,14 @@ def safe_delete(path: str | Path) -> bool:
 
 def get_sandbox_info() -> dict:
     """Get info about the sandbox for display/logging."""
+    backend = "bubblewrap" if _CAN_BWRAP else ("unshare" if _CAN_NAMESPACE else "none")
     return {
         "project_root": str(PROJECT_ROOT),
         "data_dir": str(DATA_DIR),
         "temp_prefix": TEMP_PREFIX,
         "project_size_mb": _dir_size_mb(PROJECT_ROOT),
         "data_size_mb": _dir_size_mb(DATA_DIR),
+        "isolation_backend": backend,
     }
 
 
