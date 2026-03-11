@@ -26,6 +26,15 @@ from monai.payments.types import WebhookEvent
 
 logger = logging.getLogger(__name__)
 
+# Optional audit trail — set by caller (e.g. orchestrator)
+_audit_trail = None
+
+
+def set_webhook_audit(audit) -> None:
+    """Set the audit trail instance for webhook event logging."""
+    global _audit_trail
+    _audit_trail = audit
+
 # Schema for webhook event log
 WEBHOOK_LOG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS webhook_events (
@@ -222,11 +231,22 @@ class WebhookServer:
             event = await provider.handle_webhook(body, original_headers)
         except Exception as e:
             logger.error(f"Webhook processing error ({route}): {e}")
+            if _audit_trail:
+                _audit_trail.log(
+                    "webhook_server", "api_call", "webhook_error",
+                    details={"provider": route, "error": str(e)},
+                    success=False, risk_level="high",
+                )
             await self._send_response(writer, 500, str(e))
             return
 
         if event is None:
             logger.warning(f"Webhook from {route} could not be parsed/verified")
+            if _audit_trail:
+                _audit_trail.log(
+                    "webhook_server", "api_call", "webhook_invalid",
+                    details={"provider": route}, success=False,
+                )
             await self._send_response(writer, 400, "Invalid webhook")
             return
 
@@ -236,6 +256,20 @@ class WebhookServer:
                 await handler(event)
             except Exception as e:
                 logger.error(f"Event handler error: {e}")
+
+        # Audit successful webhook
+        if _audit_trail:
+            _audit_trail.log(
+                "webhook_server", "payment", "webhook_received",
+                details={
+                    "provider": event.provider,
+                    "event_type": event.event_type.value,
+                    "payment_ref": event.payment_ref,
+                    "amount": event.amount,
+                    "currency": event.currency,
+                },
+                brand=event.metadata.get("brand", ""),
+            )
 
         logger.info(
             f"Webhook processed: {event.provider}/{event.event_type.value} "

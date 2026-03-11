@@ -64,8 +64,13 @@
 - [x] Fixed self.lifecycle → self.strategy_lifecycle bug in phase 6.97
 - [x] Total: 1308 tests, all passing
 
+- [x] Webhook audit events (success/error/invalid webhooks logged with provider, amount, brand)
+- [x] Configurable backup scheduling (BackupConfig: db_interval_cycles, config_interval_cycles, max_backups, enabled)
+- [x] Dashboard API: /api/audit, /api/audit/summary, /api/brands, /api/backups endpoints
+- [x] Total: 1334 tests, all passing
+
 ## Next Up
 - [ ] First real deployment test (end-to-end with a real Ko-fi page)
-- [ ] Client portal / dashboard (web UI for strategy performance and financial reports)
-- [ ] Webhook-triggered audit events (audit log from webhook handlers)
-- [ ] Backup scheduling configurability (intervals from config rather than hardcoded)
+- [ ] Dashboard HTML enhancements (audit trail panel, brand P&L chart, backup status widget)
+- [ ] Alerting rules engine (configurable alert thresholds for revenue, budget, errors)
+- [ ] Webhook replay (re-process failed webhooks from the event log)

@@ -31,8 +31,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
+from monai.business.audit import AuditTrail
+from monai.business.backup import BackupManager
 from monai.business.commercialista import Commercialista
-from monai.business.finance import Finance
+from monai.business.finance import Finance, GeneralLedger
 from monai.business.risk import RiskManager
 from monai.config import Config
 from monai.db.database import Database
@@ -60,6 +62,12 @@ class DashboardServer:
         self.commercialista = Commercialista(config, db)
         self.finance = Finance(db)
         self.risk = RiskManager(config, db)
+        self.ledger = GeneralLedger(db)
+        self.audit = AuditTrail(db)
+        self.backup_manager = BackupManager(
+            db, config.data_dir / "backups",
+            max_backups=config.backup.max_backups,
+        )
 
     async def start(self):
         """Start the dashboard server."""
@@ -139,6 +147,18 @@ class DashboardServer:
                 await self._serve_json(writer, self._get_accounts())
             elif route == "/api/reinvestment":
                 await self._serve_json(writer, self._get_reinvestment())
+            elif route == "/api/audit":
+                params = parse_qs(parsed.query)
+                await self._serve_json(writer, self._get_audit(params))
+            elif route == "/api/audit/summary":
+                params = parse_qs(parsed.query)
+                days = int(params.get("days", ["7"])[0])
+                await self._serve_json(writer, self._get_audit_summary(days))
+            elif route == "/api/brands":
+                params = parse_qs(parsed.query)
+                await self._serve_json(writer, self._get_brand_pnl(params))
+            elif route == "/api/backups":
+                await self._serve_json(writer, self._get_backups())
             elif route == "/events":
                 await self._serve_sse(writer)
             else:
@@ -242,6 +262,47 @@ class DashboardServer:
 
     def _get_reinvestment(self) -> dict[str, Any]:
         return self.commercialista.compute_reinvestment()
+
+    def _get_audit(self, params: dict[str, list[str]]) -> list[dict]:
+        """Get audit trail entries with optional filters."""
+        limit = int(params.get("limit", ["50"])[0])
+        kwargs: dict[str, Any] = {"limit": limit}
+        if "agent" in params:
+            kwargs["agent_name"] = params["agent"][0]
+        if "type" in params:
+            kwargs["action_type"] = params["type"][0]
+        if "brand" in params:
+            kwargs["brand"] = params["brand"][0]
+        if "risk" in params:
+            kwargs["risk_level"] = params["risk"][0]
+        return self.audit.get_recent(**kwargs)
+
+    def _get_audit_summary(self, days: int = 7) -> dict[str, Any]:
+        """Get audit summary with agent stats and high-risk events."""
+        return {
+            "agent_summary": self.audit.get_agent_summary(days),
+            "high_risk": self.audit.get_high_risk_entries(days),
+            "failures": self.audit.get_failures(days),
+            "total_actions": self.audit.count_actions(days=days),
+        }
+
+    def _get_brand_pnl(self, params: dict[str, list[str]]) -> dict[str, Any]:
+        """Get multi-brand P&L segmentation."""
+        start = params.get("start", [None])[0]
+        end = params.get("end", [None])[0]
+        brand = params.get("brand", [None])[0]
+        if brand:
+            return self.ledger.get_income_statement_by_brand(brand, start, end)
+        return self.ledger.get_all_brands_pnl(start, end)
+
+    def _get_backups(self) -> dict[str, Any]:
+        """Get backup status and listing."""
+        return {
+            "database": self.backup_manager.list_backups("database"),
+            "config": self.backup_manager.list_backups("config"),
+            "latest_db": self.backup_manager.get_latest_backup("database"),
+            "latest_config": self.backup_manager.get_latest_backup("config"),
+        }
 
     # ── HTTP Helpers ─────────────────────────────────────────────
 

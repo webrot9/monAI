@@ -203,6 +203,15 @@ class SandboxConfig:
 
 
 @dataclass
+class BackupConfig:
+    """Automated backup scheduling and retention."""
+    db_interval_cycles: int = 1       # Backup DB every N cycles (1 = every cycle)
+    config_interval_cycles: int = 7   # Backup config every N cycles
+    max_backups: int = 10             # Max backup files to retain per type
+    enabled: bool = True              # Master switch for backups
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -218,6 +227,7 @@ class Config:
     captcha: CaptchaConfig = field(default_factory=CaptchaConfig)
     reinvestment: ReinvestmentConfig = field(default_factory=ReinvestmentConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    backup: BackupConfig = field(default_factory=BackupConfig)
     initial_capital: float = 500.0  # €500 initial budget
     currency: str = "EUR"
     data_dir: Path = field(default_factory=lambda: CONFIG_DIR)
@@ -255,6 +265,8 @@ class Config:
                 config.captcha = CaptchaConfig(**data["captcha"])
             if "reinvestment" in data:
                 config.reinvestment = ReinvestmentConfig(**data["reinvestment"])
+            if "backup" in data:
+                config.backup = BackupConfig(**data["backup"])
             if "initial_capital" in data:
                 config.initial_capital = data["initial_capital"]
             if "currency" in data:
@@ -371,6 +383,12 @@ class Config:
                 "max_strategy_boost": self.reinvestment.max_strategy_boost,
                 "scale_winners": self.reinvestment.scale_winners,
                 "cut_losers": self.reinvestment.cut_losers,
+            },
+            "backup": {
+                "db_interval_cycles": self.backup.db_interval_cycles,
+                "config_interval_cycles": self.backup.config_interval_cycles,
+                "max_backups": self.backup.max_backups,
+                "enabled": self.backup.enabled,
             },
             "initial_capital": self.initial_capital,
             "currency": self.currency,

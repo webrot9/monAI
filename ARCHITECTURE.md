@@ -231,7 +231,12 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `monero_provider.py` | Monero privacy-first crypto |
 | `kofi_provider.py` | Ko-fi webhook handler (donation/subscription verification) |
 | `sweep_engine.py` | Automated profit sweeping |
-| `webhook_server.py` | Webhook handler for all providers |
+| `webhook_server.py` | Webhook handler for all providers (with audit trail integration) |
+
+### Dashboard (`src/monai/dashboard/`)
+| Module | Purpose |
+|--------|---------|
+| `server.py` | Real-time web UI (SSE, financial overview, strategies, audit trail, brand P&L, backup status) |
 
 ### Strategies (`src/monai/strategies/`)
 13 strategy agents, each implementing a FULLY FUNCTIONAL autonomous revenue channel.

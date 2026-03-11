@@ -119,7 +119,8 @@ class Orchestrator(BaseAgent):
         self.strategy_lifecycle = StrategyLifecycle(db)
         self.audit = AuditTrail(db)
         self.backup_manager = BackupManager(
-            db, config.data_dir / "backups", max_backups=10,
+            db, config.data_dir / "backups",
+            max_backups=config.backup.max_backups,
         )
         self._ensure_llc_setup()
         # Load persisted cost tracker state
@@ -536,25 +537,26 @@ class Orchestrator(BaseAgent):
                 logger.debug(f"Telegram alert failed: {e}")
 
     def _run_scheduled_backups(self) -> dict[str, Any]:
-        """Run automated backups on schedule.
+        """Run automated backups on schedule (intervals from config.backup)."""
+        bcfg = self.config.backup
+        if not bcfg.enabled:
+            return {"status": "disabled"}
 
-        - Database backup: every cycle (lightweight via SQLite backup API)
-        - Config backup: every 7 cycles
-        """
         results: dict[str, Any] = {}
         try:
-            # Always back up the database
-            db_result = self.backup_manager.backup_database()
-            results["database"] = {
-                "path": db_result["path"],
-                "size_bytes": db_result["size_bytes"],
-                "verified": db_result["verified"],
-            }
-            self.audit.log("orchestrator", "system", "backup_database",
-                           details=results["database"])
+            # Database backup on configured interval
+            if self._cycle % bcfg.db_interval_cycles == 0:
+                db_result = self.backup_manager.backup_database()
+                results["database"] = {
+                    "path": db_result["path"],
+                    "size_bytes": db_result["size_bytes"],
+                    "verified": db_result["verified"],
+                }
+                self.audit.log("orchestrator", "system", "backup_database",
+                               details=results["database"])
 
-            # Config backup weekly (every 7 cycles)
-            if self._cycle % 7 == 0:
+            # Config backup on configured interval
+            if self._cycle % bcfg.config_interval_cycles == 0:
                 config_path = self.config.data_dir / "config.json"
                 if config_path.exists():
                     cfg_result = self.backup_manager.backup_config(config_path)
