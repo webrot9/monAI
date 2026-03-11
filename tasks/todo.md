@@ -34,9 +34,13 @@
 - [x] E2E payment flow tests (13 tests: webhook→GL→sweep→GL→balanced books)
 - [x] Research already wired into opportunity discovery (verified)
 - [x] Total: 1135 tests, all passing
+- [x] Wire GeneralLedger into bootstrap wallet (contributions→revenue, seed→equity, spend→expense)
+- [x] Automated financial reporting (FinancialReporter: monthly P&L, daily snapshots, weekly dashboards via Telegram)
+- [x] Strategy performance dashboards (per-strategy ROI, 7d/30d trends, auto-recommendations)
+- [x] Total: 1151 tests, all passing
 
 ## Next Up
 - [ ] First real deployment test (end-to-end with a real Ko-fi page)
-- [ ] Wire GeneralLedger into bootstrap wallet (track seed capital in GL)
-- [ ] Automated financial reporting (monthly P&L + balance sheet via Telegram)
-- [ ] Strategy agent performance dashboards
+- [ ] Auto-pause underperforming strategies based on dashboard recommendations
+- [ ] Webhook signature verification (Stripe, LemonSqueezy, Ko-fi)
+- [ ] Multi-currency support in GeneralLedger (EUR/USD/XMR conversion rates)

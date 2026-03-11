@@ -203,6 +203,7 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `corporate.py` | LLC management, expenses, tax obligations |
 | `bootstrap.py` | Seed capital (crowdfunding, Paysafecard, creator seed) |
 | `kofi.py` | Ko-fi campaign automation (setup, monitoring, donation sync) |
+| `reporting.py` | Automated financial reporting (P&L, balance sheet, strategy dashboards via Telegram) |
 | `crm.py` | Lead management, contacts, pipeline |
 | `pipeline.py` | Conversion funnel tracking |
 | `risk.py` | Diversification, spend limits, stop-loss |
@@ -298,7 +299,7 @@ All strategies use real browser automation and APIs — zero simulation:
 
 ## Test Suite
 
-- **1135 tests** across 57 test files
+- **1151 tests** across 58 test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
@@ -368,6 +369,11 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 - **Ko-fi campaign automation**: `KofiCampaignManager` agent — auto-registers on Ko-fi, creates campaign page, syncs donations into bootstrap wallet
 - **Ko-fi wired into orchestrator bootstrap**: Pre-bootstrap phase auto-triggers Ko-fi setup; donation sync every 3 cycles
 - **E2E payment flow tests**: 13 tests covering webhook→GL→sweep→GL→balance-sheet lifecycle
+- **GL wired into bootstrap wallet**: Contributions → crowdfunding revenue GL; creator seed → equity GL; spending → expense GL
+- **FinancialReporter module**: Monthly P&L + balance sheet, daily snapshots, strategy dashboards — all via Telegram
+- **Strategy performance analysis**: Per-strategy ROI, 7d/30d trends, auto-recommendations (continue/review/pause/scale)
+- **Phase 6.97**: Strategy performance eval in orchestrator cycle — logs underperformers and growth candidates
+- **Phase 7.5**: Automated report dispatch — monthly, weekly dashboard, daily snapshot every 10 cycles
 
 ### Earlier Changes
 - **Webhook idempotency**: `processed_webhooks` table prevents double-processing

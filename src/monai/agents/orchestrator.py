@@ -43,6 +43,7 @@ from monai.business.email_marketing import EmailMarketing
 from monai.business.finance import Finance, GeneralLedger
 from monai.business.kofi import KofiCampaignManager
 from monai.business.pipeline import Pipeline
+from monai.business.reporting import FinancialReporter
 from monai.business.risk import RiskManager
 from monai.business.strategy_lifecycle import StrategyLifecycle
 from monai.config import Config
@@ -97,9 +98,12 @@ class Orchestrator(BaseAgent):
         self.brand_payments = BrandPayments(db)
         self.payment_manager = UnifiedPaymentManager(config, db, ledger=self.ledger)
         self.corporate = CorporateManager(db)
-        self.bootstrap_wallet = BootstrapWallet(config, db)
+        self.bootstrap_wallet = BootstrapWallet(config, db, ledger=self.ledger)
         self.kofi_manager = KofiCampaignManager(
             config, db, llm, bootstrap_wallet=self.bootstrap_wallet,
+        )
+        self.reporter = FinancialReporter(
+            db, self.ledger, self.finance, bootstrap=self.bootstrap_wallet,
         )
         self.llc_provisioner = LLCProvisioner(config, db, llm)
         self.api_provisioner = APIProvisioner(
@@ -349,6 +353,29 @@ class Orchestrator(BaseAgent):
             logger.error(f"Ledger integrity check failed: {e}")
             cycle_result["ledger_integrity"] = {"error": str(e)}
 
+        # Phase 6.97: Strategy performance evaluation
+        try:
+            perf = self.reporter.get_strategy_performance()
+            cycle_result["strategy_performance"] = {
+                "total_revenue": perf["total_revenue"],
+                "total_expenses": perf["total_expenses"],
+                "overall_roi_pct": perf["overall_roi_pct"],
+                "to_review": len(perf["strategies_to_review"]),
+                "to_pause": len(perf["strategies_to_pause"]),
+                "to_scale": len(perf["strategies_to_scale"]),
+            }
+            # Auto-action on underperformers
+            for s in perf["strategies_to_pause"]:
+                self.log_action("strategy_underperform",
+                                f"Strategy '{s['name']}' recommended for pause: "
+                                f"net={s['net']:.2f}, ROI={s['roi_pct']}%")
+            for s in perf["strategies_to_scale"]:
+                self.log_action("strategy_scale",
+                                f"Strategy '{s['name']}' growing: "
+                                f"7d_rev={s['trend_7d']['revenue']:.2f}")
+        except Exception as e:
+            logger.error(f"Strategy performance eval failed: {e}")
+
         # Phase 7: Commercialista report
         cycle_result["timestamp"] = datetime.now().isoformat()
         cycle_result["net_profit"] = self.finance.get_net_profit()
@@ -360,6 +387,9 @@ class Orchestrator(BaseAgent):
                         f"API calls: {api_costs['total_calls']}, "
                         f"cost: €{api_costs['total_cost_eur']:.4f}, "
                         f"budget: €{updated_budget['balance']:.2f}")
+
+        # Phase 7.5: Automated financial reports
+        self._send_financial_reports()
 
         # Phase 8: Reflect and learn
         self._reflect_on_cycle(cycle_result)
@@ -551,6 +581,30 @@ class Orchestrator(BaseAgent):
         except Exception as e:
             logger.error(f"Ko-fi sync failed: {e}")
             return {"status": "error", "error": str(e)}
+
+    def _send_financial_reports(self) -> None:
+        """Send periodic financial reports to creator via Telegram."""
+        try:
+            # Monthly report: send on 1st of month
+            if self.reporter.should_send_monthly_report():
+                report = self.reporter.generate_monthly_report()
+                msg = self.reporter.format_telegram_report(report)
+                self.notify_creator(msg)
+                self.log_action("monthly_report", f"Sent monthly P&L for {report['period']}")
+
+            # Weekly strategy dashboard: send every Monday
+            elif self.reporter.should_send_weekly_report():
+                dashboard = self.reporter.generate_strategy_dashboard()
+                self.notify_creator(dashboard)
+                self.log_action("weekly_dashboard", "Sent strategy performance dashboard")
+
+            # Daily snapshot: every cycle (creator can mute in Telegram)
+            elif self._cycle % 10 == 0:
+                snapshot = self.reporter.generate_daily_snapshot()
+                self.notify_creator(snapshot)
+
+        except Exception as e:
+            logger.error(f"Financial reporting failed: {e}")
 
     def _run_api_provisioning(self) -> dict[str, Any]:
         """Run API key provisioning for brands that need payment provider keys.
