@@ -108,7 +108,10 @@ class GumroadProvider(PaymentProvider):
         except GumroadAPIError as e:
             return PaymentResult(success=False, error=str(e))
 
-        price = float(sale.get("price", 0)) / 100
+        try:
+            price = float(sale.get("price", 0)) / 100
+        except (ValueError, TypeError):
+            price = 0.0
         refunded = sale.get("refunded", False)
 
         if refunded:
@@ -197,7 +200,18 @@ class GumroadProvider(PaymentProvider):
         else:
             return None
 
-        price = float(data.get("price", 0)) / 100
+        # Gumroad sends price in cents as integer string (e.g. "500" = $5.00)
+        raw_price = data.get("price", "0")
+        try:
+            price_val = float(raw_price)
+        except (ValueError, TypeError):
+            logger.warning(f"Gumroad webhook with unparseable price: {raw_price!r}")
+            return None
+        # Gumroad always sends cents — divide by 100
+        price = price_val / 100
+        if price < 0 or price != price:  # reject negative or NaN
+            logger.warning(f"Gumroad webhook with invalid price: {price}")
+            return None
         currency = data.get("currency", "usd").upper()
 
         return WebhookEvent(

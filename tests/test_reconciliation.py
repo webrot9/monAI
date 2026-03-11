@@ -93,16 +93,29 @@ class TestReconciliationMatching:
         assert result.is_clean
 
     def test_unmatched_gl_entry(self, engine, ledger, db):
-        """GL entry with no matching webhook flagged."""
+        """Webhook-sourced GL entry with no matching webhook flagged."""
+        ledger.record_revenue(
+            amount=75.0, revenue_account="4000", cash_account="1010",
+            description="Webhook entry", reference="webhook_orphan_001",
+            source="webhook",
+        )
+
+        result = engine.run_reconciliation()
+        assert len(result.unmatched_gl) == 1
+        assert result.unmatched_gl[0]["payment_ref"] == "webhook_orphan_001"
+        assert not result.is_clean
+
+    def test_manual_gl_entry_excluded(self, engine, ledger, db):
+        """Manual GL entries are excluded from webhook reconciliation."""
         ledger.record_revenue(
             amount=75.0, revenue_account="4000", cash_account="1010",
             description="Manual entry", reference="manual_001", source="manual",
         )
 
         result = engine.run_reconciliation()
-        assert len(result.unmatched_gl) == 1
-        assert result.unmatched_gl[0]["payment_ref"] == "manual_001"
-        assert not result.is_clean
+        # Manual entries should not appear — only webhook/webhook_refund sources
+        assert result.total_gl == 0
+        assert result.is_clean
 
     def test_unmatched_webhook_event(self, engine, db):
         """Webhook event with no GL entry flagged."""
@@ -154,10 +167,10 @@ class TestReconciliationMatching:
         )
         _create_webhook_event(db, "pay_fee", 47.50)
 
-        # Orphan GL
+        # Orphan GL (webhook source — should be flagged as unmatched)
         ledger.record_revenue(
             amount=25.0, revenue_account="4000", cash_account="1010",
-            description="No webhook", reference="pay_missing_wh", source="manual",
+            description="No webhook", reference="pay_missing_wh", source="webhook",
         )
 
         # Orphan webhook

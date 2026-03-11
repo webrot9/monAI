@@ -386,6 +386,29 @@ class SweepEngine:
                 status=SweepStatus.FAILED,
             )
 
+        # Deduct outstanding deficits (refunds after previous sweeps)
+        try:
+            deficits = self.db.execute(
+                "SELECT COALESCE(SUM(amount), 0) as total FROM sweep_deficits "
+                "WHERE brand = ? AND status = 'outstanding'",
+                (brand,),
+            )
+            deficit_total = deficits[0]["total"] if deficits else 0
+            if deficit_total > 0:
+                sweepable -= deficit_total
+                logger.info(
+                    f"Brand {brand}: deducting {deficit_total:.2f} deficit from sweepable"
+                )
+                if sweepable <= 0:
+                    return SweepResult(
+                        success=False,
+                        error=f"Sweepable balance ({sweepable + deficit_total:.2f}) "
+                              f"consumed by deficit ({deficit_total:.2f})",
+                        status=SweepStatus.FAILED,
+                    )
+        except Exception:
+            pass  # Table may not exist yet
+
         from_account = self._find_sweep_source(brand)
         if not from_account:
             return SweepResult(

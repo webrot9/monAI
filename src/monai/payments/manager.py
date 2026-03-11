@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from decimal import Decimal
 from typing import Any
 
 from monai.business.brand_payments import BrandPayments
@@ -62,8 +63,26 @@ class UnifiedPaymentManager:
         # Register webhook event handler
         self.webhook_server.on_event(self._handle_webhook_event)
 
-        # Init webhook log schema
+        # Init webhook log schema + deficit tracking
         self._init_schema()
+        self._ensure_deficit_table()
+
+    def _ensure_deficit_table(self) -> None:
+        """Create sweep_deficits table for tracking refund-after-sweep gaps."""
+        with self.db.connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS sweep_deficits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    brand TEXT NOT NULL,
+                    payment_ref TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    currency TEXT DEFAULT 'EUR',
+                    sweep_id INTEGER,
+                    status TEXT DEFAULT 'outstanding',
+                    resolved_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
 
     def _init_schema(self):
         with self.db.connect() as conn:
@@ -288,8 +307,15 @@ class UnifiedPaymentManager:
         if event.amount < 0:
             logger.error(f"Webhook with negative amount rejected: {event.amount}")
             return
+        if event.amount == 0 and event.event_type == WebhookEventType.PAYMENT_COMPLETED:
+            logger.error("Webhook with zero amount rejected for payment.completed")
+            return
         if event.amount > 1_000_000:  # €1M safety cap per single webhook
             logger.error(f"Webhook with suspicious amount rejected: {event.amount}")
+            return
+        # NaN check
+        if event.amount != event.amount:
+            logger.error("Webhook with NaN amount rejected")
             return
 
         # ATOMIC: idempotency check + event log in single transaction
@@ -354,6 +380,18 @@ class UnifiedPaymentManager:
             except (ValueError, TypeError):
                 lead_id = None
 
+        # Use Decimal for precise fee calculation, round to 2 decimals before storage
+        gross_dec = Decimal(str(event.amount))
+        rates = self.brand_payments.PLATFORM_FEE_RATES.get(event.provider)
+        if rates:
+            fee_dec = gross_dec * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"]))
+        else:
+            fee_dec = Decimal("0")
+        # Round to 2 decimal places for storage (avoids floating-point drift)
+        amount_rounded = float(gross_dec.quantize(Decimal("0.01")))
+        fee_amount = float(fee_dec.quantize(Decimal("0.01")))
+        fee_currency = event.currency  # Fee in same currency as payment
+
         # Record payment + fee atomically in a single transaction
         with self.db.transaction() as conn:
             cursor = conn.execute(
@@ -361,29 +399,16 @@ class UnifiedPaymentManager:
                 "(brand, account_id, lead_id, amount, currency, product, "
                 "customer_email, payment_ref) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (brand, account_id, lead_id, event.amount, event.currency,
+                (brand, account_id, lead_id, amount_rounded, event.currency,
                  event.product, event.customer_email, event.payment_ref),
             )
             pay_id = cursor.lastrowid
-
-            # Auto-record platform fees in same transaction
-            rates = self.brand_payments.PLATFORM_FEE_RATES.get(event.provider)
-            if rates:
-                from decimal import Decimal
-                gross = Decimal(str(event.amount))
-                fee_amount = float(
-                    gross * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"]))
-                )
-                fee_currency = event.currency  # Fee in same currency as payment
-            else:
-                fee_amount = 0.0
-                fee_currency = event.currency
 
             conn.execute(
                 "INSERT INTO platform_fees "
                 "(brand, provider, payment_id, gross_amount, fee_amount, fee_currency) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (brand, event.provider, pay_id, event.amount, fee_amount, fee_currency),
+                (brand, event.provider, pay_id, amount_rounded, fee_amount, fee_currency),
             )
 
         logger.info(
@@ -472,11 +497,25 @@ class UnifiedPaymentManager:
             (payment["brand"],),
         )
         if swept:
+            # Track the deficit so it can be recovered from future sweeps
+            try:
+                self._ensure_deficit_table()
+                self.db.execute_insert(
+                    "INSERT INTO sweep_deficits "
+                    "(brand, payment_ref, amount, currency, sweep_id, status) "
+                    "VALUES (?, ?, ?, ?, ?, 'outstanding')",
+                    (payment["brand"], event.payment_ref,
+                     payment["amount"], payment["currency"],
+                     swept[0]["id"]),
+                )
+            except Exception as e:
+                logger.error(f"Failed to record sweep deficit: {e}")
+
             logger.critical(
                 f"REFUND AFTER SWEEP: Payment {event.payment_ref} for "
                 f"{payment['amount']} {payment['currency']} was already swept. "
                 f"Brand {payment['brand']} has NEGATIVE sweepable balance. "
-                f"Manual intervention required."
+                f"Deficit tracked for recovery."
             )
 
         # Record refund in GL (reverse the original entry)
