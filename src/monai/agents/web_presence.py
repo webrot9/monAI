@@ -237,11 +237,16 @@ class WebPresence(BaseAgent):
 
         Uses web/landing/generator.py to fill the HTML template with live
         funding progress from the DB and real payment links.
+        Writes to a build/ subdirectory to avoid overwriting the template.
         """
+        from pathlib import Path
         try:
+            build_dir = Path(landing_generator.OUTPUT_DIR) / "build"
+            build_dir.mkdir(parents=True, exist_ok=True)
             output_path = landing_generator.generate(
                 config=self.config,
                 db=self.db,
+                output_path=build_dir / "index.html",
                 stripe_links=stripe_links,
                 kofi_url=kofi_url,
                 monero_address=monero_address,
@@ -268,8 +273,11 @@ class WebPresence(BaseAgent):
             return {"status": "error", "error": f"Generation failed: {gen_result.get('error')}"}
 
         try:
+            from pathlib import Path
+            build_dir = Path(landing_generator.OUTPUT_DIR) / "build"
             deploy_result = landing_deploy.deploy(
                 provider=provider,
+                site_dir=build_dir,
                 site_name=site_name,
             )
             result = {
