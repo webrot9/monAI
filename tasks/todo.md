@@ -22,10 +22,16 @@
 - [x] Optimize costs (model tiers: FULL/MINI/NANO)
 - [x] Strategy lifecycle state machine
 - [x] Phone provisioner lazy HTTP client fix
+- [x] Wire APIProvisioner into orchestrator (runs every 5 cycles, auto-provisions API keys)
+- [x] Register LemonSqueezy in UnifiedPaymentManager (auto-loads from DB at startup)
+- [x] Wire landing page generator into WebPresence agent (generate + deploy crowdfunding page)
+- [x] Double-entry bookkeeping GeneralLedger (chart of accounts, journal, balance sheet, P&L)
+- [x] Ledger integrity verification in orchestrator cycle (Phase 6.95)
+- [x] 20 new tests for GeneralLedger (1114 total tests, all passing)
 
 ## Next Up
-- [ ] Crowdfunding landing page generation (monAI's first website)
 - [ ] Ko-fi campaign setup automation
 - [ ] End-to-end integration tests for the full payment flow
-- [ ] More platform integrations (LemonSqueezy, Stripe, etc.)
 - [ ] Research wiring into opportunity discovery
+- [ ] Wire GeneralLedger into webhook handler (auto-create GL entries on payments)
+- [ ] Wire GeneralLedger into sweep engine (auto-create GL entries on sweeps)

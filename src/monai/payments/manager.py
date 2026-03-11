@@ -14,6 +14,7 @@ from monai.business.brand_payments import BrandPayments
 from monai.config import Config
 from monai.db.database import Database
 from monai.payments.base import PaymentProvider
+from monai.payments.lemonsqueezy_provider import LemonSqueezyProvider
 from monai.payments.monero_provider import MoneroProvider
 from monai.payments.sweep_engine import SweepEngine
 from monai.payments.types import (
@@ -53,6 +54,9 @@ class UnifiedPaymentManager:
         # Auto-register Monero if configured
         if config.monero.wallet_rpc_url:
             self._register_monero(config)
+
+        # Auto-register LemonSqueezy providers from DB (previously provisioned keys)
+        self._register_lemonsqueezy_from_db()
 
         # Register webhook event handler
         self.webhook_server.on_event(self._handle_webhook_event)
@@ -96,6 +100,57 @@ class UnifiedPaymentManager:
             proxy_url=config.monero.proxy_url,
         )
         self.register_provider("crypto_xmr", monero)
+
+    def _register_lemonsqueezy_from_db(self) -> None:
+        """Auto-register LemonSqueezy providers from previously provisioned API keys.
+
+        Checks brand_api_keys table for active LemonSqueezy credentials
+        and registers a provider for each brand that has them.
+        """
+        try:
+            rows = self.db.execute(
+                "SELECT DISTINCT brand FROM brand_api_keys "
+                "WHERE provider = 'lemonsqueezy' AND status = 'active'"
+            )
+        except Exception:
+            # Table may not exist yet (APIProvisioner not initialized)
+            return
+
+        for row in rows:
+            brand = row["brand"]
+            try:
+                keys = self.db.execute(
+                    "SELECT key_type, key_value FROM brand_api_keys "
+                    "WHERE brand = ? AND provider = 'lemonsqueezy' AND status = 'active'",
+                    (brand,),
+                )
+                key_map = {k["key_type"]: k["key_value"] for k in keys}
+
+                api_key = key_map.get("access_token", "")
+                store_id = key_map.get("store_id", "")
+                webhook_secret = key_map.get("webhook_secret", "")
+
+                if not api_key or not store_id:
+                    continue
+
+                # Decrypt keys if encrypted
+                try:
+                    from monai.utils.crypto import decrypt_value
+                    api_key = decrypt_value(api_key)
+                    if webhook_secret:
+                        webhook_secret = decrypt_value(webhook_secret)
+                except Exception:
+                    pass  # Keys may not be encrypted
+
+                provider = LemonSqueezyProvider(
+                    api_key=api_key,
+                    store_id=store_id,
+                    webhook_secret=webhook_secret,
+                )
+                self.register_brand_provider(brand, "lemonsqueezy", provider)
+                logger.info(f"Auto-registered LemonSqueezy for brand: {brand}")
+            except Exception as e:
+                logger.warning(f"Failed to register LemonSqueezy for {brand}: {e}")
 
     def register_provider(self, name: str, provider: PaymentProvider) -> None:
         """Register a payment provider globally."""

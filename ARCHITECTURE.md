@@ -188,6 +188,7 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `collaboration.py` | Agent-to-agent help system |
 | `spawner.py` | Sub-agent creation |
 | `base.py` | Base agent class with lazy-loaded mixins (coder, executor, identity, provisioner) |
+| `api_provisioner.py` | Autonomous payment provider API key self-provisioning |
 | `captcha_solver.py` | Autonomous CAPTCHA solving for account registration |
 | `email_verifier.py` | Email verification and temporary email management |
 | `eng_team/` | Engineering team (tech lead + engineers) |
@@ -197,7 +198,7 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 ### Business (`src/monai/business/`)
 | Module | Purpose |
 |--------|---------|
-| `finance.py` | Revenue & expense tracking |
+| `finance.py` | Revenue & expense tracking + double-entry GeneralLedger |
 | `commercialista.py` | Accounting, budgets, ROI per agent |
 | `corporate.py` | LLC management, expenses, tax obligations |
 | `bootstrap.py` | Seed capital (crowdfunding, Paysafecard, creator seed) |
@@ -296,7 +297,7 @@ All strategies use real browser automation and APIs — zero simulation:
 
 ## Test Suite
 
-- **1088 tests** across 54 test files
+- **1114 tests** across 55 test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
@@ -353,6 +354,13 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 - **Crowdfunding landing page**: `web/landing/` — deployable static site with payment integration
 - **Team agents with real logic**: Engineering, research, marketing teams now use browser automation
 - **API key self-provisioning**: `agents/api_provisioner.py` — autonomous provider registration
+
+### Integration Fixes (2026-03-11)
+- **APIProvisioner wired into orchestrator**: Now runs every 5 cycles, auto-provisions Stripe/Gumroad/LemonSqueezy/BTCPay API keys for brands
+- **LemonSqueezy auto-registered in PaymentManager**: On startup, checks DB for provisioned LS keys and registers brand-specific providers
+- **Landing page generator wired into WebPresence**: `run()` now regenerates crowdfunding page with live funding data; new `deploy_crowdfunding_page()` method
+- **Double-entry bookkeeping (GeneralLedger)**: Full chart of accounts, journal entries with balanced debit/credit, trial balance, balance sheet, income statement, reconciliation, integrity verification
+- **Ledger integrity check in orchestrator cycle**: Phase 6.95 verifies all entries balanced before commercialista report
 
 ### Earlier Changes
 - **Webhook idempotency**: `processed_webhooks` table prevents double-processing

@@ -27,6 +27,7 @@ from monai.agents.social_presence import SocialPresence
 from monai.agents.web_presence import WebPresence
 from monai.agents.identity import IdentityManager
 from monai.agents.legal import LegalAdvisorFactory
+from monai.agents.api_provisioner import APIProvisioner
 from monai.agents.llc_provisioner import LLCProvisioner
 from monai.agents.phone_provisioner import PhoneProvisioner
 from monai.agents.provisioner import Provisioner
@@ -39,7 +40,7 @@ from monai.business.commercialista import Commercialista
 from monai.business.bootstrap import BootstrapWallet
 from monai.business.crm import CRM
 from monai.business.email_marketing import EmailMarketing
-from monai.business.finance import Finance
+from monai.business.finance import Finance, GeneralLedger
 from monai.business.pipeline import Pipeline
 from monai.business.risk import RiskManager
 from monai.business.strategy_lifecycle import StrategyLifecycle
@@ -69,6 +70,7 @@ class Orchestrator(BaseAgent):
         super().__init__(config, db, llm)
         self.crm = CRM(db)
         self.finance = Finance(db)
+        self.ledger = GeneralLedger(db)
         self.risk = RiskManager(config, db)
         self.identity = IdentityManager(config, db, llm)
         self.provisioner = Provisioner(config, db, llm)
@@ -96,6 +98,10 @@ class Orchestrator(BaseAgent):
         self.corporate = CorporateManager(db)
         self.bootstrap_wallet = BootstrapWallet(config, db)
         self.llc_provisioner = LLCProvisioner(config, db, llm)
+        self.api_provisioner = APIProvisioner(
+            config, db, llm,
+            payment_manager=self.payment_manager,
+        )
         self.strategy_lifecycle = StrategyLifecycle(db)
         self._ensure_llc_setup()
         # Load persisted cost tracker state
@@ -111,6 +117,7 @@ class Orchestrator(BaseAgent):
         self.workflow_engine.register_agent("marketing_team", self.marketing_team)
         self.workflow_engine.register_agent("social_presence", self.social_presence)
         self.workflow_engine.register_agent("web_presence", self.web_presence)
+        self.workflow_engine.register_agent("api_provisioner", self.api_provisioner)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
     def register_strategy(self, agent: BaseAgent):
@@ -325,6 +332,19 @@ class Orchestrator(BaseAgent):
         # Phase 6.9: Payment processing — sweep profits to creator
         cycle_result["payments"] = self._run_payment_cycle()
 
+        # Phase 6.95: Ledger integrity check
+        try:
+            integrity = self.ledger.verify_integrity()
+            cycle_result["ledger_integrity"] = integrity
+            if not integrity["balanced"]:
+                logger.critical(
+                    f"LEDGER IMBALANCE: {len(integrity['unbalanced_entries'])} "
+                    f"unbalanced entries detected"
+                )
+        except Exception as e:
+            logger.error(f"Ledger integrity check failed: {e}")
+            cycle_result["ledger_integrity"] = {"error": str(e)}
+
         # Phase 7: Commercialista report
         cycle_result["timestamp"] = datetime.now().isoformat()
         cycle_result["net_profit"] = self.finance.get_net_profit()
@@ -490,10 +510,37 @@ class Orchestrator(BaseAgent):
                     f"Will continue next cycle."
                 )
 
-        if not needs and "llc" not in result:
+        # API key provisioning — ensure brands have payment provider keys
+        api_prov_result = self._run_api_provisioning()
+        if api_prov_result.get("provisioned"):
+            result["api_keys"] = api_prov_result
+
+        if not needs and "llc" not in result and "api_keys" not in result:
             return {"status": "infrastructure_ok", "accounts": len(accounts)}
 
         return {"provisioned": needs, "result": result}
+
+    def _run_api_provisioning(self) -> dict[str, Any]:
+        """Run API key provisioning for brands that need payment provider keys.
+
+        Checks all active brands and provisions missing API keys
+        (Stripe, Gumroad, LemonSqueezy, BTCPay) via the APIProvisioner agent.
+        Runs every 5 cycles to avoid excessive provisioning attempts.
+        """
+        if self._cycle % 5 != 1:
+            return {"status": "skipped", "reason": "not_provisioning_cycle"}
+
+        try:
+            plan = self.api_provisioner.plan()
+            if not plan:
+                return {"status": "ok", "provisioned": []}
+
+            result = self.api_provisioner.run()
+            self.log_action("api_provisioning", json.dumps(result, default=str)[:500])
+            return result
+        except Exception as e:
+            logger.error(f"API provisioning failed: {e}")
+            return {"status": "error", "error": str(e)}
 
     def discover_opportunities(self) -> list[dict[str, Any]]:
         """Discover new money-making opportunities.
