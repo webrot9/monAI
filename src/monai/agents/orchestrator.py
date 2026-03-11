@@ -43,6 +43,8 @@ from monai.business.email_marketing import EmailMarketing
 from monai.business.finance import Finance, GeneralLedger
 from monai.business.kofi import KofiCampaignManager
 from monai.business.pipeline import Pipeline
+from monai.business.exchange_rates import ExchangeRateService
+from monai.business.reconciliation import ReconciliationEngine
 from monai.business.reporting import FinancialReporter
 from monai.business.risk import RiskManager
 from monai.business.strategy_lifecycle import StrategyLifecycle
@@ -102,9 +104,11 @@ class Orchestrator(BaseAgent):
         self.kofi_manager = KofiCampaignManager(
             config, db, llm, bootstrap_wallet=self.bootstrap_wallet,
         )
+        self.exchange_rates = ExchangeRateService(db)
         self.reporter = FinancialReporter(
             db, self.ledger, self.finance, bootstrap=self.bootstrap_wallet,
         )
+        self.reconciliation = ReconciliationEngine(db)
         self.llc_provisioner = LLCProvisioner(config, db, llm)
         self.api_provisioner = APIProvisioner(
             config, db, llm,
@@ -337,6 +341,17 @@ class Orchestrator(BaseAgent):
         # Phase 6.8: Browser automation metrics
         cycle_result["browser_metrics"] = self._get_browser_metrics()
 
+        # Phase 6.85: Refresh exchange rates (every 6 cycles ≈ hourly)
+        if self._cycle % 6 == 0:
+            try:
+                import asyncio
+                fetched = asyncio.get_event_loop().run_until_complete(
+                    self.exchange_rates.fetch_live_rates()
+                )
+                cycle_result["exchange_rates_refreshed"] = len(fetched)
+            except Exception as e:
+                logger.warning(f"Exchange rate refresh failed: {e}")
+
         # Phase 6.9: Payment processing — sweep profits to creator
         cycle_result["payments"] = self._run_payment_cycle()
 
@@ -392,10 +407,9 @@ class Orchestrator(BaseAgent):
                                 f"Strategy '{s['name']}' needs review: "
                                 f"net=€{s['net']:.2f}, 7d_net=€{s['trend_7d']['net']:.2f}")
 
-            for s in perf["strategies_to_scale"]:
-                self.log_action("strategy_scale",
-                                f"Strategy '{s['name']}' growing: "
-                                f"7d_rev=€{s['trend_7d']['revenue']:.2f}")
+            # Auto-scale: boost budget for growing strategies
+            scaled = self._auto_scale_strategies(perf["strategies_to_scale"])
+            cycle_result["strategy_performance"]["scaled"] = len(scaled)
         except Exception as e:
             logger.error(f"Strategy performance eval failed: {e}")
 
@@ -605,6 +619,76 @@ class Orchestrator(BaseAgent):
             logger.error(f"Ko-fi sync failed: {e}")
             return {"status": "error", "error": str(e)}
 
+    def _auto_scale_strategies(self, to_scale: list[dict]) -> list[str]:
+        """Increase budget for strategies with strong growth trends.
+
+        Rules:
+        - Only scale if ROI > 0 and 7-day revenue trend is positive
+        - Boost = 20% of current budget (capped at max_strategy_boost from config)
+        - Respects max_strategy_allocation_pct from risk config
+        - Notifies creator of budget increases
+        """
+        if not to_scale:
+            return []
+
+        max_boost = getattr(
+            getattr(self.config, "reinvestment", None), "max_strategy_boost", 50.0
+        )
+        max_alloc_pct = self.config.risk.max_strategy_allocation_pct
+
+        total_active_budget = self.db.execute(
+            "SELECT COALESCE(SUM(allocated_budget), 0) as total "
+            "FROM strategies WHERE status = 'active'"
+        )[0]["total"]
+
+        scaled = []
+        for s in to_scale:
+            sid = s["id"]
+            current_budget = s.get("budget", 0)
+
+            # Skip if no budget set
+            if current_budget <= 0:
+                continue
+
+            # Calculate boost (20% of current, capped)
+            boost = min(current_budget * 0.2, max_boost)
+            new_budget = current_budget + boost
+
+            # Check allocation limit
+            if total_active_budget > 0:
+                new_pct = (new_budget / (total_active_budget + boost)) * 100
+                if new_pct > max_alloc_pct:
+                    logger.info(
+                        f"Skip scaling '{s['name']}': would exceed "
+                        f"{max_alloc_pct}% allocation ({new_pct:.1f}%)"
+                    )
+                    continue
+
+            # Update budget in DB
+            self.db.execute(
+                "UPDATE strategies SET allocated_budget = ?, updated_at = ? "
+                "WHERE id = ?",
+                (new_budget, datetime.now().isoformat(), sid),
+            )
+
+            total_active_budget += boost
+            scaled.append(s["name"])
+            self.log_action(
+                "strategy_auto_scale",
+                f"Scaled '{s['name']}': €{current_budget:.0f} → "
+                f"€{new_budget:.0f} (+€{boost:.0f}), "
+                f"ROI={s['roi_pct']}%, 7d_rev=€{s['trend_7d']['revenue']:.2f}"
+            )
+
+        if scaled:
+            self.notify_creator(
+                f"*Auto-scaled {len(scaled)} growing "
+                f"{'strategy' if len(scaled) == 1 else 'strategies'}:*\n"
+                + "\n".join(f"- {name}" for name in scaled)
+            )
+
+        return scaled
+
     def _send_financial_reports(self) -> None:
         """Send periodic financial reports to creator via Telegram."""
         try:
@@ -615,11 +699,20 @@ class Orchestrator(BaseAgent):
                 self.notify_creator(msg)
                 self.log_action("monthly_report", f"Sent monthly P&L for {report['period']}")
 
-            # Weekly strategy dashboard: send every Monday
+            # Weekly strategy dashboard + reconciliation: send every Monday
             elif self.reporter.should_send_weekly_report():
                 dashboard = self.reporter.generate_strategy_dashboard()
                 self.notify_creator(dashboard)
                 self.log_action("weekly_dashboard", "Sent strategy performance dashboard")
+
+                # Run weekly reconciliation
+                recon = self.reconciliation.run_reconciliation()
+                if not recon.is_clean:
+                    msg = self.reconciliation.format_telegram_report(recon)
+                    self.notify_creator(msg)
+                self.log_action("reconciliation",
+                                f"Run #{recon.run_id}: {recon.matched} matched, "
+                                f"{recon.discrepancy_count} discrepancies")
 
             # Daily snapshot: every cycle (creator can mute in Telegram)
             elif self._cycle % 10 == 0:

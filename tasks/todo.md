@@ -44,8 +44,13 @@
 - [x] GL normalized income statement (get_income_statement_normalized with FX conversion)
 - [x] Total: 1192 tests, all passing
 
+- [x] Live exchange rate fetching (ECB fiat + CoinGecko crypto, async httpx, Phase 6.85)
+- [x] Auto-scale promising strategies (Phase 6.97 boosts budget +20% for growing strategies)
+- [x] Reconciliation engine (GL↔webhook matching, amount tolerance, weekly run with Telegram alerts)
+- [x] Total: 1216 tests, all passing
+
 ## Next Up
 - [ ] First real deployment test (end-to-end with a real Ko-fi page)
-- [ ] Live exchange rate fetching (CoinGecko/ECB API integration for ExchangeRateService)
-- [ ] Auto-scale promising strategies (increase budget allocation based on ROI trends)
-- [ ] Reconciliation engine (match GL entries with payment provider statements)
+- [ ] Invoice generation (PDF invoices for LLC-based client billing)
+- [ ] Tax estimation module (quarterly estimated tax calculations)
+- [ ] Rate limiting per provider for exchange rate API calls

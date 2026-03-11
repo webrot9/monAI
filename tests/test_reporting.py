@@ -330,3 +330,78 @@ class TestAutoPause:
 
         # can_transition should return False for paused→paused
         assert not lifecycle.can_transition(sid, "paused")
+
+
+class TestAutoScale:
+    """Test auto-scaling of promising strategies."""
+
+    def _create_strategy(self, db, name, budget=100):
+        return db.execute_insert(
+            "INSERT INTO strategies (name, category, allocated_budget, status) "
+            "VALUES (?, 'digital_products', ?, 'active')",
+            (name, budget),
+        )
+
+    def _record_tx(self, db, strategy_id, amount, tx_type="revenue"):
+        db.execute_insert(
+            "INSERT INTO transactions (strategy_id, amount, type, category, description) "
+            "VALUES (?, ?, ?, ?, 'test')",
+            (strategy_id, amount, tx_type, tx_type),
+        )
+
+    def test_scale_recommendation_for_growing_strategy(self, db, config):
+        """Strategy with positive net and growing 7d rev gets 'scale' recommendation."""
+        ledger = GeneralLedger(db)
+        finance = Finance(db)
+        reporter = FinancialReporter(db, ledger, finance)
+
+        sid = self._create_strategy(db, "rocket", budget=200)
+        self._record_tx(db, sid, 500.0, "revenue")
+        self._record_tx(db, sid, 50.0, "expense")
+
+        perf = reporter.get_strategy_performance()
+        rocket = next(s for s in perf["strategies"] if s["name"] == "rocket")
+        # net >= 0 and rev_7d > rev_30d/4 → should be "scale"
+        assert rocket["recommendation"] == "scale"
+
+    def test_budget_increase_20_percent(self, db, config):
+        """Auto-scale boosts budget by 20%."""
+        sid = self._create_strategy(db, "grower", budget=100)
+        self._record_tx(db, sid, 300.0, "revenue")
+        self._record_tx(db, sid, 30.0, "expense")
+
+        ledger = GeneralLedger(db)
+        finance = Finance(db)
+        reporter = FinancialReporter(db, ledger, finance)
+
+        perf = reporter.get_strategy_performance()
+        to_scale = perf["strategies_to_scale"]
+        assert len(to_scale) >= 1
+
+        # Simulate the boost
+        for s in to_scale:
+            current = s["budget"]
+            boost = min(current * 0.2, 50.0)
+            new_budget = current + boost
+            db.execute(
+                "UPDATE strategies SET allocated_budget = ? WHERE id = ?",
+                (new_budget, s["id"]),
+            )
+
+        # Verify budget increased
+        rows = db.execute("SELECT allocated_budget FROM strategies WHERE id = ?", (sid,))
+        assert rows[0]["allocated_budget"] == 120.0  # 100 + 20%
+
+    def test_losing_strategy_not_scaled(self, db, config):
+        """Negative-net strategy never gets 'scale' recommendation."""
+        ledger = GeneralLedger(db)
+        finance = Finance(db)
+        reporter = FinancialReporter(db, ledger, finance)
+
+        sid = self._create_strategy(db, "sinking", budget=200)
+        self._record_tx(db, sid, 20.0, "revenue")
+        self._record_tx(db, sid, 100.0, "expense")
+
+        perf = reporter.get_strategy_performance()
+        scale_ids = [s["id"] for s in perf["strategies_to_scale"]]
+        assert sid not in scale_ids

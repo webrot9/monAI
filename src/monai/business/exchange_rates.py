@@ -5,6 +5,10 @@ Rates are fetched from public APIs and cached to avoid excessive requests.
 
 All GL entries store amounts in their original currency. This module
 enables normalized reporting (convert everything to EUR for P&L).
+
+Rate sources:
+  - ECB (European Central Bank) — EUR/USD and other fiat pairs, free, no key
+  - CoinGecko — BTC/EUR, XMR/EUR, and other crypto pairs, free tier
 """
 
 from __future__ import annotations
@@ -13,6 +17,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+import httpx
 
 from monai.db.database import Database
 
@@ -204,6 +210,113 @@ class ExchangeRateService:
             (base.upper(), quote.upper(), limit),
         )
         return [dict(r) for r in rows]
+
+    # ── Live Rate Fetching ─────────────────────────────────────
+
+    async def fetch_live_rates(self) -> dict[str, float]:
+        """Fetch live rates from ECB (fiat) and CoinGecko (crypto).
+
+        Returns dict of rates that were successfully fetched and stored.
+        Failures are logged but don't raise — falls back to cached/fallback.
+        """
+        fetched: dict[str, float] = {}
+
+        # Fetch fiat rates from ECB
+        ecb_rates = await self._fetch_ecb_rates()
+        for pair, rate in ecb_rates.items():
+            self.set_rate(pair[0], pair[1], rate, source="ecb")
+            fetched[f"{pair[0]}/{pair[1]}"] = rate
+
+        # Fetch crypto rates from CoinGecko
+        crypto_rates = await self._fetch_coingecko_rates()
+        for pair, rate in crypto_rates.items():
+            self.set_rate(pair[0], pair[1], rate, source="coingecko")
+            fetched[f"{pair[0]}/{pair[1]}"] = rate
+
+        if fetched:
+            logger.info(f"Fetched {len(fetched)} live exchange rates")
+        else:
+            logger.warning("No live exchange rates fetched — using cached/fallback")
+
+        return fetched
+
+    async def _fetch_ecb_rates(self) -> dict[tuple[str, str], float]:
+        """Fetch EUR-based rates from ECB daily reference rates.
+
+        ECB provides free XML/JSON with EUR as base for ~30 currencies.
+        We extract EUR/USD and compute USD/EUR inverse.
+        """
+        rates: dict[tuple[str, str], float] = {}
+        url = "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A?lastNObservations=1&format=csvdata"
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+
+                # CSV format: parse the last line for the rate
+                lines = resp.text.strip().split("\n")
+                if len(lines) >= 2:
+                    # Header + data row; OBS_VALUE is the rate column
+                    header = lines[0].split(",")
+                    data = lines[-1].split(",")
+                    if "OBS_VALUE" in header:
+                        idx = header.index("OBS_VALUE")
+                        usd_rate = float(data[idx])
+                        rates[("EUR", "USD")] = usd_rate
+                        rates[("USD", "EUR")] = round(1.0 / usd_rate, 6)
+                        logger.debug(f"ECB EUR/USD: {usd_rate}")
+        except Exception as e:
+            logger.warning(f"ECB rate fetch failed: {e}")
+
+        return rates
+
+    async def _fetch_coingecko_rates(self) -> dict[tuple[str, str], float]:
+        """Fetch crypto rates from CoinGecko free API.
+
+        Gets BTC and XMR prices in EUR and USD.
+        """
+        rates: dict[tuple[str, str], float] = {}
+        url = (
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=bitcoin,monero&vs_currencies=eur,usd"
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+
+                # Bitcoin
+                btc = data.get("bitcoin", {})
+                if "eur" in btc:
+                    rates[("BTC", "EUR")] = btc["eur"]
+                    rates[("EUR", "BTC")] = round(1.0 / btc["eur"], 10)
+                if "usd" in btc:
+                    rates[("BTC", "USD")] = btc["usd"]
+                    rates[("USD", "BTC")] = round(1.0 / btc["usd"], 10)
+
+                # Monero
+                xmr = data.get("monero", {})
+                if "eur" in xmr:
+                    rates[("XMR", "EUR")] = xmr["eur"]
+                    rates[("EUR", "XMR")] = round(1.0 / xmr["eur"], 10)
+                if "usd" in xmr:
+                    rates[("XMR", "USD")] = xmr["usd"]
+                    rates[("USD", "XMR")] = round(1.0 / xmr["usd"], 10)
+
+                # Cross rate: BTC/XMR
+                if btc.get("eur") and xmr.get("eur"):
+                    btc_xmr = btc["eur"] / xmr["eur"]
+                    rates[("BTC", "XMR")] = round(btc_xmr, 4)
+                    rates[("XMR", "BTC")] = round(1.0 / btc_xmr, 10)
+
+                logger.debug(f"CoinGecko: BTC/EUR={btc.get('eur')}, XMR/EUR={xmr.get('eur')}")
+        except Exception as e:
+            logger.warning(f"CoinGecko rate fetch failed: {e}")
+
+        return rates
 
     def get_all_latest_rates(self) -> list[dict[str, Any]]:
         """Get the latest rate for each currency pair."""

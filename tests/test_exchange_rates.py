@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
+import httpx
 import pytest
 
 from monai.business.exchange_rates import ExchangeRateService, normalize_to_eur
@@ -211,3 +214,156 @@ class TestGLMultiCurrency:
 
         report = ledger.get_income_statement_normalized(rates, "EUR")
         assert report["total_revenue"] == 850.0  # 0.01 BTC * 85000
+
+
+class TestLiveRateFetching:
+    """Test ECB and CoinGecko API integration (mocked)."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_ecb_rates(self, rates):
+        """ECB CSV response parsed correctly."""
+        csv_response = (
+            "KEY,FREQ,CURRENCY,CURRENCY_DENOM,EXR_TYPE,EXR_SUFFIX,"
+            "TIME_PERIOD,OBS_VALUE,OBS_STATUS\n"
+            "EXR.D.USD.EUR.SP00.A,D,USD,EUR,SP00,A,2026-03-11,1.0850,A"
+        )
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.text = csv_response
+        mock_resp.raise_for_status = lambda: None
+
+        with patch("monai.business.exchange_rates.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value.get = AsyncMock(return_value=mock_resp)
+
+            result = await rates._fetch_ecb_rates()
+
+        assert ("EUR", "USD") in result
+        assert result[("EUR", "USD")] == 1.085
+        assert ("USD", "EUR") in result
+        assert abs(result[("USD", "EUR")] - (1.0 / 1.085)) < 0.001
+
+    @pytest.mark.asyncio
+    async def test_fetch_coingecko_rates(self, rates):
+        """CoinGecko JSON response parsed correctly."""
+        json_response = {
+            "bitcoin": {"eur": 84500.0, "usd": 91000.0},
+            "monero": {"eur": 218.0, "usd": 235.0},
+        }
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.json = lambda: json_response
+        mock_resp.raise_for_status = lambda: None
+
+        with patch("monai.business.exchange_rates.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value.get = AsyncMock(return_value=mock_resp)
+
+            result = await rates._fetch_coingecko_rates()
+
+        assert result[("BTC", "EUR")] == 84500.0
+        assert result[("BTC", "USD")] == 91000.0
+        assert result[("XMR", "EUR")] == 218.0
+        assert result[("XMR", "USD")] == 235.0
+        # Cross rate
+        assert ("BTC", "XMR") in result
+        assert abs(result[("BTC", "XMR")] - (84500.0 / 218.0)) < 1.0
+
+    @pytest.mark.asyncio
+    async def test_fetch_live_rates_stores_in_db(self, rates):
+        """fetch_live_rates persists rates to DB."""
+        ecb_csv = (
+            "KEY,FREQ,CURRENCY,CURRENCY_DENOM,EXR_TYPE,EXR_SUFFIX,"
+            "TIME_PERIOD,OBS_VALUE,OBS_STATUS\n"
+            "EXR.D.USD.EUR.SP00.A,D,USD,EUR,SP00,A,2026-03-11,1.09,A"
+        )
+        coingecko_json = {
+            "bitcoin": {"eur": 85000.0, "usd": 92000.0},
+            "monero": {"eur": 220.0, "usd": 238.0},
+        }
+
+        ecb_resp = AsyncMock()
+        ecb_resp.text = ecb_csv
+        ecb_resp.raise_for_status = lambda: None
+
+        cg_resp = AsyncMock()
+        cg_resp.json = lambda: coingecko_json
+        cg_resp.raise_for_status = lambda: None
+
+        async def mock_get(url, **kwargs):
+            if "ecb" in url:
+                return ecb_resp
+            return cg_resp
+
+        with patch("monai.business.exchange_rates.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value.get = mock_get
+
+            fetched = await rates.fetch_live_rates()
+
+        # Should have stored EUR/USD + USD/EUR + crypto pairs
+        assert len(fetched) > 0
+        assert "EUR/USD" in fetched
+
+        # Verify DB persistence
+        history = rates.get_rate_history("EUR", "USD")
+        assert len(history) >= 1
+        assert any(h["source"] == "ecb" for h in history)
+
+    @pytest.mark.asyncio
+    async def test_ecb_failure_graceful(self, rates):
+        """ECB API failure doesn't crash — returns empty."""
+        with patch("monai.business.exchange_rates.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value.get = AsyncMock(side_effect=httpx.ConnectError("offline"))
+
+            result = await rates._fetch_ecb_rates()
+
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_coingecko_failure_graceful(self, rates):
+        """CoinGecko API failure doesn't crash — returns empty."""
+        with patch("monai.business.exchange_rates.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value.get = AsyncMock(side_effect=httpx.ConnectError("offline"))
+
+            result = await rates._fetch_coingecko_rates()
+
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_full_fetch_with_partial_failure(self, rates):
+        """If one source fails, the other still works."""
+        coingecko_json = {
+            "bitcoin": {"eur": 85000.0, "usd": 92000.0},
+            "monero": {"eur": 220.0, "usd": 238.0},
+        }
+        cg_resp = AsyncMock()
+        cg_resp.json = lambda: coingecko_json
+        cg_resp.raise_for_status = lambda: None
+
+        call_count = 0
+
+        async def mock_get(url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if "ecb" in url:
+                raise httpx.ConnectError("ECB down")
+            return cg_resp
+
+        with patch("monai.business.exchange_rates.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value.get = mock_get
+
+            fetched = await rates.fetch_live_rates()
+
+        # ECB failed but CoinGecko succeeded
+        assert "BTC/EUR" in fetched
+        assert "EUR/USD" not in fetched

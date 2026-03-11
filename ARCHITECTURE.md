@@ -205,6 +205,7 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `kofi.py` | Ko-fi campaign automation (setup, monitoring, donation sync) |
 | `reporting.py` | Automated financial reporting (P&L, balance sheet, strategy dashboards via Telegram) |
 | `exchange_rates.py` | Multi-currency exchange rate service (EUR/USD/BTC/XMR with caching + persistence) |
+| `reconciliation.py` | Reconciliation engine (matches GL entries with webhook events, finds discrepancies) |
 | `crm.py` | Lead management, contacts, pipeline |
 | `pipeline.py` | Conversion funnel tracking |
 | `risk.py` | Diversification, spend limits, stop-loss |
@@ -301,7 +302,7 @@ All strategies use real browser automation and APIs — zero simulation:
 
 ## Test Suite
 
-- **1192 tests** across 60 test files
+- **1216 tests** across 62 test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
@@ -381,6 +382,10 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 - **All 6 payment providers** have HMAC/token signature verification: Stripe (v1+timestamp), BTCPay (sha256= prefix), Gumroad, LemonSqueezy, Ko-fi (token), Monero (confirmations-based)
 - **ExchangeRateService**: Multi-currency support with memory+DB caching, fallback rates, inverse pair computation, rate history
 - **`get_income_statement_normalized()`**: GL income statement with FX conversion to target currency (EUR default)
+- **Live rate fetching**: ECB (EUR/USD fiat) + CoinGecko (BTC/XMR crypto) with async httpx, runs every 6 cycles
+- **Auto-scale strategies**: Phase 6.97 boosts budget +20% for growing strategies (capped, allocation-limited)
+- **ReconciliationEngine**: Matches GL entries (by `reference`) to `webhook_events` (by `payment_ref`), flags mismatches/orphans
+- **Weekly reconciliation**: Runs every Monday, sends Telegram alert only if discrepancies found
 
 ### Earlier Changes
 - **Webhook idempotency**: `processed_webhooks` table prevents double-processing
