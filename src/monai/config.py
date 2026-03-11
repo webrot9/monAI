@@ -44,6 +44,9 @@ class ReinvestmentConfig:
     creator_pct: float = 30.0  # 30% to creator (sweep)
     min_profit_to_reinvest: float = 10.0  # Don't reinvest if profit < €10
     max_strategy_boost: float = 50.0  # Max € to add to one strategy per cycle
+    max_daily_spend: float = 100.0  # Hard daily spending cap (all strategies combined)
+    max_single_transaction: float = 200.0  # Max spend per single transaction
+    require_approval_above: float = 500.0  # Pause and alert creator above this
     scale_winners: bool = True  # Give more budget to high-ROI strategies
     cut_losers: bool = True  # Reduce budget for negative-ROI strategies
 
@@ -82,6 +85,9 @@ class PrivacyConfig:
     dns_over_proxy: bool = True  # Route DNS through proxy to prevent leaks
     verify_anonymity: bool = True  # Check real IP is hidden before operations
     max_requests_per_circuit: int = 50  # Rotate Tor circuit after N requests
+    residential_proxy: str = ""  # Residential proxy URL (socks5:// or http://)
+    datacenter_proxy: str = ""  # Datacenter proxy URL (socks5:// or http://)
+    fallback_enabled: bool = True  # Enable proxy fallback chain (Tor → residential → datacenter)
 
 
 @dataclass
@@ -131,7 +137,7 @@ class LLCConfig:
     contractor_alias: str = ""  # Professional alias for invoicing
     contractor_service: str = "Management consulting and technical advisory"
     contractor_rate_type: str = "percentage"  # percentage, monthly
-    contractor_rate_percentage: float = 90.0  # 90% of revenue to contractor
+    contractor_rate_percentage: float = 90.0  # 90% of revenue to contractor (max 100%)
     contractor_rate_amount: float = 0.0  # Fixed amount if monthly
     contractor_payment_method: str = "bank_transfer"
     contractor_tax_id: str = ""  # Creator's P.IVA or codice fiscale
@@ -292,6 +298,9 @@ class Config:
                 "dns_over_proxy": self.privacy.dns_over_proxy,
                 "verify_anonymity": self.privacy.verify_anonymity,
                 "max_requests_per_circuit": self.privacy.max_requests_per_circuit,
+                "residential_proxy": self.privacy.residential_proxy,
+                "datacenter_proxy": self.privacy.datacenter_proxy,
+                "fallback_enabled": self.privacy.fallback_enabled,
             },
             "telegram": {
                 "bot_token": self.telegram.bot_token,

@@ -91,6 +91,31 @@
   5. LLM is ONLY for planning decisions and content creation — never for faking market data
   The distinction: "What should I do next?" = legitimate LLM planning. "Generate 5 affiliate programs with commission rates" = hallucination that must use real web data instead.
 
+### 2026-03-11 - Webhook signatures are MANDATORY, not optional
+- **Mistake**: All payment providers accepted unsigned webhooks when webhook_secret was empty — anyone could forge payments
+- **Root cause**: Defensive coding pattern of "skip verification if not configured" instead of "reject if not configured"
+- **Rule**: Webhook signature verification is NEVER optional. If webhook_secret is not configured, the provider MUST reject all incoming webhooks. Better to miss a real payment than accept a fake one. This applies to ALL providers: Stripe, BTCPay, Gumroad, LemonSqueezy.
+
+### 2026-03-11 - Financial operations must be atomic
+- **Mistake**: Idempotency check and event logging were in separate operations — race conditions could cause double-charging
+- **Root cause**: Didn't think about concurrent webhook delivery from payment providers
+- **Rule**: ALL financial database operations (idempotency check, payment recording, fee calculation) must happen in a single atomic transaction using `db.transaction()`. Never split financial writes across multiple non-transactional operations.
+
+### 2026-03-11 - Validate money amounts at ALL boundaries
+- **Mistake**: PaymentIntent accepted zero, negative, NaN, and absurdly large amounts with no validation
+- **Root cause**: Trusted internal callers to always pass valid data
+- **Rule**: Every financial amount must be validated at the point of creation: minimum (€0.01), maximum (safety cap), no NaN, no negative. Webhook amounts must also be validated. Defense in depth — validate at every boundary, not just the edge.
+
+### 2026-03-11 - Currency must be consistent across the transaction chain
+- **Mistake**: Platform fees were hardcoded in specific currencies (Stripe=EUR, Gumroad=USD) regardless of the actual payment currency
+- **Root cause**: Copied fee rates from provider docs without considering multi-currency scenarios
+- **Rule**: Fees must ALWAYS be calculated and stored in the same currency as the payment. Never mix currencies in a single transaction chain. If conversion is needed, do it explicitly with tracked exchange rates.
+
+### 2026-03-11 - Tor fallback, not Tor-or-nothing
+- **Mistake**: Tor detection by platforms would block the agent entirely with no recourse
+- **Root cause**: Binary thinking — either Tor works or we're blocked
+- **Rule**: Implement a proxy fallback chain: Tor → residential proxy → datacenter proxy. Per-domain tracking of which proxies work. NEVER fall back to direct connection (reveals real IP). If ALL proxies fail, ABORT rather than expose identity. Log every fallback for creator visibility.
+
 ### 2026-03-10 - Agents get their own credentials — only OpenAI key provided
 - **Mistake**: Assumed the creator would provide API credentials for platforms (Gumroad, Stripe, Twitter, etc.)
 - **Root cause**: Traditional developer mindset — someone hands you the keys

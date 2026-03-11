@@ -44,6 +44,43 @@ CREATE TABLE IF NOT EXISTS webhook_events (
 """
 
 
+class _RateLimiter:
+    """Simple in-memory rate limiter for webhook endpoints."""
+
+    def __init__(self, max_per_second: int = 10, max_per_minute: int = 200):
+        self._max_per_second = max_per_second
+        self._max_per_minute = max_per_minute
+        self._second_counts: dict[str, int] = {}  # ip -> count
+        self._minute_counts: dict[str, int] = {}  # ip -> count
+        self._last_second: float = 0.0
+        self._last_minute: float = 0.0
+
+    def is_allowed(self, client_ip: str) -> bool:
+        import time
+        now = time.time()
+        current_second = int(now)
+        current_minute = int(now / 60)
+
+        # Reset per-second counters
+        if current_second != int(self._last_second):
+            self._second_counts.clear()
+            self._last_second = now
+        # Reset per-minute counters
+        if current_minute != int(self._last_minute / 60):
+            self._minute_counts.clear()
+            self._last_minute = now
+
+        sec_count = self._second_counts.get(client_ip, 0)
+        min_count = self._minute_counts.get(client_ip, 0)
+
+        if sec_count >= self._max_per_second or min_count >= self._max_per_minute:
+            return False
+
+        self._second_counts[client_ip] = sec_count + 1
+        self._minute_counts[client_ip] = min_count + 1
+        return True
+
+
 class WebhookServer:
     """Async HTTP server for receiving payment webhooks."""
 
@@ -53,6 +90,7 @@ class WebhookServer:
         self._providers: dict[str, PaymentProvider] = {}
         self._event_handlers: list[Callable[[WebhookEvent], Awaitable[None]]] = []
         self._server: asyncio.Server | None = None
+        self._rate_limiter = _RateLimiter(max_per_second=10, max_per_minute=200)
 
     def register_provider(self, route: str, provider: PaymentProvider) -> None:
         """Register a payment provider for a webhook route.
@@ -90,6 +128,14 @@ class WebhookServer:
                                  writer: asyncio.StreamWriter) -> None:
         """Handle a single HTTP connection."""
         try:
+            # Rate limit by client IP
+            peername = writer.get_extra_info("peername")
+            client_ip = peername[0] if peername else "unknown"
+            if not self._rate_limiter.is_allowed(client_ip):
+                logger.warning(f"Rate limit exceeded for {client_ip}")
+                await self._send_response(writer, 429, "Too Many Requests")
+                return
+
             # Read the full HTTP request
             request_line = await asyncio.wait_for(
                 reader.readline(), timeout=10.0

@@ -78,10 +78,13 @@ class TestGrowthHacker:
             "experiments": [
                 {"name": "Referral loop", "hypothesis": "Users refer friends",
                  "type": "referral", "implementation": "Add referral code",
-                 "success_metric": "signups", "expected_impact": "2x growth"},
+                 "success_metric": "signups", "expected_impact": "2x growth",
+                 "variant_a": "control", "variant_b": "with referral"},
             ]
         }
         gh = GrowthHacker(config, db, llm)
+        # Mock execute_task since it requires real executor in tests
+        gh.execute_task = MagicMock(return_value={"status": "completed"})
         result = gh.run(
             campaign={"name": "growth", "target_audience": "startups"},
             strategy="saas",
@@ -116,13 +119,16 @@ class TestOutreachSpecialist:
     def test_run_plans_sequences(self, config, db, llm):
         llm.chat_json.return_value = {
             "outreach_sequences": [
-                {"target_type": "startup founders", "channel": "email",
-                 "message_template": "Hi {name}...",
-                 "personalization_fields": ["name", "company"],
+                {"target_name": "Jane Doe", "target_type": "startup founders",
+                 "channel": "email", "target_email": "jane@example.com",
+                 "subject": "Partnership", "message_body": "Hi Jane...",
                  "follow_up_days": 3, "expected_response_rate": 0.15},
             ]
         }
         os_ = OutreachSpecialist(config, db, llm)
+        # Mock web research and email sending since they need real infrastructure
+        os_.search_web = MagicMock(return_value={"prospects": []})
+        os_._send_email = MagicMock(return_value=True)
         result = os_.run(
             campaign={"name": "cold outreach", "target_audience": "founders"},
             strategy="lead_gen",

@@ -15,9 +15,14 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from monai.config import Config
-from monai.utils.privacy import get_anonymizer
+from monai.utils.privacy import (
+    AllProxiesBlockedError,
+    ProxyFallbackChain,
+    get_anonymizer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +92,8 @@ class Browser:
             };
         """)
 
+        self._active_proxy_url = proxy_config["server"] if proxy_config else None
+
         logger.info(
             f"Browser started (proxy={'yes' if proxy_config else 'no'}, "
             f"tz={fp['timezone_id']}, locale={fp['locale']})"
@@ -100,11 +107,95 @@ class Browser:
         logger.info("Browser stopped")
 
     async def navigate(self, url: str, wait_for: str = "domcontentloaded") -> str:
-        page = await self._get_page()
-        self._anonymizer.maybe_rotate()  # Maybe rotate Tor circuit
-        await page.goto(url, wait_until=wait_for)
-        logger.info(f"Navigated to {url}")
-        return await page.content()
+        """Navigate to a URL with automatic proxy fallback on block detection.
+
+        If the target domain blocks the current proxy (Tor exit node detected,
+        CAPTCHA challenge, 403, etc.), the browser retries with the next proxy
+        in the fallback chain.  Maximum 3 retry attempts.
+
+        Raises AllProxiesBlockedError if every proxy is exhausted — the action
+        is aborted rather than revealing the real IP.
+        """
+        max_retries = 3
+        domain = urlparse(url).hostname or ""
+        fallback = self._anonymizer.fallback_chain
+
+        for attempt in range(max_retries + 1):
+            # Determine which proxy to use for this domain
+            try:
+                proxy_type, proxy_url = fallback.get_proxy_for_domain(domain)
+            except AllProxiesBlockedError:
+                logger.error(
+                    f"NAVIGATE ABORTED: all proxies blocked for {domain} — "
+                    f"refusing to connect without proxy"
+                )
+                raise
+
+            # If the proxy changed from what the browser context was launched
+            # with, we need to recreate the context with the new proxy.
+            current_proxy = self._current_proxy_url()
+            if proxy_url != current_proxy:
+                logger.info(
+                    f"PROXY FALLBACK: switching from {current_proxy} to "
+                    f"{proxy_url} for {domain} (attempt {attempt + 1})"
+                )
+                await self._recreate_context_with_proxy(proxy_url)
+
+            page = await self._get_page()
+            self._anonymizer.maybe_rotate()
+
+            try:
+                response = await page.goto(url, wait_until=wait_for)
+            except Exception as e:
+                logger.warning(
+                    f"Navigation error on {domain} via {proxy_type}: {e}"
+                )
+                if attempt < max_retries:
+                    try:
+                        fallback.report_blocked(domain, proxy_type)
+                    except AllProxiesBlockedError:
+                        raise
+                    continue
+                raise
+
+            content = await page.content()
+            status = response.status if response else 0
+
+            # Check for block signals: HTTP status or page content
+            blocked = False
+            if ProxyFallbackChain.is_blocked_status_code(status):
+                logger.warning(
+                    f"Blocked status {status} on {domain} via {proxy_type}"
+                )
+                blocked = True
+            elif ProxyFallbackChain.detect_block_page(content):
+                logger.warning(
+                    f"Block page detected on {domain} via {proxy_type}"
+                )
+                blocked = True
+
+            if blocked and attempt < max_retries:
+                try:
+                    fallback.report_blocked(domain, proxy_type)
+                except AllProxiesBlockedError:
+                    raise
+                continue
+
+            if blocked:
+                # Final attempt still blocked — abort
+                fallback.report_blocked(domain, proxy_type)
+                raise AllProxiesBlockedError(
+                    f"All retry attempts exhausted for {domain}. "
+                    f"Last proxy ({proxy_type}) was also blocked."
+                )
+
+            # Success
+            fallback.report_success(domain, proxy_type)
+            logger.info(f"Navigated to {url} via {proxy_type}")
+            return content
+
+        # Should be unreachable, but guard anyway
+        raise AllProxiesBlockedError(f"Navigation to {domain} failed after all retries")
 
     async def screenshot(self, name: str = "page") -> Path:
         page = await self._get_page()
@@ -180,6 +271,74 @@ class Browser:
         """Submit a form."""
         page = await self._get_page()
         await page.evaluate(f'document.querySelector("{selector}").submit()')
+
+    def _current_proxy_url(self) -> str | None:
+        """Return the proxy URL the current browser context was launched with."""
+        return getattr(self, "_active_proxy_url", None)
+
+    async def _recreate_context_with_proxy(self, proxy_url: str) -> None:
+        """Tear down the current browser context and create a new one with a
+        different proxy.  The browser instance itself is kept alive.
+
+        This is the mechanism that makes mid-session proxy switching
+        transparent to the target platform.
+        """
+        # Close existing context (pages and cookies go away — intentional)
+        if self._context:
+            await self._context.close()
+            self._context = None
+
+        # Close old browser — Playwright requires proxy at browser level
+        if self._browser:
+            await self._browser.close()
+            self._browser = None
+
+        if not self._playwright:
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+
+        launch_args = {"headless": self.headless}
+        if proxy_url:
+            launch_args["proxy"] = {"server": proxy_url}
+        self._browser = await self._playwright.chromium.launch(**launch_args)
+
+        fp = self._anonymizer.get_browser_fingerprint()
+        self._context = await self._browser.new_context(
+            viewport=fp["viewport"],
+            user_agent=fp["user_agent"],
+            timezone_id=fp["timezone_id"],
+            locale=fp["locale"],
+            color_scheme=fp["color_scheme"],
+            device_scale_factor=fp["device_scale_factor"],
+            permissions=[],
+        )
+
+        # Re-inject anti-fingerprinting scripts
+        await self._context.add_init_script("""
+            Object.defineProperty(navigator, 'mediaDevices', { get: () => undefined });
+            window.RTCPeerConnection = undefined;
+            window.RTCSessionDescription = undefined;
+            window.RTCIceCandidate = undefined;
+            window.webkitRTCPeerConnection = undefined;
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+            const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = function(type) {
+                const ctx = this.getContext('2d');
+                if (ctx) {
+                    const imgData = ctx.getImageData(0, 0, this.width, this.height);
+                    for (let i = 0; i < imgData.data.length; i += 4) {
+                        imgData.data[i] ^= 1;
+                    }
+                    ctx.putImageData(imgData, 0, 0);
+                }
+                return origToDataURL.call(this, type);
+            };
+        """)
+
+        self._active_proxy_url = proxy_url
+        logger.info(f"Browser context recreated with proxy: {proxy_url}")
 
     async def _get_page(self):
         if not self._context:

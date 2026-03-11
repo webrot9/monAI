@@ -87,6 +87,186 @@ class AnonymityError(Exception):
     pass
 
 
+class AllProxiesBlockedError(AnonymityError):
+    """Raised when every proxy in the fallback chain is blocked for a domain."""
+    pass
+
+
+# ── Proxy type constants ────────────────────────────────────────
+PROXY_TOR = "tor"
+PROXY_RESIDENTIAL = "residential"
+PROXY_DATACENTER = "datacenter"
+PROXY_DIRECT = "direct"  # NEVER actually used — exists only as a sentinel
+
+# Ordered preference: best anonymity first
+PROXY_CHAIN_ORDER = [PROXY_TOR, PROXY_RESIDENTIAL, PROXY_DATACENTER]
+
+# Block-detection patterns in page content (case-insensitive)
+BLOCK_PATTERNS = [
+    "access denied",
+    "access blocked",
+    "403 forbidden",
+    "you have been blocked",
+    "please verify you are a human",
+    "captcha",
+    "ray id",           # Cloudflare block page fingerprint
+    "cf-error-details", # Cloudflare error page
+    "attention required",
+    "why have i been blocked",
+    "security check",
+    "one more step",
+    "checking your browser",
+    "enable javascript and cookies",
+    "unusual traffic",
+    "automated queries",
+    "suspected automated",
+]
+
+
+class ProxyFallbackChain:
+    """Manages an ordered fallback chain of proxy methods per domain.
+
+    When Tor gets detected/blocked on a domain, the chain falls back to
+    residential proxy, then datacenter proxy.  NEVER falls back to a direct
+    connection — if all proxies are exhausted the action is aborted.
+
+    Thread-safe: all state mutations are guarded by a lock.
+    """
+
+    def __init__(self, privacy_config: PrivacyConfig):
+        self._privacy = privacy_config
+        self._lock = threading.Lock()
+        # domain → set of blocked proxy types
+        self._blocked: dict[str, set[str]] = {}
+        # domain → proxy type that last succeeded
+        self._preferred: dict[str, str] = {}
+
+    # ── Proxy URL resolution ────────────────────────────────────
+
+    def _proxy_url_for_type(self, proxy_type: str) -> str | None:
+        """Resolve a proxy type to its URL.  Returns None if unconfigured."""
+        if proxy_type == PROXY_TOR:
+            return f"socks5://127.0.0.1:{self._privacy.tor_socks_port}"
+        elif proxy_type == PROXY_RESIDENTIAL:
+            return self._privacy.residential_proxy or None
+        elif proxy_type == PROXY_DATACENTER:
+            return self._privacy.datacenter_proxy or None
+        return None  # PROXY_DIRECT — never returned
+
+    def _available_chain(self) -> list[str]:
+        """Return proxy types that are actually configured."""
+        available = []
+        for ptype in PROXY_CHAIN_ORDER:
+            if self._proxy_url_for_type(ptype):
+                available.append(ptype)
+        return available
+
+    # ── Public API ──────────────────────────────────────────────
+
+    def get_proxy_for_domain(self, domain: str) -> tuple[str, str]:
+        """Return (proxy_type, proxy_url) for a domain.
+
+        Uses the preferred proxy if one has previously succeeded, otherwise
+        walks the chain skipping blocked types.
+
+        Raises AllProxiesBlockedError if nothing is available.
+        """
+        if not self._privacy.fallback_enabled:
+            # Fallback disabled — just return the primary proxy
+            url = self._proxy_url_for_type(PROXY_TOR)
+            if url:
+                return (PROXY_TOR, url)
+            raise AnonymityError("No proxy configured and fallback is disabled")
+
+        with self._lock:
+            blocked = self._blocked.get(domain, set())
+            preferred = self._preferred.get(domain)
+
+            # Try preferred first if it's not blocked
+            if preferred and preferred not in blocked:
+                url = self._proxy_url_for_type(preferred)
+                if url:
+                    return (preferred, url)
+
+            # Walk the chain
+            for ptype in self._available_chain():
+                if ptype not in blocked:
+                    url = self._proxy_url_for_type(ptype)
+                    if url:
+                        return (ptype, url)
+
+        # All proxies blocked or unconfigured — ABORT, never go direct
+        raise AllProxiesBlockedError(
+            f"All proxy methods blocked for {domain}. "
+            f"Blocked: {blocked}. Aborting to protect anonymity."
+        )
+
+    def report_blocked(self, domain: str, proxy_type: str) -> None:
+        """Mark a proxy type as blocked for a domain."""
+        with self._lock:
+            if domain not in self._blocked:
+                self._blocked[domain] = set()
+            self._blocked[domain].add(proxy_type)
+            # Clear preferred if it was the one that got blocked
+            if self._preferred.get(domain) == proxy_type:
+                del self._preferred[domain]
+        logger.warning(
+            f"PROXY FALLBACK: {proxy_type} blocked on {domain} — "
+            f"blocked set: {self._blocked[domain]}"
+        )
+
+    def report_success(self, domain: str, proxy_type: str) -> None:
+        """Mark a proxy type as working for a domain."""
+        with self._lock:
+            self._preferred[domain] = proxy_type
+            # Un-block it in case it was previously blocked and recovered
+            if domain in self._blocked:
+                self._blocked[domain].discard(proxy_type)
+        logger.info(f"PROXY FALLBACK: {proxy_type} working for {domain}")
+
+    def get_next_fallback(self, domain: str, current_type: str) -> tuple[str, str]:
+        """Get the next proxy in the chain after *current_type* for a domain.
+
+        Marks current_type as blocked, then returns the next available.
+        Raises AllProxiesBlockedError if nothing is left.
+        """
+        self.report_blocked(domain, current_type)
+        return self.get_proxy_for_domain(domain)
+
+    def is_blocked(self, domain: str, proxy_type: str) -> bool:
+        """Check whether a proxy type is blocked for a domain."""
+        with self._lock:
+            return proxy_type in self._blocked.get(domain, set())
+
+    def get_domain_status(self) -> dict[str, Any]:
+        """Return a snapshot of blocked/preferred state for logging."""
+        with self._lock:
+            return {
+                "blocked": {d: list(s) for d, s in self._blocked.items()},
+                "preferred": dict(self._preferred),
+            }
+
+    @staticmethod
+    def detect_block_page(page_content: str) -> bool:
+        """Detect whether page content indicates a proxy/Tor block.
+
+        Checks for CAPTCHA challenges, Cloudflare blocks, access-denied
+        pages, and similar anti-bot responses.
+        """
+        if not page_content:
+            return False
+        lower = page_content.lower()
+        matches = sum(1 for p in BLOCK_PATTERNS if p in lower)
+        # Require at least 2 pattern matches to reduce false positives
+        # (a single word like "captcha" could appear legitimately)
+        return matches >= 2
+
+    @staticmethod
+    def is_blocked_status_code(status_code: int) -> bool:
+        """Check if an HTTP status code indicates proxy detection."""
+        return status_code in (403, 429, 503)
+
+
 class TorController:
     """Manages Tor circuit rotation via the control protocol."""
 
@@ -128,11 +308,34 @@ class NetworkAnonymizer:
         self._real_ip: str | None = None  # Cached real IP (detected once, then hidden)
         self._tor_controller: TorController | None = None
 
+        self._fallback_chain = ProxyFallbackChain(self.privacy)
+
         if self.privacy.proxy_type == "tor":
             self._tor_controller = TorController(
                 self.privacy.tor_control_port,
                 self.privacy.tor_password,
             )
+
+    # ── Fallback Chain ────────────────────────────────────────────
+
+    @property
+    def fallback_chain(self) -> ProxyFallbackChain:
+        """Access the proxy fallback chain."""
+        return self._fallback_chain
+
+    def get_proxy_for_domain(self, domain: str) -> dict[str, str] | None:
+        """Get proxy config for a specific domain, respecting the fallback chain.
+
+        Returns a dict suitable for Playwright proxy config: {"server": url}.
+        Returns None only if proxy_type is 'none'.
+        Raises AllProxiesBlockedError if all proxies are blocked for the domain.
+        """
+        if self.privacy.proxy_type == "none":
+            return None
+        if not self.privacy.fallback_enabled:
+            return self.get_browser_proxy()
+        _ptype, url = self._fallback_chain.get_proxy_for_domain(domain)
+        return {"server": url}
 
     # ── Proxy URLs ───────────────────────────────────────────────
 

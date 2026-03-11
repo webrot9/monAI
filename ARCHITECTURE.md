@@ -244,6 +244,13 @@ All strategies use real browser automation and APIs — zero simulation:
 | `print_on_demand` | Researches real POD trends, generates designs, lists on Redbubble/TeeSpring |
 | `telegram_bots` | Researches real bot market, builds bots, deploys via BotFather |
 
+### Web (`src/monai/web/`)
+| Module | Purpose |
+|--------|---------|
+| `landing/index.html` | Crowdfunding landing page (static, self-contained, dark theme) |
+| `landing/generator.py` | Dynamic page generator — fills payment links, funding progress from DB |
+| `landing/deploy.py` | Deployment helper for Netlify, Vercel, Cloudflare Pages |
+
 ### Workflows (`src/monai/workflows/`)
 | Module | Purpose |
 |--------|---------|
@@ -302,7 +309,7 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 **Major refactor completed 2026-03-10**: All 13 strategy agents rewired from simulated/hallucinated operations to REAL browser automation and API integrations. BaseAgent now provides `execute_task()`, `browse_and_extract()`, `search_web()`, `ensure_platform_account()`, and `platform_action()` to all agents. Zero simulation remaining.
 
 ### What's Next
-1. **Crowdfunding landing page** — monAI's first website for the AI crowdfunding campaign
+1. ~~**Crowdfunding landing page**~~ — DONE: `src/monai/web/landing/` (static page + generator + deploy helper)
 2. **Ko-fi campaign setup** — automated campaign creation and monitoring
 3. **End-to-end integration tests** — full payment flow from Stripe webhook to creator wallet
 4. **More platform integrations** — LemonSqueezy, Stripe connect, etc.
@@ -323,6 +330,31 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 
 ## Recent Changes
 
+### Security Hardening (Critical)
+- **Webhook signature enforcement**: ALL providers now REJECT unsigned webhooks (was: optional)
+- **Atomic webhook idempotency**: Idempotency check + event log in single DB transaction (was: separate, racy)
+- **PaymentIntent validation**: Amount validated on creation (min €0.01, max €100k, no NaN/negative)
+- **Webhook amount validation**: Rejects negative amounts and suspiciously large (>€1M) webhook claims
+- **Rate limiting on webhook server**: Per-IP rate limiting (10/sec, 200/min) with 429 responses
+- **Spending caps**: Hard daily limit on auto-reinvestment, per-transaction max, creator approval above threshold
+
+### Financial Fixes
+- **Currency mismatch fix**: Platform fees now always in same currency as payment (was: hardcoded per-provider)
+- **Contractor rate cap**: Percentage capped at 100% (was: uncapped, could exceed revenue)
+- **Negative sweep validation**: Rejects negative/zero sweep amounts
+- **Transactional payment recording**: Payment + fee recorded atomically in single transaction
+- **Refund-after-sweep detection**: Logs CRITICAL alert if refund occurs after funds already swept
+- **Dispute handling**: Proper alerting with CRITICAL log level on disputes
+
+### Feature Completions
+- **LemonSqueezy full integration**: Auto-creates products and variants (was: checkout-only)
+- **LemonSqueezy platform integration**: `integrations/lemonsqueezy.py` for strategy agents
+- **Tor detection fallback**: `ProxyFallbackChain` — auto-falls back Tor → residential → datacenter
+- **Crowdfunding landing page**: `web/landing/` — deployable static site with payment integration
+- **Team agents with real logic**: Engineering, research, marketing teams now use browser automation
+- **API key self-provisioning**: `agents/api_provisioner.py` — autonomous provider registration
+
+### Earlier Changes
 - **Webhook idempotency**: `processed_webhooks` table prevents double-processing
 - **Decimal support**: Financial precision via `_to_decimal` and `amount_decimal` properties
 - **Gumroad webhook verification**: HMAC-SHA256 signature verification

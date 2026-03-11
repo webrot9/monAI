@@ -181,11 +181,13 @@ class BTCPayProvider(PaymentProvider):
     async def handle_webhook(self, payload: bytes,
                              headers: dict[str, str]) -> WebhookEvent | None:
         """Parse BTCPay webhook event."""
-        if self.webhook_secret:
-            sig = headers.get("btcpay-sig", "")
-            if not self._verify_signature(payload, sig):
-                logger.warning("Invalid BTCPay webhook signature")
-                return None
+        if not self.webhook_secret:
+            logger.error("BTCPay webhook_secret not configured — rejecting webhook")
+            return None
+        sig = headers.get("btcpay-sig", "")
+        if not self._verify_signature(payload, sig):
+            logger.warning("Invalid BTCPay webhook signature")
+            return None
 
         try:
             event = json.loads(payload)

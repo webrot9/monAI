@@ -79,7 +79,7 @@ class GumroadProvider(PaymentProvider):
         """
         data = {
             "name": intent.product or "Digital Product",
-            "price": intent.amount_cents,
+            "price": intent.amount_cents,  # Gumroad API expects price in cents
         }
         if intent.metadata.get("description"):
             data["description"] = intent.metadata["description"]
@@ -164,12 +164,14 @@ class GumroadProvider(PaymentProvider):
         Gumroad sends form-encoded POST data on each sale.
         Verifies HMAC-SHA256 signature if webhook_secret is configured.
         """
-        # Verify signature if configured
-        if self.webhook_secret:
-            sig = headers.get("x-gumroad-signature", "")
-            if not self._verify_signature(payload, sig):
-                logger.warning("Invalid Gumroad webhook signature")
-                return None
+        # Verify signature — REQUIRED, reject if secret not configured
+        if not self.webhook_secret:
+            logger.error("Gumroad webhook_secret not configured — rejecting webhook")
+            return None
+        sig = headers.get("x-gumroad-signature", "")
+        if not self._verify_signature(payload, sig):
+            logger.warning("Invalid Gumroad webhook signature")
+            return None
 
         try:
             # Gumroad sends form-encoded data

@@ -292,6 +292,14 @@ class SweepEngine:
     async def sweep_brand(self, brand: str,
                           amount: float | None = None) -> SweepResult:
         """Manually trigger a sweep for a specific brand."""
+        # Validate amount if provided
+        if amount is not None and amount <= 0:
+            return SweepResult(
+                success=False,
+                error=f"Invalid sweep amount: {amount} (must be positive)",
+                status=SweepStatus.FAILED,
+            )
+
         flow = self.get_active_flow()
 
         if flow == "llc_contractor":

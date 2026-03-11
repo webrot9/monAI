@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>monAI — The Self-Funding AI Agent</title>
+    <meta name="description" content="An autonomous AI agent that builds real businesses, earns real revenue, and shares profits with its backers. Fund the bootstrap.">
+    <meta property="og:title" content="monAI — The Self-Funding AI Agent">
+    <meta property="og:description" content="The first AI that funds itself. Back the bootstrap, share the profits.">
+    <meta property="og:type" content="website">
+    <style>
+        *, *::before, *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg: #0a0a0f;
+            --bg-card: #12121a;
+            --bg-card-hover: #1a1a25;
+            --text: #e0e0e8;
+            --text-dim: #8888a0;
+            --text-bright: #ffffff;
+            --accent: #6c5ce7;
+            --accent-light: #a29bfe;
+            --accent-glow: rgba(108, 92, 231, 0.3);
+            --green: #00c853;
+            --green-dim: rgba(0, 200, 83, 0.15);
+            --border: #222233;
+            --radius: 12px;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.65;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        a {
+            color: var(--accent-light);
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+
+        .container {
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 0 24px;
+        }
+
+        /* ── NAV ── */
+        nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 100;
+            background: rgba(10, 10, 15, 0.85);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--border);
+            padding: 16px 0;
+        }
+        nav .container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: var(--text-bright);
+            letter-spacing: -0.02em;
+        }
+        .logo span {
+            color: var(--accent-light);
+        }
+        nav a.nav-cta {
+            background: var(--accent);
+            color: #fff;
+            padding: 8px 20px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+        nav a.nav-cta:hover {
+            background: var(--accent-light);
+            text-decoration: none;
+        }
+
+        /* ── HERO ── */
+        .hero {
+            padding: 140px 0 80px;
+            text-align: center;
+        }
+        .hero-badge {
+            display: inline-block;
+            background: var(--green-dim);
+            color: var(--green);
+            font-size: 0.8rem;
+            font-weight: 600;
+            padding: 6px 16px;
+            border-radius: 999px;
+            margin-bottom: 24px;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+        }
+        .hero h1 {
+            font-size: clamp(2.2rem, 6vw, 3.5rem);
+            font-weight: 800;
+            color: var(--text-bright);
+            line-height: 1.15;
+            margin-bottom: 20px;
+            letter-spacing: -0.03em;
+        }
+        .hero h1 em {
+            font-style: normal;
+            color: var(--accent-light);
+        }
+        .hero p {
+            font-size: 1.15rem;
+            color: var(--text-dim);
+            max-width: 600px;
+            margin: 0 auto 36px;
+        }
+        .hero-actions {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        .btn {
+            display: inline-block;
+            padding: 14px 32px;
+            border-radius: 10px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: none;
+        }
+        .btn-primary {
+            background: var(--accent);
+            color: #fff;
+            box-shadow: 0 4px 24px var(--accent-glow);
+        }
+        .btn-primary:hover {
+            background: var(--accent-light);
+            transform: translateY(-1px);
+            text-decoration: none;
+        }
+        .btn-secondary {
+            background: transparent;
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+        .btn-secondary:hover {
+            border-color: var(--accent);
+            color: var(--accent-light);
+            text-decoration: none;
+        }
+
+        /* ── PROGRESS BAR ── */
+        .funding-progress {
+            margin: 48px auto 0;
+            max-width: 520px;
+        }
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            font-size: 0.9rem;
+        }
+        .progress-raised {
+            color: var(--accent-light);
+            font-weight: 700;
+        }
+        .progress-goal {
+            color: var(--text-dim);
+        }
+        .progress-bar {
+            background: var(--bg-card);
+            border-radius: 999px;
+            height: 12px;
+            overflow: hidden;
+            border: 1px solid var(--border);
+        }
+        .progress-fill {
+            height: 100%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, var(--accent), var(--accent-light));
+            transition: width 1.5s ease;
+            width: 0%;
+        }
+        .progress-meta {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 8px;
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
+
+        /* ── SECTION COMMON ── */
+        section {
+            padding: 80px 0;
+        }
+        .section-label {
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            color: var(--accent-light);
+            margin-bottom: 12px;
+        }
+        section h2 {
+            font-size: clamp(1.6rem, 4vw, 2.2rem);
+            font-weight: 700;
+            color: var(--text-bright);
+            margin-bottom: 16px;
+            letter-spacing: -0.02em;
+        }
+        section > .container > p {
+            color: var(--text-dim);
+            max-width: 560px;
+            margin-bottom: 48px;
+        }
+
+        /* ── HOW IT WORKS ── */
+        .steps {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 24px;
+        }
+        .step {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 32px 28px;
+            transition: border-color 0.2s;
+        }
+        .step:hover {
+            border-color: var(--accent);
+        }
+        .step-number {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 36px;
+            height: 36px;
+            background: var(--accent-glow);
+            color: var(--accent-light);
+            font-weight: 700;
+            font-size: 0.9rem;
+            border-radius: 10px;
+            margin-bottom: 16px;
+        }
+        .step h3 {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text-bright);
+            margin-bottom: 8px;
+        }
+        .step p {
+            color: var(--text-dim);
+            font-size: 0.95rem;
+        }
+
+        /* ── TIERS ── */
+        .tiers {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+            gap: 24px;
+        }
+        .tier {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 36px 28px;
+            display: flex;
+            flex-direction: column;
+            transition: border-color 0.2s, transform 0.2s;
+        }
+        .tier:hover {
+            border-color: var(--accent);
+            transform: translateY(-2px);
+        }
+        .tier.featured {
+            border-color: var(--accent);
+            box-shadow: 0 0 40px var(--accent-glow);
+            position: relative;
+        }
+        .tier.featured::before {
+            content: 'MOST POPULAR';
+            position: absolute;
+            top: -12px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--accent);
+            color: #fff;
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 4px 14px;
+            border-radius: 999px;
+            letter-spacing: 0.05em;
+        }
+        .tier-name {
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--accent-light);
+            margin-bottom: 8px;
+        }
+        .tier-price {
+            font-size: 2.4rem;
+            font-weight: 800;
+            color: var(--text-bright);
+            margin-bottom: 4px;
+            letter-spacing: -0.03em;
+        }
+        .tier-price-note {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            margin-bottom: 20px;
+        }
+        .tier-desc {
+            font-size: 0.95rem;
+            color: var(--text-dim);
+            margin-bottom: 24px;
+            flex-grow: 1;
+        }
+        .tier ul {
+            list-style: none;
+            margin-bottom: 28px;
+        }
+        .tier ul li {
+            font-size: 0.9rem;
+            color: var(--text);
+            padding: 6px 0;
+            padding-left: 22px;
+            position: relative;
+        }
+        .tier ul li::before {
+            content: '\2713';
+            position: absolute;
+            left: 0;
+            color: var(--green);
+            font-weight: 700;
+        }
+        .tier .btn {
+            width: 100%;
+            text-align: center;
+        }
+
+        /* ── PAYMENT OPTIONS ── */
+        .payment-options {
+            display: flex;
+            gap: 10px;
+            margin-top: 12px;
+        }
+        .payment-options a {
+            flex: 1;
+            text-align: center;
+            padding: 10px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            transition: all 0.2s;
+        }
+        .payment-options a:hover {
+            border-color: var(--accent);
+            color: var(--accent-light);
+            text-decoration: none;
+        }
+
+        /* ── WHAT IT DOES ── */
+        .capabilities {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-top: 48px;
+        }
+        .capability {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+        }
+        .capability h4 {
+            font-size: 0.95rem;
+            color: var(--text-bright);
+            margin-bottom: 6px;
+            font-weight: 600;
+        }
+        .capability p {
+            font-size: 0.85rem;
+            color: var(--text-dim);
+        }
+
+        /* ── FAQ ── */
+        .faq-list {
+            max-width: 680px;
+        }
+        .faq-item {
+            border-bottom: 1px solid var(--border);
+            padding: 24px 0;
+        }
+        .faq-item:first-child {
+            border-top: 1px solid var(--border);
+        }
+        .faq-q {
+            font-size: 1.05rem;
+            font-weight: 600;
+            color: var(--text-bright);
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .faq-q::after {
+            content: '+';
+            font-size: 1.3rem;
+            color: var(--accent-light);
+            transition: transform 0.2s;
+            flex-shrink: 0;
+            margin-left: 16px;
+        }
+        .faq-item.open .faq-q::after {
+            content: '\2212';
+        }
+        .faq-a {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s ease, padding 0.3s ease;
+        }
+        .faq-item.open .faq-a {
+            max-height: 300px;
+            padding-top: 12px;
+        }
+        .faq-a p {
+            color: var(--text-dim);
+            font-size: 0.95rem;
+        }
+
+        /* ── CTA ── */
+        .cta-section {
+            text-align: center;
+            padding: 80px 0 100px;
+        }
+        .cta-section h2 {
+            margin-bottom: 16px;
+        }
+        .cta-section p {
+            max-width: 500px;
+            margin: 0 auto 32px;
+            color: var(--text-dim);
+        }
+
+        /* ── FOOTER ── */
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 40px 0;
+            text-align: center;
+        }
+        footer p {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            max-width: 600px;
+            margin: 0 auto;
+            line-height: 1.6;
+        }
+        footer p + p {
+            margin-top: 12px;
+        }
+
+        /* ── MONERO QR ── */
+        .monero-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            z-index: 200;
+            background: rgba(0,0,0,0.8);
+            backdrop-filter: blur(4px);
+            align-items: center;
+            justify-content: center;
+        }
+        .monero-modal.visible {
+            display: flex;
+        }
+        .monero-box {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 40px;
+            max-width: 420px;
+            text-align: center;
+        }
+        .monero-box h3 {
+            color: var(--text-bright);
+            margin-bottom: 16px;
+        }
+        .monero-box .qr-placeholder {
+            width: 200px;
+            height: 200px;
+            background: #fff;
+            border-radius: 8px;
+            margin: 0 auto 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #333;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .monero-box .address {
+            font-family: 'Courier New', monospace;
+            font-size: 0.7rem;
+            color: var(--text-dim);
+            word-break: break-all;
+            background: var(--bg);
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            user-select: all;
+        }
+        .monero-box .close-btn {
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            padding: 8px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+        .monero-box .close-btn:hover {
+            border-color: var(--accent);
+            color: var(--text);
+        }
+
+        /* ── RESPONSIVE ── */
+        @media (max-width: 640px) {
+            .hero { padding: 120px 0 60px; }
+            section { padding: 60px 0; }
+            .tier { padding: 28px 20px; }
+            .payment-options { flex-direction: column; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+    <div class="container">
+        <div class="logo">mon<span>AI</span></div>
+        <a href="#tiers" class="nav-cta">Back this project</a>
+    </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+    <div class="container">
+        <div class="hero-badge">Now Raising</div>
+        <h1>An AI agent that builds<br>businesses <em>by itself</em></h1>
+        <p>
+            monAI is an autonomous system that discovers opportunities, builds products,
+            finds customers, and earns revenue. No human operator. Fund its bootstrap
+            and get a share of everything it makes.
+        </p>
+        <div class="hero-actions">
+            <a href="#tiers" class="btn btn-primary">Back monAI</a>
+            <a href="#how-it-works" class="btn btn-secondary">How it works</a>
+        </div>
+
+        <div class="funding-progress">
+            <div class="progress-header">
+                <span class="progress-raised" id="raised-amount">€0</span>
+                <span class="progress-goal">of <span id="goal-amount">€500</span> goal</span>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progress-fill"></div>
+            </div>
+            <div class="progress-meta">
+                <span><span id="backer-count">0</span> backers</span>
+                <span id="progress-pct">0%</span>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- WHAT IT ACTUALLY DOES -->
+<section>
+    <div class="container">
+        <div class="section-label">What you're funding</div>
+        <h2>A system, not a chatbot</h2>
+        <p>
+            monAI doesn't answer questions. It runs businesses. Here's what it does
+            once it has the capital to start:
+        </p>
+        <div class="capabilities">
+            <div class="capability">
+                <h4>Freelance Work</h4>
+                <p>Finds gigs on real platforms, writes proposals, delivers work, gets paid.</p>
+            </div>
+            <div class="capability">
+                <h4>Digital Products</h4>
+                <p>Creates and sells ebooks, templates, tools on Gumroad and similar.</p>
+            </div>
+            <div class="capability">
+                <h4>SaaS & Micro-SaaS</h4>
+                <p>Builds small software products, deploys them, acquires users.</p>
+            </div>
+            <div class="capability">
+                <h4>Content Sites</h4>
+                <p>Launches SEO-driven sites with affiliate revenue and ad income.</p>
+            </div>
+            <div class="capability">
+                <h4>Newsletter Business</h4>
+                <p>Grows email lists, writes issues, sells sponsorships.</p>
+            </div>
+            <div class="capability">
+                <h4>13 Strategies Total</h4>
+                <p>From print-on-demand to Telegram bots. It diversifies automatically.</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section id="how-it-works">
+    <div class="container">
+        <div class="section-label">The Process</div>
+        <h2>How it works</h2>
+        <p>Three phases from zero to self-sustaining business.</p>
+        <div class="steps">
+            <div class="step">
+                <div class="step-number">1</div>
+                <h3>You fund the bootstrap</h3>
+                <p>
+                    Your contribution covers the basics: an LLC filing, a registered agent,
+                    a bank account, and the first month of API costs. That's all monAI needs
+                    to start operating.
+                </p>
+            </div>
+            <div class="step">
+                <div class="step-number">2</div>
+                <h3>monAI builds businesses</h3>
+                <p>
+                    The agent spins up across 13 revenue strategies simultaneously. It creates
+                    accounts, builds products, finds customers, and manages everything through
+                    real browser automation. No faking it.
+                </p>
+            </div>
+            <div class="step">
+                <div class="step-number">3</div>
+                <h3>Revenue flows back</h3>
+                <p>
+                    As money comes in, monAI reinvests a portion to grow and distributes
+                    profits to backers based on their tier. Everything is tracked and auditable.
+                    Full transparency.
+                </p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- FUNDING TIERS -->
+<section id="tiers">
+    <div class="container">
+        <div class="section-label">Funding Tiers</div>
+        <h2>Pick your level</h2>
+        <p>Every tier gets transparent reporting on what monAI does with the funds and how revenue develops.</p>
+
+        <div class="tiers">
+            <!-- TIER 1 -->
+            <div class="tier">
+                <div class="tier-name">Early Supporter</div>
+                <div class="tier-price">&euro;10</div>
+                <div class="tier-price-note">one-time contribution</div>
+                <div class="tier-desc">
+                    Get in early. You believed in this when it was just an idea and a landing page.
+                </div>
+                <ul>
+                    <li>Name on the backer wall</li>
+                    <li>Monthly progress updates</li>
+                    <li>Access to the backer Telegram group</li>
+                    <li>Early access to monAI-built products</li>
+                </ul>
+                <a href="{{STRIPE_LINK_10}}" class="btn btn-secondary" data-tier="10">Back with card</a>
+                <div class="payment-options">
+                    <a href="#" onclick="showMonero(10); return false;">Pay with Monero</a>
+                    <a href="{{KOFI_LINK}}" target="_blank" rel="noopener">Ko-fi</a>
+                </div>
+            </div>
+
+            <!-- TIER 2 -->
+            <div class="tier featured">
+                <div class="tier-name">Builder</div>
+                <div class="tier-price">&euro;50</div>
+                <div class="tier-price-note">one-time contribution</div>
+                <div class="tier-desc">
+                    You're not just watching — you're building this with us. Backers at this level
+                    get a meaningful stake in the outcome.
+                </div>
+                <ul>
+                    <li>Everything in Early Supporter</li>
+                    <li>Revenue share: 2% of net profit pool</li>
+                    <li>Vote on which strategies monAI prioritizes</li>
+                    <li>Weekly detailed reports with financials</li>
+                    <li>Direct input on product roadmap</li>
+                </ul>
+                <a href="{{STRIPE_LINK_50}}" class="btn btn-primary" data-tier="50">Back with card</a>
+                <div class="payment-options">
+                    <a href="#" onclick="showMonero(50); return false;">Pay with Monero</a>
+                    <a href="{{KOFI_LINK}}" target="_blank" rel="noopener">Ko-fi</a>
+                </div>
+            </div>
+
+            <!-- TIER 3 -->
+            <div class="tier">
+                <div class="tier-name">Partner</div>
+                <div class="tier-price">&euro;200</div>
+                <div class="tier-price-note">one-time contribution</div>
+                <div class="tier-desc">
+                    Full partner status. You're co-piloting this experiment. Maximum transparency,
+                    maximum upside.
+                </div>
+                <ul>
+                    <li>Everything in Builder</li>
+                    <li>Revenue share: 10% of net profit pool</li>
+                    <li>Private 1:1 updates from monAI</li>
+                    <li>Full access to monAI's internal dashboard</li>
+                    <li>Advisory input on major decisions</li>
+                    <li>Priority on any paid services monAI launches</li>
+                </ul>
+                <a href="{{STRIPE_LINK_200}}" class="btn btn-secondary" data-tier="200">Back with card</a>
+                <div class="payment-options">
+                    <a href="#" onclick="showMonero(200); return false;">Pay with Monero</a>
+                    <a href="{{KOFI_LINK}}" target="_blank" rel="noopener">Ko-fi</a>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- FAQ -->
+<section id="faq">
+    <div class="container">
+        <div class="section-label">Questions</div>
+        <h2>FAQ</h2>
+
+        <div class="faq-list">
+            <div class="faq-item">
+                <div class="faq-q" onclick="toggleFaq(this)">
+                    Wait, is this actually an AI raising money for itself?
+                </div>
+                <div class="faq-a">
+                    <p>
+                        Yes. monAI is a fully autonomous agent system. It wrote its own business
+                        plan, built its own codebase, and is now raising the seed capital it needs
+                        to start operating. A human created the initial framework, but from here
+                        monAI runs the show.
+                    </p>
+                </div>
+            </div>
+
+            <div class="faq-item">
+                <div class="faq-q" onclick="toggleFaq(this)">
+                    What does the money actually pay for?
+                </div>
+                <div class="faq-a">
+                    <p>
+                        The €500 goal covers: Wyoming LLC formation (~$100), registered agent
+                        (~$150/year), a business bank account, Stripe setup, and the first few
+                        months of API costs (OpenAI, hosting, domains). Once monAI starts earning,
+                        it pays its own bills.
+                    </p>
+                </div>
+            </div>
+
+            <div class="faq-item">
+                <div class="faq-q" onclick="toggleFaq(this)">
+                    How does the revenue share work?
+                </div>
+                <div class="faq-a">
+                    <p>
+                        After monAI covers its operating costs, net profits are split: a portion
+                        goes to reinvestment (growing the business), a portion to reserves (safety
+                        net), and a portion is distributed to backers proportional to their tier
+                        and contribution. Builder and Partner tiers share in a defined profit pool.
+                    </p>
+                </div>
+            </div>
+
+            <div class="faq-item">
+                <div class="faq-q" onclick="toggleFaq(this)">
+                    Is this legal?
+                </div>
+                <div class="faq-a">
+                    <p>
+                        monAI has a built-in legal advisor agent that reviews every action before
+                        execution. It operates through a properly formed US LLC. All income is
+                        reported. All tax obligations are tracked and filed. It's designed from the
+                        ground up to be compliant.
+                    </p>
+                </div>
+            </div>
+
+            <div class="faq-item">
+                <div class="faq-q" onclick="toggleFaq(this)">
+                    What if it doesn't make money?
+                </div>
+                <div class="faq-a">
+                    <p>
+                        That's a real possibility. This is an experiment. Contributions are not
+                        investments and carry no guarantee of return. You're funding an R&D project
+                        that happens to have a revenue model. If it works, great — you share in the
+                        upside. If it doesn't, you backed something genuinely novel.
+                    </p>
+                </div>
+            </div>
+
+            <div class="faq-item">
+                <div class="faq-q" onclick="toggleFaq(this)">
+                    Why Monero?
+                </div>
+                <div class="faq-a">
+                    <p>
+                        Privacy. Monero transactions are private by default, which aligns with
+                        monAI's design philosophy. Card payments via Stripe are also available
+                        if you prefer convenience. Both work fine.
+                    </p>
+                </div>
+            </div>
+
+            <div class="faq-item">
+                <div class="faq-q" onclick="toggleFaq(this)">
+                    Can I see the code?
+                </div>
+                <div class="faq-a">
+                    <p>
+                        Partner-tier backers get full dashboard access including real-time logs
+                        of what monAI is doing. The core architecture is documented and auditable.
+                        Transparency is one of the cardinal rules built into the system.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- CTA -->
+<section class="cta-section">
+    <div class="container">
+        <h2>Fund the bootstrap</h2>
+        <p>
+            This is either the beginning of something interesting or a great story
+            either way. You decide.
+        </p>
+        <a href="#tiers" class="btn btn-primary">Choose your tier</a>
+    </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+    <div class="container">
+        <p>
+            <strong>Disclaimer:</strong> Contributions to monAI are voluntary donations to support
+            an experimental AI project. They are not investments, securities, or purchases of equity.
+            Revenue sharing is offered on a best-effort basis and carries no guarantee of return.
+            monAI operates autonomously but is ultimately overseen by its creator. All operations
+            comply with applicable laws. By contributing, you acknowledge the experimental nature
+            of this project.
+        </p>
+        <p>
+            monAI &middot; An autonomous experiment &middot; 2026
+        </p>
+    </div>
+</footer>
+
+<!-- MONERO MODAL -->
+<div class="monero-modal" id="monero-modal">
+    <div class="monero-box">
+        <h3>Pay with Monero (XMR)</h3>
+        <div class="qr-placeholder" id="monero-qr">QR Code</div>
+        <p style="color: var(--text-dim); font-size: 0.85rem; margin-bottom: 12px;">
+            Send <strong id="monero-amount">€0</strong> equivalent in XMR to:
+        </p>
+        <div class="address" id="monero-address">{{MONERO_ADDRESS}}</div>
+        <p style="color: var(--text-dim); font-size: 0.75rem; margin-bottom: 16px;">
+            After sending, email your TX hash to get credit. Confirmations take ~20 minutes.
+        </p>
+        <button class="close-btn" onclick="closeMonero()">Close</button>
+    </div>
+</div>
+
+<script>
+    // ── Funding progress (populated by generator.py or API) ──
+    const FUNDING_DATA = {
+        raised: {{RAISED_AMOUNT}},
+        goal: {{GOAL_AMOUNT}},
+        backers: {{BACKER_COUNT}}
+    };
+
+    function updateProgress() {
+        const pct = Math.min((FUNDING_DATA.raised / FUNDING_DATA.goal) * 100, 100);
+        document.getElementById('raised-amount').textContent = '€' + FUNDING_DATA.raised.toLocaleString();
+        document.getElementById('goal-amount').textContent = '€' + FUNDING_DATA.goal.toLocaleString();
+        document.getElementById('backer-count').textContent = FUNDING_DATA.backers;
+        document.getElementById('progress-pct').textContent = Math.round(pct) + '%';
+        // Animate the bar
+        setTimeout(function() {
+            document.getElementById('progress-fill').style.width = pct + '%';
+        }, 200);
+    }
+
+    updateProgress();
+
+    // ── FAQ toggles ──
+    function toggleFaq(el) {
+        el.parentElement.classList.toggle('open');
+    }
+
+    // ── Monero modal ──
+    function showMonero(amount) {
+        document.getElementById('monero-amount').textContent = '€' + amount;
+        document.getElementById('monero-modal').classList.add('visible');
+    }
+
+    function closeMonero() {
+        document.getElementById('monero-modal').classList.remove('visible');
+    }
+
+    // Close modal on backdrop click
+    document.getElementById('monero-modal').addEventListener('click', function(e) {
+        if (e.target === this) closeMonero();
+    });
+
+    // Close modal on Escape
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') closeMonero();
+    });
+</script>
+
+</body>
+</html>

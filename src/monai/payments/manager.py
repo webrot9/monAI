@@ -201,34 +201,38 @@ class UnifiedPaymentManager:
 
     # ── Webhook Event Processing ────────────────────────────────
 
-    def _is_duplicate_webhook(self, provider: str, event_id: str) -> bool:
-        """Check if this webhook event was already processed (idempotency)."""
-        if not event_id:
-            return False
-        try:
-            self.db.execute_insert(
-                "INSERT INTO processed_webhooks (provider, event_id) VALUES (?, ?)",
-                (provider, event_id),
-            )
-            return False  # Successfully inserted — first time seeing this event
-        except Exception:
-            return True  # UNIQUE constraint violated — duplicate
-
     async def _handle_webhook_event(self, event: WebhookEvent) -> None:
         """Process a parsed webhook event — record payment in DB.
 
-        Uses idempotency check to prevent double-processing of webhooks.
+        Uses ATOMIC idempotency check: the INSERT into processed_webhooks
+        and webhook_events happens in a single transaction to prevent
+        race conditions from concurrent webhook deliveries.
         """
-        # Idempotency: derive a unique event ID from provider + payment_ref + event_type
         event_id = f"{event.payment_ref}:{event.event_type.value}"
-        if self._is_duplicate_webhook(event.provider, event_id):
-            logger.info(
-                f"Duplicate webhook ignored: {event.provider}/{event_id}"
-            )
+        if not event_id or not event.payment_ref:
+            logger.warning("Webhook missing payment_ref — ignoring")
             return
 
-        # Log the event atomically with processing
-        with self.db.connect() as conn:
+        # Validate webhook amount (reject obviously wrong values)
+        if event.amount < 0:
+            logger.error(f"Webhook with negative amount rejected: {event.amount}")
+            return
+        if event.amount > 1_000_000:  # €1M safety cap per single webhook
+            logger.error(f"Webhook with suspicious amount rejected: {event.amount}")
+            return
+
+        # ATOMIC: idempotency check + event log in single transaction
+        with self.db.transaction() as conn:
+            try:
+                conn.execute(
+                    "INSERT INTO processed_webhooks (provider, event_id) VALUES (?, ?)",
+                    (event.provider, event_id),
+                )
+            except Exception:
+                # UNIQUE constraint violated — duplicate webhook
+                logger.info(f"Duplicate webhook ignored: {event.provider}/{event_id}")
+                return
+
             conn.execute(
                 "INSERT INTO webhook_events "
                 "(provider, event_type, payment_ref, amount, currency, brand, raw_payload) "
@@ -279,50 +283,94 @@ class UnifiedPaymentManager:
             except (ValueError, TypeError):
                 lead_id = None
 
-        pay_id = self.brand_payments.record_payment(
-            brand=brand,
-            account_id=account_id,
-            amount=event.amount,
-            product=event.product,
-            customer_email=event.customer_email,
-            payment_ref=event.payment_ref,
-            lead_id=lead_id,
-            currency=event.currency,
-        )
+        # Record payment + fee atomically in a single transaction
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO brand_payments_received "
+                "(brand, account_id, lead_id, amount, currency, product, "
+                "customer_email, payment_ref) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (brand, account_id, lead_id, event.amount, event.currency,
+                 event.product, event.customer_email, event.payment_ref),
+            )
+            pay_id = cursor.lastrowid
 
-        # Auto-record platform fees
-        self.brand_payments.record_platform_fee(
-            brand=brand,
-            provider=event.provider,
-            payment_id=pay_id,
-            gross_amount=event.amount,
-            fee_currency=event.currency,
-        )
+            # Auto-record platform fees in same transaction
+            rates = self.brand_payments.PLATFORM_FEE_RATES.get(event.provider)
+            if rates:
+                from decimal import Decimal
+                gross = Decimal(str(event.amount))
+                fee_amount = float(
+                    gross * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"]))
+                )
+                fee_currency = event.currency  # Fee in same currency as payment
+            else:
+                fee_amount = 0.0
+                fee_currency = event.currency
+
+            conn.execute(
+                "INSERT INTO platform_fees "
+                "(brand, provider, payment_id, gross_amount, fee_amount, fee_currency) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (brand, event.provider, pay_id, event.amount, fee_amount, fee_currency),
+            )
 
         logger.info(
             f"Payment recorded: {brand} received {event.amount} {event.currency} "
-            f"via {event.provider} for '{event.product}'"
+            f"via {event.provider} for '{event.product}' (fee: {fee_amount:.2f} {fee_currency})"
         )
 
     async def _handle_payment_refunded(self, event: WebhookEvent) -> None:
-        """Handle a refund."""
-        # Find the payment by ref and refund it
+        """Handle a refund — mark payment and check if sweep already occurred."""
         payments = self.db.execute(
-            "SELECT id FROM brand_payments_received WHERE payment_ref = ? LIMIT 1",
+            "SELECT id, brand, amount, currency FROM brand_payments_received "
+            "WHERE payment_ref = ? LIMIT 1",
             (event.payment_ref,),
         )
-        if payments:
-            self.brand_payments.refund_payment(payments[0]["id"])
-            logger.info(f"Payment refunded: {event.payment_ref}")
+        if not payments:
+            logger.warning(f"Refund for unknown payment: {event.payment_ref}")
+            return
+
+        payment = dict(payments[0])
+        self.brand_payments.refund_payment(payment["id"])
+
+        # Check if this brand's funds were already swept to creator
+        swept = self.db.execute(
+            "SELECT id, status, tx_reference FROM brand_profit_sweeps "
+            "WHERE brand = ? AND status = 'completed' "
+            "ORDER BY completed_at DESC LIMIT 1",
+            (payment["brand"],),
+        )
+        if swept:
+            logger.critical(
+                f"REFUND AFTER SWEEP: Payment {event.payment_ref} for "
+                f"{payment['amount']} {payment['currency']} was already swept. "
+                f"Brand {payment['brand']} has NEGATIVE sweepable balance. "
+                f"Manual intervention required."
+            )
+
+        logger.info(f"Payment refunded: {event.payment_ref}")
 
     async def _handle_payment_disputed(self, event: WebhookEvent) -> None:
-        """Handle a dispute."""
-        self.db.execute(
-            "UPDATE brand_payments_received SET status = 'disputed' "
-            "WHERE payment_ref = ?",
+        """Handle a dispute — mark and alert."""
+        payments = self.db.execute(
+            "SELECT id, brand, amount, currency FROM brand_payments_received "
+            "WHERE payment_ref = ? LIMIT 1",
             (event.payment_ref,),
         )
-        logger.warning(f"Payment disputed: {event.payment_ref}")
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE brand_payments_received SET status = 'disputed' "
+                "WHERE payment_ref = ?",
+                (event.payment_ref,),
+            )
+
+        brand = dict(payments[0])["brand"] if payments else "unknown"
+        amount = dict(payments[0])["amount"] if payments else 0
+        logger.critical(
+            f"PAYMENT DISPUTED: {event.payment_ref} — {amount} from brand {brand}. "
+            f"Action required: respond to dispute within deadline."
+        )
 
     # ── Health & Status ─────────────────────────────────────────
 

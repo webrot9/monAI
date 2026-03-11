@@ -424,12 +424,12 @@ class BrandPayments:
 
     # ── Platform Fee Tracking ─────────────────────────────────
 
-    # Standard platform fee rates
+    # Standard platform fee rates — fee always in SAME currency as payment
     PLATFORM_FEE_RATES = {
-        "stripe": {"rate": 0.029, "fixed": 0.30, "currency": "EUR"},
-        "gumroad": {"rate": 0.10, "fixed": 0.0, "currency": "USD"},
-        "lemonsqueezy": {"rate": 0.05, "fixed": 0.50, "currency": "USD"},
-        "paypal": {"rate": 0.029, "fixed": 0.30, "currency": "EUR"},
+        "stripe": {"rate": 0.029, "fixed": 0.30},
+        "gumroad": {"rate": 0.10, "fixed": 0.0},
+        "lemonsqueezy": {"rate": 0.05, "fixed": 0.50},
+        "paypal": {"rate": 0.029, "fixed": 0.30},
     }
 
     def record_platform_fee(self, brand: str, provider: str,
@@ -439,6 +439,7 @@ class BrandPayments:
         """Record a platform fee for a payment.
 
         If fee_amount is not provided, calculates from standard rates.
+        Fee currency always matches the payment currency (fee_currency param).
         """
         if fee_amount is None:
             rates = self.PLATFORM_FEE_RATES.get(provider)
@@ -446,7 +447,7 @@ class BrandPayments:
                 from decimal import Decimal
                 gross = Decimal(str(gross_amount))
                 fee_amount = float(gross * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"])))
-                fee_currency = rates["currency"]
+                # fee_currency stays as passed in — matches the payment currency
             else:
                 fee_amount = 0.0
 

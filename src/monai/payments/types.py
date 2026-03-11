@@ -45,6 +45,10 @@ def _to_decimal(value: float | int | str | Decimal) -> Decimal:
     return Decimal(str(value))
 
 
+MIN_PAYMENT_AMOUNT = 0.01  # Minimum payment: 1 cent
+MAX_PAYMENT_AMOUNT = 100_000.00  # Safety cap: €100k per single payment
+
+
 @dataclass
 class PaymentIntent:
     """Request to create a payment link or invoice."""
@@ -54,6 +58,21 @@ class PaymentIntent:
     customer_email: str = ""
     brand: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Validate payment amount on creation."""
+        if not isinstance(self.amount, (int, float)):
+            raise ValueError(f"Payment amount must be a number, got {type(self.amount).__name__}")
+        if self.amount != self.amount:  # NaN check
+            raise ValueError("Payment amount cannot be NaN")
+        if self.amount < MIN_PAYMENT_AMOUNT:
+            raise ValueError(
+                f"Payment amount {self.amount} below minimum {MIN_PAYMENT_AMOUNT}"
+            )
+        if self.amount > MAX_PAYMENT_AMOUNT:
+            raise ValueError(
+                f"Payment amount {self.amount} exceeds maximum {MAX_PAYMENT_AMOUNT}"
+            )
 
     @property
     def amount_decimal(self) -> Decimal:

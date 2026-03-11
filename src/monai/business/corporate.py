@@ -309,7 +309,8 @@ class CorporateManager:
         if contractor["rate_type"] == "percentage":
             # Sum revenue for this entity's brands in the period
             total_revenue = self._get_period_revenue(entity_id, period_start, period_end)
-            amount = total_revenue * (contractor["rate_percentage"] / 100)
+            rate_pct = min(contractor["rate_percentage"], 100.0)  # Cap at 100%
+            amount = total_revenue * (rate_pct / 100)
             line_items = [{
                 "description": f"Consulting services ({contractor['rate_percentage']}% of revenue)",
                 "quantity": 1,

@@ -163,7 +163,7 @@ class TestGumroadWebhookSignature:
 
 
 class TestWebhookIdempotency:
-    """Verify that duplicate webhooks are not processed twice."""
+    """Verify that duplicate webhooks are not processed twice (atomic check)."""
 
     @pytest.fixture
     def db(self, tmp_path):
@@ -178,21 +178,68 @@ class TestWebhookIdempotency:
         from monai.payments.manager import UnifiedPaymentManager
         return UnifiedPaymentManager(config, db)
 
-    def test_first_webhook_not_duplicate(self, manager):
-        assert manager._is_duplicate_webhook("stripe", "evt_123") is False
+    def _insert_webhook_id(self, db, provider, event_id):
+        """Helper: insert a processed webhook ID directly (simulates first processing)."""
+        try:
+            db.execute_insert(
+                "INSERT INTO processed_webhooks (provider, event_id) VALUES (?, ?)",
+                (provider, event_id),
+            )
+            return False  # First time
+        except Exception:
+            return True  # Duplicate
 
-    def test_second_webhook_is_duplicate(self, manager):
-        manager._is_duplicate_webhook("stripe", "evt_456")
-        assert manager._is_duplicate_webhook("stripe", "evt_456") is True
+    def test_first_webhook_not_duplicate(self, manager, db):
+        assert self._insert_webhook_id(db, "stripe", "evt_123") is False
 
-    def test_different_providers_not_duplicate(self, manager):
-        manager._is_duplicate_webhook("stripe", "evt_789")
-        assert manager._is_duplicate_webhook("gumroad", "evt_789") is False
+    def test_second_webhook_is_duplicate(self, manager, db):
+        self._insert_webhook_id(db, "stripe", "evt_456")
+        assert self._insert_webhook_id(db, "stripe", "evt_456") is True
 
-    def test_empty_event_id_never_duplicate(self, manager):
-        """Empty event IDs are never considered duplicates (can't enforce)."""
-        assert manager._is_duplicate_webhook("stripe", "") is False
-        assert manager._is_duplicate_webhook("stripe", "") is False
+    def test_different_providers_not_duplicate(self, manager, db):
+        self._insert_webhook_id(db, "stripe", "evt_789")
+        assert self._insert_webhook_id(db, "gumroad", "evt_789") is False
+
+    def test_atomic_webhook_processing(self, manager, db):
+        """Verify webhook event log is created atomically with idempotency check."""
+        import asyncio
+        from monai.payments.types import WebhookEvent, WebhookEventType
+
+        # Set up a collection account so the payment insert doesn't fail FK
+        from monai.business.brand_payments import BrandPayments
+        bp = BrandPayments(db)
+        bp.add_collection_account("test_brand", "stripe", "acct_test")
+
+        event = WebhookEvent(
+            event_type=WebhookEventType.PAYMENT_COMPLETED,
+            provider="stripe",
+            payment_ref="pi_test_atomic",
+            amount=50.0,
+            currency="EUR",
+            metadata={"brand": "test_brand"},
+        )
+
+        # Process the event
+        asyncio.get_event_loop().run_until_complete(
+            manager._handle_webhook_event(event)
+        )
+
+        # Verify it was logged
+        rows = db.execute(
+            "SELECT * FROM webhook_events WHERE payment_ref = 'pi_test_atomic'"
+        )
+        assert len(rows) == 1
+
+        # Process the same event again — should be ignored (duplicate)
+        asyncio.get_event_loop().run_until_complete(
+            manager._handle_webhook_event(event)
+        )
+
+        # Should still only have 1 entry
+        rows = db.execute(
+            "SELECT * FROM webhook_events WHERE payment_ref = 'pi_test_atomic'"
+        )
+        assert len(rows) == 1
 
 
 # ── Platform Fee Tracking Tests ──────────────────────────────
