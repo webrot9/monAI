@@ -28,10 +28,15 @@
 - [x] Double-entry bookkeeping GeneralLedger (chart of accounts, journal, balance sheet, P&L)
 - [x] Ledger integrity verification in orchestrator cycle (Phase 6.95)
 - [x] 20 new tests for GeneralLedger (1114 total tests, all passing)
+- [x] Wire GeneralLedger into webhook handler (auto GL entries on payments/refunds)
+- [x] Wire GeneralLedger into sweep engine (auto GL entries on sweeps)
+- [x] Ko-fi campaign automation (KofiCampaignManager agent, wired into orchestrator)
+- [x] E2E payment flow tests (13 tests: webhook→GL→sweep→GL→balanced books)
+- [x] Research already wired into opportunity discovery (verified)
+- [x] Total: 1135 tests, all passing
 
 ## Next Up
-- [ ] Ko-fi campaign setup automation
-- [ ] End-to-end integration tests for the full payment flow
-- [ ] Research wiring into opportunity discovery
-- [ ] Wire GeneralLedger into webhook handler (auto-create GL entries on payments)
-- [ ] Wire GeneralLedger into sweep engine (auto-create GL entries on sweeps)
+- [ ] First real deployment test (end-to-end with a real Ko-fi page)
+- [ ] Wire GeneralLedger into bootstrap wallet (track seed capital in GL)
+- [ ] Automated financial reporting (monthly P&L + balance sheet via Telegram)
+- [ ] Strategy agent performance dashboards

@@ -41,9 +41,10 @@ class UnifiedPaymentManager:
     6. Health monitoring — check all providers are operational
     """
 
-    def __init__(self, config: Config, db: Database):
+    def __init__(self, config: Config, db: Database, ledger=None):
         self.config = config
         self.db = db
+        self.ledger = ledger  # GeneralLedger for double-entry bookkeeping
         self.brand_payments = BrandPayments(db)
         self.sweep_engine = SweepEngine(config, db)
         self.webhook_server = WebhookServer()
@@ -229,6 +230,21 @@ class UnifiedPaymentManager:
                           amount: float | None = None) -> dict[str, Any]:
         """Manually trigger a sweep for a specific brand."""
         result = await self.sweep_engine.sweep_brand(brand, amount)
+
+        # Record sweep in GL
+        if result.success and result.amount_crypto > 0 and self.ledger:
+            try:
+                self.ledger.record_sweep(
+                    amount=result.amount_crypto,
+                    from_account="1050",  # Cash - Monero
+                    description=f"Sweep to creator: {brand} ({result.tx_hash or 'n/a'})",
+                    reference=result.tx_hash or "",
+                    source="sweep_engine",
+                    brand=brand,
+                )
+            except Exception as e:
+                logger.error(f"Failed to record GL sweep for {brand}: {e}")
+
         return {
             "success": result.success,
             "tx_hash": result.tx_hash,
@@ -375,6 +391,65 @@ class UnifiedPaymentManager:
             f"via {event.provider} for '{event.product}' (fee: {fee_amount:.2f} {fee_currency})"
         )
 
+        # Record in double-entry ledger
+        self._record_payment_gl(brand, event, fee_amount)
+
+    def _record_payment_gl(self, brand: str, event: WebhookEvent,
+                           fee_amount: float) -> None:
+        """Record a payment in the general ledger (double-entry)."""
+        if not self.ledger:
+            return
+        # Round to 2 decimal places to avoid floating-point balance mismatches
+        fee_amount = round(fee_amount, 2)
+        try:
+            # Map provider to cash account
+            cash_accounts = {
+                "stripe": "1010",
+                "gumroad": "1020",
+                "lemonsqueezy": "1030",
+                "btcpay": "1040",
+                "crypto_xmr": "1050",
+            }
+            cash_acct = cash_accounts.get(event.provider, "1000")
+
+            # Determine revenue account based on product type
+            revenue_acct = "4900"  # Default: other revenue
+            product = (event.product or "").lower()
+            if any(w in product for w in ("service", "freelance", "consult")):
+                revenue_acct = "4000"
+            elif any(w in product for w in ("ebook", "template", "digital", "download")):
+                revenue_acct = "4100"
+            elif any(w in product for w in ("subscription", "saas", "plan")):
+                revenue_acct = "4200"
+            elif any(w in product for w in ("affiliate", "referral")):
+                revenue_acct = "4300"
+
+            if fee_amount > 0:
+                self.ledger.record_platform_fee(
+                    gross=event.amount,
+                    fee=fee_amount,
+                    revenue_account=revenue_acct,
+                    cash_account=cash_acct,
+                    description=f"Payment via {event.provider}: {event.product or 'sale'}",
+                    currency=event.currency,
+                    reference=event.payment_ref,
+                    source="webhook",
+                    brand=brand,
+                )
+            else:
+                self.ledger.record_revenue(
+                    amount=event.amount,
+                    revenue_account=revenue_acct,
+                    cash_account=cash_acct,
+                    description=f"Payment via {event.provider}: {event.product or 'sale'}",
+                    currency=event.currency,
+                    reference=event.payment_ref,
+                    source="webhook",
+                    brand=brand,
+                )
+        except Exception as e:
+            logger.error(f"Failed to record GL entry for payment {event.payment_ref}: {e}")
+
     async def _handle_payment_refunded(self, event: WebhookEvent) -> None:
         """Handle a refund — mark payment and check if sweep already occurred."""
         payments = self.db.execute(
@@ -403,6 +478,30 @@ class UnifiedPaymentManager:
                 f"Brand {payment['brand']} has NEGATIVE sweepable balance. "
                 f"Manual intervention required."
             )
+
+        # Record refund in GL (reverse the original entry)
+        if self.ledger and payment:
+            try:
+                cash_accounts = {
+                    "stripe": "1010", "gumroad": "1020",
+                    "lemonsqueezy": "1030", "btcpay": "1040", "crypto_xmr": "1050",
+                }
+                cash_acct = cash_accounts.get(event.provider, "1000")
+                self.ledger.record_entry(
+                    date=__import__("datetime").datetime.now().strftime("%Y-%m-%d"),
+                    description=f"Refund: {event.payment_ref}",
+                    lines=[
+                        {"account_code": "4900", "debit": payment["amount"],
+                         "currency": payment["currency"], "memo": "Refund reversal"},
+                        {"account_code": cash_acct, "credit": payment["amount"],
+                         "currency": payment["currency"]},
+                    ],
+                    reference=event.payment_ref,
+                    source="webhook_refund",
+                    brand=payment["brand"],
+                )
+            except Exception as e:
+                logger.error(f"Failed to record GL refund for {event.payment_ref}: {e}")
 
         logger.info(f"Payment refunded: {event.payment_ref}")
 

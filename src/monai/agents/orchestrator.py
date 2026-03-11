@@ -41,6 +41,7 @@ from monai.business.bootstrap import BootstrapWallet
 from monai.business.crm import CRM
 from monai.business.email_marketing import EmailMarketing
 from monai.business.finance import Finance, GeneralLedger
+from monai.business.kofi import KofiCampaignManager
 from monai.business.pipeline import Pipeline
 from monai.business.risk import RiskManager
 from monai.business.strategy_lifecycle import StrategyLifecycle
@@ -94,9 +95,12 @@ class Orchestrator(BaseAgent):
         self.pipeline = Pipeline(db)
         self.email_marketing = EmailMarketing(db)
         self.brand_payments = BrandPayments(db)
-        self.payment_manager = UnifiedPaymentManager(config, db)
+        self.payment_manager = UnifiedPaymentManager(config, db, ledger=self.ledger)
         self.corporate = CorporateManager(db)
         self.bootstrap_wallet = BootstrapWallet(config, db)
+        self.kofi_manager = KofiCampaignManager(
+            config, db, llm, bootstrap_wallet=self.bootstrap_wallet,
+        )
         self.llc_provisioner = LLCProvisioner(config, db, llm)
         self.api_provisioner = APIProvisioner(
             config, db, llm,
@@ -479,9 +483,14 @@ class Orchestrator(BaseAgent):
 
         if bootstrap_phase == "pre_bootstrap":
             self.log_action("bootstrap",
-                            "No funding source configured. "
-                            "Creator must provide anonymous prepaid card or start crowdfunding.")
-            result["bootstrap"] = {"status": "awaiting_funding"}
+                            "No funding source configured. Starting Ko-fi campaign.")
+            # Auto-setup Ko-fi campaign as primary funding source
+            kofi_result = self._setup_kofi_campaign()
+            result["bootstrap"] = kofi_result
+        else:
+            # Campaign exists — sync donations periodically
+            if self._cycle % 3 == 0:
+                result["kofi_sync"] = self._sync_kofi_donations()
 
         # LLC provisioning — runs if enabled but not yet complete
         llc_status = self.llc_provisioner.get_provision_status()
@@ -519,6 +528,29 @@ class Orchestrator(BaseAgent):
             return {"status": "infrastructure_ok", "accounts": len(accounts)}
 
         return {"provisioned": needs, "result": result}
+
+    def _setup_kofi_campaign(self) -> dict[str, Any]:
+        """Set up Ko-fi crowdfunding campaign for bootstrap funding."""
+        try:
+            result = self.kofi_manager.run()
+            if result.get("status") == "live":
+                self.notify_creator(
+                    f"Ko-fi campaign is live! {result.get('kofi_url', '')} — "
+                    f"Goal: €500. Share it to get funded!"
+                )
+            self.log_action("kofi_setup", json.dumps(result, default=str)[:500])
+            return result
+        except Exception as e:
+            logger.error(f"Ko-fi campaign setup failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def _sync_kofi_donations(self) -> dict[str, Any]:
+        """Sync Ko-fi donations into bootstrap system."""
+        try:
+            return self.kofi_manager.run()
+        except Exception as e:
+            logger.error(f"Ko-fi sync failed: {e}")
+            return {"status": "error", "error": str(e)}
 
     def _run_api_provisioning(self) -> dict[str, Any]:
         """Run API key provisioning for brands that need payment provider keys.

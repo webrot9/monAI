@@ -202,6 +202,7 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `commercialista.py` | Accounting, budgets, ROI per agent |
 | `corporate.py` | LLC management, expenses, tax obligations |
 | `bootstrap.py` | Seed capital (crowdfunding, Paysafecard, creator seed) |
+| `kofi.py` | Ko-fi campaign automation (setup, monitoring, donation sync) |
 | `crm.py` | Lead management, contacts, pipeline |
 | `pipeline.py` | Conversion funnel tracking |
 | `risk.py` | Diversification, spend limits, stop-loss |
@@ -297,7 +298,7 @@ All strategies use real browser automation and APIs — zero simulation:
 
 ## Test Suite
 
-- **1114 tests** across 55 test files
+- **1135 tests** across 57 test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
@@ -361,6 +362,12 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 - **Landing page generator wired into WebPresence**: `run()` now regenerates crowdfunding page with live funding data; new `deploy_crowdfunding_page()` method
 - **Double-entry bookkeeping (GeneralLedger)**: Full chart of accounts, journal entries with balanced debit/credit, trial balance, balance sheet, income statement, reconciliation, integrity verification
 - **Ledger integrity check in orchestrator cycle**: Phase 6.95 verifies all entries balanced before commercialista report
+- **GL auto-entries on webhooks**: Every payment_completed webhook auto-creates a GL entry (cash debit + revenue credit + fee debit)
+- **GL auto-entries on sweeps**: Successful sweeps auto-create GL entries (creator payable debit + cash credit)
+- **GL refund reversals**: Refund webhooks auto-create reversal GL entries
+- **Ko-fi campaign automation**: `KofiCampaignManager` agent — auto-registers on Ko-fi, creates campaign page, syncs donations into bootstrap wallet
+- **Ko-fi wired into orchestrator bootstrap**: Pre-bootstrap phase auto-triggers Ko-fi setup; donation sync every 3 cycles
+- **E2E payment flow tests**: 13 tests covering webhook→GL→sweep→GL→balance-sheet lifecycle
 
 ### Earlier Changes
 - **Webhook idempotency**: `processed_webhooks` table prevents double-processing
