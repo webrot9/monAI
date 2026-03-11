@@ -198,7 +198,7 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 ### Business (`src/monai/business/`)
 | Module | Purpose |
 |--------|---------|
-| `finance.py` | Revenue & expense tracking + double-entry GeneralLedger |
+| `finance.py` | Revenue & expense tracking + double-entry GeneralLedger + multi-brand P&L segmentation |
 | `commercialista.py` | Accounting, budgets, ROI per agent |
 | `corporate.py` | LLC management, expenses, tax obligations |
 | `bootstrap.py` | Seed capital (crowdfunding, Paysafecard, creator seed) |
@@ -213,6 +213,8 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `strategy_lifecycle.py` | Strategy state machine (pending→active→paused→stopped) |
 | `invoicing.py` | Invoice generation (HTML + PDF via weasyprint, client + contractor invoices) |
 | `tax_estimation.py` | Quarterly tax estimation (Italian forfettario + US federal, SE tax, brackets) |
+| `audit.py` | Audit trail (queryable activity log, risk assessment, per-agent summaries, Telegram reports) |
+| `backup.py` | Automated backup & restore (SQLite online backup, config backup, rotation, integrity verification) |
 | ~~`payments.py`~~ | **REMOVED** — superseded by `payments/manager.py` + `business/brand_payments.py` |
 | `brand_payments.py` | Per-brand payment accounts |
 | `comms.py` | Email engine (SMTP/IMAP) |

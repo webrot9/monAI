@@ -54,8 +54,13 @@
 - [x] Rate limiting per provider for exchange rate API calls (token-bucket, per-provider sliding window)
 - [x] Total: 1252 tests, all passing
 
+- [x] Audit trail / activity log (queryable log, risk assessment, per-agent summaries, Telegram reports)
+- [x] Multi-brand GL segmentation (per-brand P&L, all-brands dashboard, Telegram format)
+- [x] Automated backup & restore (SQLite online backup, config backup, rotation, integrity verification)
+- [x] Total: 1299 tests, all passing
+
 ## Next Up
 - [ ] First real deployment test (end-to-end with a real Ko-fi page)
-- [ ] Audit trail / activity log (queryable log of all agent actions)
-- [ ] Multi-brand GL segmentation (per-brand P&L from GL entries)
-- [ ] Automated backup & restore for DB + config
+- [ ] Wire audit trail into orchestrator (log all phase transitions and agent actions)
+- [ ] Automated scheduled backups in orchestrator (daily DB backup, weekly full backup)
+- [ ] Client portal / dashboard (web UI for strategy performance and financial reports)

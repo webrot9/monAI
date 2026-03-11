@@ -676,6 +676,157 @@ class GeneralLedger:
         rows = self.db.execute(query, tuple(params))
         return [dict(r) for r in rows]
 
+    # ── Brand Segmentation ─────────────────────────────────────
+
+    def get_brands(self) -> list[str]:
+        """Get all distinct brands that have GL entries."""
+        rows = self.db.execute(
+            "SELECT DISTINCT brand FROM gl_journal_entries "
+            "WHERE brand IS NOT NULL AND brand != '' ORDER BY brand"
+        )
+        return [r["brand"] for r in rows]
+
+    def get_income_statement_by_brand(
+        self,
+        brand: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate an income statement filtered to a specific brand.
+
+        Same structure as get_income_statement() but only includes
+        GL entries tagged with the given brand.
+        """
+        if not start_date:
+            start_date = datetime.now().strftime("%Y-%m-01")
+        if not end_date:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+
+        rows = self.db.execute("""
+            SELECT
+                a.code,
+                a.name,
+                a.account_type,
+                COALESCE(SUM(l.debit), 0) as total_debit,
+                COALESCE(SUM(l.credit), 0) as total_credit
+            FROM gl_accounts a
+            JOIN gl_journal_lines l ON l.account_code = a.code
+            JOIN gl_journal_entries e ON e.id = l.entry_id
+            WHERE a.account_type IN ('revenue', 'expense')
+              AND e.entry_date >= ? AND e.entry_date <= ?
+              AND e.brand = ?
+              AND a.is_active = 1
+            GROUP BY a.code
+            ORDER BY a.code
+        """, (start_date, end_date, brand))
+
+        revenue_lines = []
+        expense_lines = []
+        total_revenue = 0.0
+        total_expenses = 0.0
+
+        for row in rows:
+            r = dict(row)
+            if r["account_type"] == "revenue":
+                balance = r["total_credit"] - r["total_debit"]
+                r["balance"] = balance
+                revenue_lines.append(r)
+                total_revenue += balance
+            else:
+                balance = r["total_debit"] - r["total_credit"]
+                r["balance"] = balance
+                expense_lines.append(r)
+                total_expenses += balance
+
+        return {
+            "brand": brand,
+            "period_start": start_date,
+            "period_end": end_date,
+            "revenue": revenue_lines,
+            "expenses": expense_lines,
+            "total_revenue": round(total_revenue, 2),
+            "total_expenses": round(total_expenses, 2),
+            "net_income": round(total_revenue - total_expenses, 2),
+        }
+
+    def get_all_brands_pnl(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate P&L for all brands plus an unbranded category.
+
+        Returns a dict with per-brand summaries and a consolidated total.
+        """
+        brands = self.get_brands()
+        brand_results = []
+        grand_revenue = 0.0
+        grand_expenses = 0.0
+
+        for brand in brands:
+            pnl = self.get_income_statement_by_brand(brand, start_date, end_date)
+            brand_results.append(pnl)
+            grand_revenue += pnl["total_revenue"]
+            grand_expenses += pnl["total_expenses"]
+
+        # Also get unbranded entries
+        overall = self.get_income_statement(start_date, end_date)
+        unbranded_revenue = overall["total_revenue"] - grand_revenue
+        unbranded_expenses = overall["total_expenses"] - grand_expenses
+
+        return {
+            "brands": brand_results,
+            "unbranded": {
+                "brand": "(unbranded)",
+                "total_revenue": round(unbranded_revenue, 2),
+                "total_expenses": round(unbranded_expenses, 2),
+                "net_income": round(unbranded_revenue - unbranded_expenses, 2),
+            },
+            "consolidated": {
+                "total_revenue": overall["total_revenue"],
+                "total_expenses": overall["total_expenses"],
+                "net_income": overall["net_income"],
+            },
+            "period_start": start_date or datetime.now().strftime("%Y-%m-01"),
+            "period_end": end_date or datetime.now().strftime("%Y-%m-%d"),
+        }
+
+    def format_brand_pnl_telegram(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> str:
+        """Format multi-brand P&L for Telegram notification."""
+        data = self.get_all_brands_pnl(start_date, end_date)
+        lines = [
+            f"*Multi-Brand P&L ({data['period_start']} to {data['period_end']})*",
+            "```",
+            f"{'Brand':<20} {'Revenue':>10} {'Expenses':>10} {'Net':>10}",
+            "-" * 52,
+        ]
+
+        for b in data["brands"]:
+            lines.append(
+                f"{b['brand']:<20} {b['total_revenue']:>10.2f} "
+                f"{b['total_expenses']:>10.2f} {b['net_income']:>10.2f}"
+            )
+
+        ub = data["unbranded"]
+        if ub["total_revenue"] != 0 or ub["total_expenses"] != 0:
+            lines.append(
+                f"{'(unbranded)':<20} {ub['total_revenue']:>10.2f} "
+                f"{ub['total_expenses']:>10.2f} {ub['net_income']:>10.2f}"
+            )
+
+        lines.append("-" * 52)
+        c = data["consolidated"]
+        lines.append(
+            f"{'TOTAL':<20} {c['total_revenue']:>10.2f} "
+            f"{c['total_expenses']:>10.2f} {c['net_income']:>10.2f}"
+        )
+        lines.append("```")
+        return "\n".join(lines)
+
     def verify_integrity(self) -> dict[str, Any]:
         """Verify the ledger's integrity — all entries must be balanced."""
         unbalanced = self.db.execute("""
