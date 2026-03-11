@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from monai.business.exchange_rates import ExchangeRateService, normalize_to_eur
+from monai.business.exchange_rates import ExchangeRateService, RateLimiter, normalize_to_eur
 from monai.business.finance import GeneralLedger
 
 
@@ -367,3 +367,68 @@ class TestLiveRateFetching:
         # ECB failed but CoinGecko succeeded
         assert "BTC/EUR" in fetched
         assert "EUR/USD" not in fetched
+
+
+class TestRateLimiter:
+    """Tests for the token-bucket rate limiter."""
+
+    def test_initial_state_allows_calls(self):
+        """Fresh limiter allows calls."""
+        limiter = RateLimiter({"test": (5, 60)})
+        assert limiter.can_call("test") is True
+
+    def test_respects_max_calls(self):
+        """Blocks after max calls within window."""
+        limiter = RateLimiter({"test": (3, 60)})
+        for _ in range(3):
+            assert limiter.can_call("test") is True
+            limiter.record_call("test")
+        assert limiter.can_call("test") is False
+
+    def test_unknown_provider_always_allowed(self):
+        """Providers not in limits are always allowed."""
+        limiter = RateLimiter({"ecb": (5, 60)})
+        assert limiter.can_call("unknown_api") is True
+
+    def test_case_insensitive(self):
+        """Provider names are case insensitive."""
+        limiter = RateLimiter({"ecb": (2, 60)})
+        limiter.record_call("ECB")
+        limiter.record_call("Ecb")
+        assert limiter.can_call("ecb") is False
+
+    def test_time_until_available_zero_when_allowed(self):
+        """Returns 0 when calls are available."""
+        limiter = RateLimiter({"test": (5, 60)})
+        assert limiter.time_until_available("test") == 0.0
+
+    def test_time_until_available_positive_when_blocked(self):
+        """Returns positive seconds when rate limited."""
+        limiter = RateLimiter({"test": (1, 60)})
+        limiter.record_call("test")
+        wait = limiter.time_until_available("test")
+        assert 0 < wait <= 60
+
+    def test_window_expiry(self):
+        """Calls expire after the window passes."""
+        import time as _time
+        limiter = RateLimiter({"test": (1, 1)})  # 1 call per 1 second
+        limiter.record_call("test")
+        assert limiter.can_call("test") is False
+        _time.sleep(1.1)
+        assert limiter.can_call("test") is True
+
+    def test_default_limits(self):
+        """Default limits for ECB and CoinGecko are set."""
+        limiter = RateLimiter()
+        assert limiter.can_call("ecb") is True
+        assert limiter.can_call("coingecko") is True
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_fetch_skips_provider(self, db):
+        """When rate limited, fetch_live_rates skips that provider."""
+        limiter = RateLimiter({"ecb": (0, 60), "coingecko": (0, 60)})
+        rates = ExchangeRateService(db, rate_limiter=limiter)
+        fetched = await rates.fetch_live_rates()
+        # Both providers blocked → nothing fetched
+        assert len(fetched) == 0

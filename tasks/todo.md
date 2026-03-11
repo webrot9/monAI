@@ -49,8 +49,13 @@
 - [x] Reconciliation engine (GL↔webhook matching, amount tolerance, weekly run with Telegram alerts)
 - [x] Total: 1216 tests, all passing
 
+- [x] Invoice generation (HTML + PDF, client invoices, contractor invoices, entity/period/payment info)
+- [x] Tax estimation module (quarterly: Italian forfettario + US federal, SE tax, progressive brackets, INPS)
+- [x] Rate limiting per provider for exchange rate API calls (token-bucket, per-provider sliding window)
+- [x] Total: 1252 tests, all passing
+
 ## Next Up
 - [ ] First real deployment test (end-to-end with a real Ko-fi page)
-- [ ] Invoice generation (PDF invoices for LLC-based client billing)
-- [ ] Tax estimation module (quarterly estimated tax calculations)
-- [ ] Rate limiting per provider for exchange rate API calls
+- [ ] Audit trail / activity log (queryable log of all agent actions)
+- [ ] Multi-brand GL segmentation (per-brand P&L from GL entries)
+- [ ] Automated backup & restore for DB + config

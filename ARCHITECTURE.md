@@ -204,14 +204,15 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `bootstrap.py` | Seed capital (crowdfunding, Paysafecard, creator seed) |
 | `kofi.py` | Ko-fi campaign automation (setup, monitoring, donation sync) |
 | `reporting.py` | Automated financial reporting (P&L, balance sheet, strategy dashboards via Telegram) |
-| `exchange_rates.py` | Multi-currency exchange rate service (EUR/USD/BTC/XMR with caching + persistence) |
+| `exchange_rates.py` | Multi-currency exchange rate service (EUR/USD/BTC/XMR with caching, persistence, rate limiting) |
 | `reconciliation.py` | Reconciliation engine (matches GL entries with webhook events, finds discrepancies) |
 | `crm.py` | Lead management, contacts, pipeline |
 | `pipeline.py` | Conversion funnel tracking |
 | `risk.py` | Diversification, spend limits, stop-loss |
 | `projections.py` | Financial forecasting |
 | `strategy_lifecycle.py` | Strategy state machine (pending→active→paused→stopped) |
-| `invoicing.py` | Creator contractor invoices |
+| `invoicing.py` | Invoice generation (HTML + PDF via weasyprint, client + contractor invoices) |
+| `tax_estimation.py` | Quarterly tax estimation (Italian forfettario + US federal, SE tax, brackets) |
 | ~~`payments.py`~~ | **REMOVED** — superseded by `payments/manager.py` + `business/brand_payments.py` |
 | `brand_payments.py` | Per-brand payment accounts |
 | `comms.py` | Email engine (SMTP/IMAP) |

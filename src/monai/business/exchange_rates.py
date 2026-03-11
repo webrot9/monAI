@@ -24,6 +24,63 @@ from monai.db.database import Database
 
 logger = logging.getLogger(__name__)
 
+
+class RateLimiter:
+    """Token-bucket rate limiter for API calls.
+
+    Tracks per-provider call counts with a sliding window.
+    """
+
+    def __init__(self, limits: dict[str, tuple[int, int]] | None = None):
+        """
+        Args:
+            limits: Mapping of provider → (max_calls, window_seconds).
+                    Default: ECB 30/hour, CoinGecko 10/minute.
+        """
+        self._limits = limits or {
+            "ecb": (30, 3600),
+            "coingecko": (10, 60),
+        }
+        self._calls: dict[str, list[float]] = {}
+
+    def can_call(self, provider: str) -> bool:
+        """Check if we're within rate limits for this provider."""
+        provider = provider.lower()
+        if provider not in self._limits:
+            return True
+        max_calls, window = self._limits[provider]
+        self._prune(provider, window)
+        return len(self._calls.get(provider, [])) < max_calls
+
+    def record_call(self, provider: str) -> None:
+        """Record that we made a call to this provider."""
+        provider = provider.lower()
+        self._calls.setdefault(provider, []).append(time.time())
+
+    def time_until_available(self, provider: str) -> float:
+        """Seconds until the next call is allowed. 0 if allowed now."""
+        provider = provider.lower()
+        if provider not in self._limits:
+            return 0.0
+        max_calls, window = self._limits[provider]
+        self._prune(provider, window)
+        calls = self._calls.get(provider, [])
+        if len(calls) < max_calls:
+            return 0.0
+        if not calls:
+            # max_calls is 0 — permanently blocked
+            return float(window)
+        # Oldest call in window — wait until it expires
+        return calls[0] + window - time.time()
+
+    def _prune(self, provider: str, window: int) -> None:
+        """Remove calls outside the sliding window."""
+        cutoff = time.time() - window
+        if provider in self._calls:
+            self._calls[provider] = [
+                t for t in self._calls[provider] if t > cutoff
+            ]
+
 EXCHANGE_RATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS exchange_rates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,15 +129,18 @@ class ExchangeRateService:
     and persists to DB for historical records.
     """
 
-    def __init__(self, db: Database, cache_ttl: int = 3600):
+    def __init__(self, db: Database, cache_ttl: int = 3600,
+                 rate_limiter: RateLimiter | None = None):
         """
         Args:
             db: Database for persistent rate storage.
             cache_ttl: Cache time-to-live in seconds (default: 1 hour).
+            rate_limiter: Optional rate limiter for API calls.
         """
         self.db = db
         self.cache_ttl = cache_ttl
         self._cache: dict[tuple[str, str], ExchangeRate] = {}
+        self.rate_limiter = rate_limiter or RateLimiter()
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -221,17 +281,27 @@ class ExchangeRateService:
         """
         fetched: dict[str, float] = {}
 
-        # Fetch fiat rates from ECB
-        ecb_rates = await self._fetch_ecb_rates()
-        for pair, rate in ecb_rates.items():
-            self.set_rate(pair[0], pair[1], rate, source="ecb")
-            fetched[f"{pair[0]}/{pair[1]}"] = rate
+        # Fetch fiat rates from ECB (if allowed by rate limiter)
+        if self.rate_limiter.can_call("ecb"):
+            self.rate_limiter.record_call("ecb")
+            ecb_rates = await self._fetch_ecb_rates()
+            for pair, rate in ecb_rates.items():
+                self.set_rate(pair[0], pair[1], rate, source="ecb")
+                fetched[f"{pair[0]}/{pair[1]}"] = rate
+        else:
+            wait = self.rate_limiter.time_until_available("ecb")
+            logger.info(f"ECB rate-limited, next call in {wait:.0f}s")
 
-        # Fetch crypto rates from CoinGecko
-        crypto_rates = await self._fetch_coingecko_rates()
-        for pair, rate in crypto_rates.items():
-            self.set_rate(pair[0], pair[1], rate, source="coingecko")
-            fetched[f"{pair[0]}/{pair[1]}"] = rate
+        # Fetch crypto rates from CoinGecko (if allowed by rate limiter)
+        if self.rate_limiter.can_call("coingecko"):
+            self.rate_limiter.record_call("coingecko")
+            crypto_rates = await self._fetch_coingecko_rates()
+            for pair, rate in crypto_rates.items():
+                self.set_rate(pair[0], pair[1], rate, source="coingecko")
+                fetched[f"{pair[0]}/{pair[1]}"] = rate
+        else:
+            wait = self.rate_limiter.time_until_available("coingecko")
+            logger.info(f"CoinGecko rate-limited, next call in {wait:.0f}s")
 
         if fetched:
             logger.info(f"Fetched {len(fetched)} live exchange rates")
