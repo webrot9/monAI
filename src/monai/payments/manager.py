@@ -602,3 +602,101 @@ class UnifiedPaymentManager:
             },
             "sweep_summary": self.sweep_engine.get_sweep_summary(),
         }
+
+    # ── Webhook Replay ─────────────────────────────────────────
+
+    async def replay_webhook(self, event_id: int) -> dict[str, Any]:
+        """Replay a single webhook event by its ID from the webhook_events table.
+
+        Re-processes the stored raw_payload through the normal handler pipeline.
+        Idempotency is bypassed by removing the processed_webhooks entry first.
+        """
+        rows = self.db.execute(
+            "SELECT * FROM webhook_events WHERE id = ?", (event_id,)
+        )
+        if not rows:
+            return {"success": False, "error": f"Event {event_id} not found"}
+
+        row = dict(rows[0])
+        raw_payload = row.get("raw_payload")
+        if not raw_payload:
+            return {"success": False, "error": "No raw_payload stored for this event"}
+
+        try:
+            raw = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+        except json.JSONDecodeError:
+            return {"success": False, "error": "Corrupted raw_payload"}
+
+        # Remove idempotency lock so re-processing can proceed
+        idem_id = f"{row['payment_ref']}:{row['event_type']}"
+        self.db.execute(
+            "DELETE FROM processed_webhooks WHERE provider = ? AND event_id = ?",
+            (row["provider"], idem_id),
+        )
+        # Remove original webhook_events entry (handler will re-insert)
+        self.db.execute("DELETE FROM webhook_events WHERE id = ?", (event_id,))
+
+        # Reconstruct the WebhookEvent
+        try:
+            event_type = WebhookEventType(row["event_type"])
+        except ValueError:
+            return {"success": False, "error": f"Unknown event type: {row['event_type']}"}
+
+        event = WebhookEvent(
+            event_type=event_type,
+            provider=row["provider"],
+            payment_ref=row["payment_ref"],
+            amount=float(row.get("amount", 0)),
+            currency=row.get("currency", "EUR"),
+            metadata={"brand": row.get("brand", "")},
+            raw=raw,
+        )
+
+        try:
+            await self._handle_webhook_event(event)
+            logger.info(f"Webhook replayed: event_id={event_id} ref={row['payment_ref']}")
+            return {"success": True, "payment_ref": row["payment_ref"]}
+        except Exception as e:
+            logger.error(f"Webhook replay failed for event_id={event_id}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def replay_failed_webhooks(
+        self, since_hours: int = 24, limit: int = 100
+    ) -> dict[str, Any]:
+        """Replay webhook events that have errors recorded.
+
+        Returns summary of replay results.
+        """
+        rows = self.db.execute(
+            "SELECT id FROM webhook_events "
+            "WHERE error IS NOT NULL AND error != '' "
+            "AND created_at >= datetime('now', ?) "
+            "ORDER BY created_at ASC LIMIT ?",
+            (f"-{since_hours} hours", limit),
+        )
+
+        results = {"total": len(rows), "succeeded": 0, "failed": 0, "errors": []}
+        for row in rows:
+            result = await self.replay_webhook(row["id"])
+            if result["success"]:
+                results["succeeded"] += 1
+            else:
+                results["failed"] += 1
+                results["errors"].append(
+                    {"event_id": row["id"], "error": result.get("error", "")}
+                )
+
+        logger.info(
+            f"Webhook replay batch: {results['succeeded']}/{results['total']} succeeded"
+        )
+        return results
+
+    def get_replayable_webhooks(self, limit: int = 50) -> list[dict]:
+        """List webhook events available for replay."""
+        rows = self.db.execute(
+            "SELECT id, provider, event_type, payment_ref, amount, currency, "
+            "brand, status, error, created_at FROM webhook_events "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in rows]

@@ -57,6 +57,7 @@ from monai.workflows.router import TaskRouter
 from monai.utils.privacy import get_anonymizer
 from monai.utils.resources import check_resources
 from monai.utils.sandbox import PROJECT_ROOT
+from monai.business.alerting import AlertingEngine
 from monai.business.audit import AuditTrail
 from monai.business.backup import BackupManager
 from monai.utils.telegram import TelegramBot
@@ -118,6 +119,7 @@ class Orchestrator(BaseAgent):
         )
         self.strategy_lifecycle = StrategyLifecycle(db)
         self.audit = AuditTrail(db)
+        self.alerting = AlertingEngine(db)
         self.backup_manager = BackupManager(
             db, config.data_dir / "backups",
             max_backups=config.backup.max_backups,
@@ -494,32 +496,34 @@ class Orchestrator(BaseAgent):
         return cycle_result
 
     def _send_auto_alerts(self, cycle_result: dict, budget: dict):
-        """Send automatic Telegram alerts for critical events."""
+        """Send automatic Telegram alerts for critical events.
+
+        Uses the AlertingEngine for configurable threshold-based alerts,
+        plus hardcoded milestone alerts that don't fit a threshold model.
+        """
         if not self.config.telegram.enabled or not self.config.telegram.bot_token:
             return
 
         alerts = []
 
-        # Revenue alert — celebrate first money
-        net_profit = cycle_result.get("net_profit", 0)
-        if net_profit > 0:
+        # Evaluate configurable alert rules
+        try:
             today = self.finance.get_daily_summary()
-            if today.get("revenue", 0) > 0:
-                alerts.append(f"💰 Revenue today: €{today['revenue']:.2f} "
-                              f"(Net: €{today['net']:.2f})")
+            dashboard_data = {"budget": budget, "today": today}
+            fired = self.alerting.evaluate(dashboard_data)
+            severity_icons = {
+                "critical": "🚨", "warning": "⚠️", "info": "💡",
+            }
+            for alert in fired:
+                icon = severity_icons.get(alert["severity"], "📌")
+                alerts.append(f"{icon} {alert['message']}")
+        except Exception as e:
+            logger.debug(f"Alerting engine error: {e}")
 
-        # Budget critical
-        if budget.get("balance", 0) <= 0:
-            alerts.append("🚨 BUDGET EXHAUSTED — all spending paused")
-        elif budget.get("days_until_broke") and budget["days_until_broke"] < 3:
-            alerts.append(f"⚠️ {budget['days_until_broke']} days of budget left "
-                          f"(€{budget['balance']:.2f})")
-
-        # Self-sustaining milestone
+        # Hardcoded milestone alerts (not threshold-based)
         if budget.get("self_sustaining") and self._cycle <= 5:
-            alerts.append("🎉 MILESTONE: monAI is self-sustaining! Revenue ≥ Expenses")
+            alerts.append("🎉 MILESTONE: monAI is self-sustaining! Revenue >= Expenses")
 
-        # Strategy stopped
         reviews = cycle_result.get("reviews", {})
         if isinstance(reviews, dict):
             for strat_name, review in reviews.items():
