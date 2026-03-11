@@ -92,6 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_bpr_status ON brand_payments_received(brand, stat
 CREATE INDEX IF NOT EXISTS idx_bpr_payment_ref ON brand_payments_received(payment_ref);
 CREATE INDEX IF NOT EXISTS idx_bps_brand ON brand_profit_sweeps(brand, status);
 CREATE INDEX IF NOT EXISTS idx_bpa_brand ON brand_payment_accounts(brand, account_type, status);
+CREATE INDEX IF NOT EXISTS idx_bpf_brand ON platform_fees(brand, provider);
 """;
 
 # Collection methods available to brands

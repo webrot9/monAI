@@ -320,6 +320,7 @@ class TestDatabaseImprovements:
         assert "idx_bpr_brand" in index_names
         assert "idx_bpr_payment_ref" in index_names
         assert "idx_bps_brand" in index_names
+        assert "idx_bpf_brand" in index_names
 
 
 # ── HTTP Client Pooling Tests ────────────────────────────────
@@ -355,6 +356,13 @@ class TestHTTPClientPooling:
     def test_monero_reuses_client(self):
         from monai.payments.monero_provider import MoneroProvider
         provider = MoneroProvider(proxy_url="")
+        client1 = provider._get_client()
+        client2 = provider._get_client()
+        assert client1 is client2
+
+    def test_lemonsqueezy_reuses_client(self):
+        from monai.payments.lemonsqueezy_provider import LemonSqueezyProvider
+        provider = LemonSqueezyProvider(api_key="test", store_id="s1", proxy_url="")
         client1 = provider._get_client()
         client2 = provider._get_client()
         assert client1 is client2

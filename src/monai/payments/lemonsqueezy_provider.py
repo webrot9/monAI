@@ -47,39 +47,42 @@ class LemonSqueezyProvider(PaymentProvider):
         self.store_id = store_id
         self.webhook_secret = webhook_secret
         self.proxy_url = proxy_url
+        self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
-        kwargs: dict[str, Any] = {
-            "timeout": 30.0,
-            "headers": {
-                "Authorization": f"Bearer {self.api_key}",
-                "Accept": "application/vnd.api+json",
-                "Content-Type": "application/vnd.api+json",
-            },
-        }
-        from monai.payments.base import _resolve_proxy_url
-        proxy = _resolve_proxy_url(self.proxy_url)
-        if proxy:
-            kwargs["proxy"] = proxy
-        return httpx.AsyncClient(**kwargs)
+        if self._client is None or self._client.is_closed:
+            kwargs: dict[str, Any] = {
+                "timeout": 30.0,
+                "headers": {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Accept": "application/vnd.api+json",
+                    "Content-Type": "application/vnd.api+json",
+                },
+            }
+            from monai.payments.base import _resolve_proxy_url
+            proxy = _resolve_proxy_url(self.proxy_url)
+            if proxy:
+                kwargs["proxy"] = proxy
+            self._client = httpx.AsyncClient(**kwargs)
+        return self._client
 
     async def _api_call(self, method: str, endpoint: str,
                         data: dict | None = None) -> dict:
         url = f"{LS_API_BASE}/{endpoint.lstrip('/')}"
-        async with self._get_client() as client:
-            if method == "GET":
-                resp = await client.get(url, params=data)
-            elif method == "POST":
-                resp = await client.post(url, json=data)
-            elif method == "PATCH":
-                resp = await client.patch(url, json=data)
-            else:
-                resp = await client.request(method, url, json=data)
+        client = self._get_client()
+        if method == "GET":
+            resp = await client.get(url, params=data)
+        elif method == "POST":
+            resp = await client.post(url, json=data)
+        elif method == "PATCH":
+            resp = await client.patch(url, json=data)
+        else:
+            resp = await client.request(method, url, json=data)
 
-            if resp.status_code >= 400:
-                raise LemonSqueezyAPIError(f"HTTP {resp.status_code}: {resp.text}")
+        if resp.status_code >= 400:
+            raise LemonSqueezyAPIError(f"HTTP {resp.status_code}: {resp.text}")
 
-            return resp.json() if resp.text else {}
+        return resp.json() if resp.text else {}
 
     async def create_payment(self, intent: PaymentIntent) -> PaymentResult:
         """Create a checkout link via Lemon Squeezy API.
