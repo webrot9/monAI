@@ -77,9 +77,11 @@
 - [x] Spending guard module (daily/per-transaction/per-strategy caps with approval thresholds)
 - [x] Total: 1398 tests, all passing
 
+- [x] Sprint 4: Team agents with real data-driven logic (GrowthHacker insights, ContentMarketer SEO validation, OutreachSpecialist segmentation, AgentSpawner structured decomposition)
+- [x] Sprint 5: Crowdfunding landing page enhancements (QR codes, campaign management, DB fixes)
+- [x] Sprint 6: Tor detection fallback tests (22 tests for ProxyFallbackChain)
+- [x] Sprint 7: API key self-provisioning tests (49 tests for APIProvisioner, 3 production bug fixes)
+- [x] Total: 1520 tests, all passing
+
 ## Next Up
 - [ ] First real deployment test (end-to-end with a real Ko-fi page)
-- [ ] Sprint 4: Team agents with real logic (not LLM wrappers)
-- [ ] Sprint 5: Crowdfunding landing page enhancements
-- [ ] Sprint 6: Tor detection fallback (transparent without revealing itself)
-- [ ] Sprint 7: API key self-provisioning for sub-business
