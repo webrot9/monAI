@@ -554,6 +554,80 @@ class GeneralLedger:
             "net_income": round(total_revenue - total_expenses, 2),
         }
 
+    def get_income_statement_normalized(
+        self,
+        rates: Any,
+        target_currency: str = "EUR",
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Income statement with all amounts normalized to target currency.
+
+        Args:
+            rates: ExchangeRateService instance.
+            target_currency: Currency to normalize to (default EUR).
+            start_date: Period start (YYYY-MM-DD).
+            end_date: Period end (YYYY-MM-DD).
+        """
+        if not start_date:
+            start_date = datetime.now().strftime("%Y-%m-01")
+        if not end_date:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+
+        rows = self.db.execute("""
+            SELECT
+                a.code,
+                a.name,
+                a.account_type,
+                l.currency,
+                COALESCE(SUM(l.debit), 0) as total_debit,
+                COALESCE(SUM(l.credit), 0) as total_credit
+            FROM gl_accounts a
+            JOIN gl_journal_lines l ON l.account_code = a.code
+            JOIN gl_journal_entries e ON e.id = l.entry_id
+            WHERE a.account_type IN ('revenue', 'expense')
+              AND e.entry_date >= ? AND e.entry_date <= ?
+              AND a.is_active = 1
+            GROUP BY a.code, l.currency
+            ORDER BY a.code
+        """, (start_date, end_date))
+
+        revenue_lines: list[dict[str, Any]] = []
+        expense_lines: list[dict[str, Any]] = []
+        total_revenue = 0.0
+        total_expenses = 0.0
+
+        for row in rows:
+            r = dict(row)
+            currency = r.get("currency", "EUR")
+            fx = rates.get_rate(currency, target_currency) if currency != target_currency else 1.0
+
+            if r["account_type"] == "revenue":
+                balance = (r["total_credit"] - r["total_debit"]) * fx
+                r["balance"] = round(balance, 2)
+                r["original_currency"] = currency
+                r["fx_rate"] = fx
+                revenue_lines.append(r)
+                total_revenue += balance
+            else:
+                balance = (r["total_debit"] - r["total_credit"]) * fx
+                r["balance"] = round(balance, 2)
+                r["original_currency"] = currency
+                r["fx_rate"] = fx
+                expense_lines.append(r)
+                total_expenses += balance
+
+        return {
+            "period_start": start_date,
+            "period_end": end_date,
+            "target_currency": target_currency,
+            "revenue": revenue_lines,
+            "expenses": expense_lines,
+            "total_revenue": round(total_revenue, 2),
+            "total_expenses": round(total_expenses, 2),
+            "net_income": round(total_revenue - total_expenses, 2),
+        }
+
     # ── Journal Queries ──────────────────────────────────────────
 
     def get_journal_entries(self, limit: int = 50,

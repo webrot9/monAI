@@ -215,6 +215,7 @@ class WebhookServer:
             "btcpay-sig": headers.get("btcpay-sig", ""),
             "x-gumroad-signature": headers.get("x-gumroad-signature", ""),
             "x-signature": headers.get("x-signature", ""),
+            "content-type": headers.get("content-type", ""),
         }
 
         try:

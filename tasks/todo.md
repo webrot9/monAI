@@ -38,9 +38,14 @@
 - [x] Automated financial reporting (FinancialReporter: monthly P&L, daily snapshots, weekly dashboards via Telegram)
 - [x] Strategy performance dashboards (per-strategy ROI, 7d/30d trends, auto-recommendations)
 - [x] Total: 1151 tests, all passing
+- [x] Auto-pause underperforming strategies (Phase 6.97 calls lifecycle.pause + Telegram notification)
+- [x] Ko-fi webhook provider (verification_token constant-time comparison, form-encoded parsing)
+- [x] ExchangeRateService (EUR/USD/BTC/XMR with caching, persistence, fallback rates, inverse pairs)
+- [x] GL normalized income statement (get_income_statement_normalized with FX conversion)
+- [x] Total: 1192 tests, all passing
 
 ## Next Up
 - [ ] First real deployment test (end-to-end with a real Ko-fi page)
-- [ ] Auto-pause underperforming strategies based on dashboard recommendations
-- [ ] Webhook signature verification (Stripe, LemonSqueezy, Ko-fi)
-- [ ] Multi-currency support in GeneralLedger (EUR/USD/XMR conversion rates)
+- [ ] Live exchange rate fetching (CoinGecko/ECB API integration for ExchangeRateService)
+- [ ] Auto-scale promising strategies (increase budget allocation based on ROI trends)
+- [ ] Reconciliation engine (match GL entries with payment provider statements)

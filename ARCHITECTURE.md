@@ -204,6 +204,7 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `bootstrap.py` | Seed capital (crowdfunding, Paysafecard, creator seed) |
 | `kofi.py` | Ko-fi campaign automation (setup, monitoring, donation sync) |
 | `reporting.py` | Automated financial reporting (P&L, balance sheet, strategy dashboards via Telegram) |
+| `exchange_rates.py` | Multi-currency exchange rate service (EUR/USD/BTC/XMR with caching + persistence) |
 | `crm.py` | Lead management, contacts, pipeline |
 | `pipeline.py` | Conversion funnel tracking |
 | `risk.py` | Diversification, spend limits, stop-loss |
@@ -224,6 +225,7 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `gumroad_provider.py` | Gumroad sales |
 | `lemonsqueezy_provider.py` | LemonSqueezy payments |
 | `monero_provider.py` | Monero privacy-first crypto |
+| `kofi_provider.py` | Ko-fi webhook handler (donation/subscription verification) |
 | `sweep_engine.py` | Automated profit sweeping |
 | `webhook_server.py` | Webhook handler for all providers |
 
@@ -299,7 +301,7 @@ All strategies use real browser automation and APIs — zero simulation:
 
 ## Test Suite
 
-- **1151 tests** across 58 test files
+- **1192 tests** across 60 test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
@@ -374,6 +376,11 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 - **Strategy performance analysis**: Per-strategy ROI, 7d/30d trends, auto-recommendations (continue/review/pause/scale)
 - **Phase 6.97**: Strategy performance eval in orchestrator cycle — logs underperformers and growth candidates
 - **Phase 7.5**: Automated report dispatch — monthly, weekly dashboard, daily snapshot every 10 cycles
+- **Auto-pause underperformers**: Phase 6.97 now calls `lifecycle.pause()` on strategies recommended for pause, with Telegram notification to creator
+- **Ko-fi webhook provider**: `KofiProvider` handles Ko-fi form-encoded webhooks with verification_token constant-time comparison
+- **All 6 payment providers** have HMAC/token signature verification: Stripe (v1+timestamp), BTCPay (sha256= prefix), Gumroad, LemonSqueezy, Ko-fi (token), Monero (confirmations-based)
+- **ExchangeRateService**: Multi-currency support with memory+DB caching, fallback rates, inverse pair computation, rate history
+- **`get_income_statement_normalized()`**: GL income statement with FX conversion to target currency (EUR default)
 
 ### Earlier Changes
 - **Webhook idempotency**: `processed_webhooks` table prevents double-processing

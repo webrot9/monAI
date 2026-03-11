@@ -259,3 +259,74 @@ class TestBootstrapGLIntegration:
         wallet.record_contribution(campaign_id, 50.0, "Backer")
         # Should not raise
         assert wallet.get_crowdfunding_total_raised() == 50.0
+
+
+class TestAutoPause:
+    """Test auto-pause of underperforming strategies via lifecycle integration."""
+
+    def _create_strategy(self, db, name, budget=100):
+        return db.execute_insert(
+            "INSERT INTO strategies (name, category, allocated_budget, status) "
+            "VALUES (?, 'digital_products', ?, 'active')",
+            (name, budget),
+        )
+
+    def _record_tx(self, db, strategy_id, amount, tx_type="revenue"):
+        db.execute_insert(
+            "INSERT INTO transactions (strategy_id, amount, type, category, description) "
+            "VALUES (?, ?, ?, ?, 'test')",
+            (strategy_id, amount, tx_type, tx_type),
+        )
+
+    def test_pause_recommendation_triggers_lifecycle_pause(self, db, config):
+        """Strategy recommended for pause gets paused via lifecycle."""
+        from monai.business.strategy_lifecycle import StrategyLifecycle
+
+        ledger = GeneralLedger(db)
+        finance = Finance(db)
+        reporter = FinancialReporter(db, ledger, finance)
+        lifecycle = StrategyLifecycle(db)
+
+        # Create a badly performing strategy: net < 0, budget > 50% used
+        sid = self._create_strategy(db, "money_pit", budget=100)
+        self._record_tx(db, sid, 5.0, "revenue")
+        self._record_tx(db, sid, 80.0, "expense")
+
+        perf = reporter.get_strategy_performance()
+        to_pause = perf["strategies_to_pause"]
+        assert len(to_pause) >= 1
+
+        # Simulate orchestrator auto-pause
+        for s in to_pause:
+            if lifecycle.can_transition(s["id"], "paused"):
+                lifecycle.pause(s["id"], reason=f"Auto: net={s['net']:.2f}")
+
+        # Verify strategy is now paused
+        assert lifecycle.get_status(sid) == "paused"
+        assert not lifecycle.is_runnable(sid)
+
+    def test_profitable_strategy_not_paused(self, db, config):
+        """Profitable strategy should not be recommended for pause."""
+        ledger = GeneralLedger(db)
+        finance = Finance(db)
+        reporter = FinancialReporter(db, ledger, finance)
+
+        sid = self._create_strategy(db, "winner", budget=200)
+        self._record_tx(db, sid, 500.0, "revenue")
+        self._record_tx(db, sid, 100.0, "expense")
+
+        perf = reporter.get_strategy_performance()
+        pause_ids = [s["id"] for s in perf["strategies_to_pause"]]
+        assert sid not in pause_ids
+
+    def test_already_paused_strategy_skipped(self, db, config):
+        """Already-paused strategy can't be paused again."""
+        from monai.business.strategy_lifecycle import StrategyLifecycle
+
+        lifecycle = StrategyLifecycle(db)
+
+        sid = self._create_strategy(db, "already_paused", budget=100)
+        lifecycle.pause(sid, reason="manual")
+
+        # can_transition should return False for paused→paused
+        assert not lifecycle.can_transition(sid, "paused")

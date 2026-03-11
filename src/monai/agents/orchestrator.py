@@ -353,7 +353,7 @@ class Orchestrator(BaseAgent):
             logger.error(f"Ledger integrity check failed: {e}")
             cycle_result["ledger_integrity"] = {"error": str(e)}
 
-        # Phase 6.97: Strategy performance evaluation
+        # Phase 6.97: Strategy performance evaluation + auto-actions
         try:
             perf = self.reporter.get_strategy_performance()
             cycle_result["strategy_performance"] = {
@@ -364,15 +364,38 @@ class Orchestrator(BaseAgent):
                 "to_pause": len(perf["strategies_to_pause"]),
                 "to_scale": len(perf["strategies_to_scale"]),
             }
-            # Auto-action on underperformers
+
+            paused = []
             for s in perf["strategies_to_pause"]:
-                self.log_action("strategy_underperform",
-                                f"Strategy '{s['name']}' recommended for pause: "
-                                f"net={s['net']:.2f}, ROI={s['roi_pct']}%")
+                sid = s["id"]
+                if self.lifecycle.can_transition(sid, "paused"):
+                    self.lifecycle.pause(
+                        sid,
+                        reason=f"Auto-pause: net={s['net']:.2f}, "
+                               f"ROI={s['roi_pct']}%, budget_used={s['budget_used_pct']}%",
+                    )
+                    paused.append(s["name"])
+                    self.log_action("strategy_auto_pause",
+                                    f"Paused '{s['name']}': net=€{s['net']:.2f}, "
+                                    f"ROI={s['roi_pct']}%")
+
+            if paused:
+                self.notify_creator(
+                    f"*Auto-paused {len(paused)} underperforming "
+                    f"{'strategy' if len(paused) == 1 else 'strategies'}:*\n"
+                    + "\n".join(f"- {name}" for name in paused)
+                    + "\n\nUse /resume <name> to re-activate."
+                )
+
+            for s in perf["strategies_to_review"]:
+                self.log_action("strategy_review",
+                                f"Strategy '{s['name']}' needs review: "
+                                f"net=€{s['net']:.2f}, 7d_net=€{s['trend_7d']['net']:.2f}")
+
             for s in perf["strategies_to_scale"]:
                 self.log_action("strategy_scale",
                                 f"Strategy '{s['name']}' growing: "
-                                f"7d_rev={s['trend_7d']['revenue']:.2f}")
+                                f"7d_rev=€{s['trend_7d']['revenue']:.2f}")
         except Exception as e:
             logger.error(f"Strategy performance eval failed: {e}")
 
