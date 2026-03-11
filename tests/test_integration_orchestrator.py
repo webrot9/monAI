@@ -424,3 +424,177 @@ class TestPipelineFactCheck:
         pipeline = product_launch_pipeline()
         step_names = [s.name for s in pipeline.steps]
         assert "fact_check_landing" in step_names
+
+
+class TestOrchestratorAuditIntegration:
+    """Test that the orchestrator logs audit events during cycles."""
+
+    def test_orchestrator_has_audit_trail(self, integration_config, integration_db,
+                                          mock_llm_responses):
+        """Orchestrator should initialize with an AuditTrail."""
+        from monai.business.audit import AuditTrail
+        llm = _create_mock_llm(integration_config, mock_llm_responses)
+        orch = Orchestrator(integration_config, integration_db, llm)
+        assert isinstance(orch.audit, AuditTrail)
+
+    def test_cycle_logs_audit_events(self, integration_config, integration_db,
+                                     mock_llm_responses):
+        """A full cycle should produce audit trail entries."""
+        llm = _create_mock_llm(integration_config, mock_llm_responses)
+        orch = Orchestrator(integration_config, integration_db, llm)
+
+        mock_telegram = MagicMock()
+        mock_telegram.has_token = False
+        mock_telegram.is_configured = False
+        orch.telegram = mock_telegram
+
+        with patch.object(orch.payment_manager, 'run_sweep_cycle',
+                         return_value={"flow": "none"}), \
+             patch.object(orch.payment_manager, 'health_check',
+                         return_value={"status": "ok"}), \
+             patch.object(orch.payment_manager, 'get_status',
+                         return_value={"active_providers": 0}):
+            orch.run()
+
+        # Should have audit entries for cycle start and complete
+        entries = orch.audit.get_recent(limit=100, agent_name="orchestrator")
+        actions = [e["action"] for e in entries]
+        assert "cycle_start" in actions
+        assert "cycle_complete" in actions
+
+    def test_budget_exhausted_logs_audit(self, integration_config, integration_db,
+                                         mock_llm_responses):
+        """Budget exhaustion should be logged to audit trail."""
+        integration_config.initial_capital = 0.0
+        llm = _create_mock_llm(integration_config, mock_llm_responses)
+        orch = Orchestrator(integration_config, integration_db, llm)
+
+        mock_telegram = MagicMock()
+        mock_telegram.has_token = False
+        mock_telegram.is_configured = False
+        orch.telegram = mock_telegram
+
+        with patch.object(orch.payment_manager, 'run_sweep_cycle',
+                         return_value={"flow": "none"}), \
+             patch.object(orch.payment_manager, 'health_check',
+                         return_value={"status": "ok"}), \
+             patch.object(orch.payment_manager, 'get_status',
+                         return_value={"active_providers": 0}):
+            orch.run()
+
+        high_risk = orch.audit.get_high_risk_entries()
+        actions = [e["action"] for e in high_risk]
+        assert "budget_exhausted" in actions
+
+    def test_direct_actions_audited(self, integration_config, integration_db,
+                                    mock_llm_responses):
+        """Direct actions from the planning phase should be audited."""
+        llm = _create_mock_llm(integration_config, mock_llm_responses)
+        orch = Orchestrator(integration_config, integration_db, llm)
+
+        mock_telegram = MagicMock()
+        mock_telegram.has_token = False
+        mock_telegram.is_configured = False
+        orch.telegram = mock_telegram
+
+        with patch.object(orch.payment_manager, 'run_sweep_cycle',
+                         return_value={"flow": "none"}), \
+             patch.object(orch.payment_manager, 'health_check',
+                         return_value={"status": "ok"}), \
+             patch.object(orch.payment_manager, 'get_status',
+                         return_value={"active_providers": 0}):
+            orch.run()
+
+        entries = orch.audit.get_recent(action_type="system")
+        actions = [e["action"] for e in entries]
+        assert "execute_action" in actions
+
+    def test_audit_agent_summary(self, integration_config, integration_db,
+                                  mock_llm_responses):
+        """Agent summary should work after a cycle."""
+        llm = _create_mock_llm(integration_config, mock_llm_responses)
+        orch = Orchestrator(integration_config, integration_db, llm)
+
+        mock_telegram = MagicMock()
+        mock_telegram.has_token = False
+        mock_telegram.is_configured = False
+        orch.telegram = mock_telegram
+
+        with patch.object(orch.payment_manager, 'run_sweep_cycle',
+                         return_value={"flow": "none"}), \
+             patch.object(orch.payment_manager, 'health_check',
+                         return_value={"status": "ok"}), \
+             patch.object(orch.payment_manager, 'get_status',
+                         return_value={"active_providers": 0}):
+            orch.run()
+
+        summary = orch.audit.get_agent_summary()
+        assert len(summary) > 0
+        assert any(s["agent_name"] == "orchestrator" for s in summary)
+
+
+class TestOrchestratorBackupIntegration:
+    """Test that the orchestrator runs scheduled backups."""
+
+    def test_orchestrator_has_backup_manager(self, integration_config, integration_db,
+                                              mock_llm_responses):
+        """Orchestrator should initialize with a BackupManager."""
+        from monai.business.backup import BackupManager
+        llm = _create_mock_llm(integration_config, mock_llm_responses)
+        orch = Orchestrator(integration_config, integration_db, llm)
+        assert isinstance(orch.backup_manager, BackupManager)
+
+    def test_cycle_creates_backup(self, integration_config, integration_db,
+                                   mock_llm_responses):
+        """A full cycle should produce a database backup."""
+        llm = _create_mock_llm(integration_config, mock_llm_responses)
+        orch = Orchestrator(integration_config, integration_db, llm)
+
+        mock_telegram = MagicMock()
+        mock_telegram.has_token = False
+        mock_telegram.is_configured = False
+        orch.telegram = mock_telegram
+
+        with patch.object(orch.payment_manager, 'run_sweep_cycle',
+                         return_value={"flow": "none"}), \
+             patch.object(orch.payment_manager, 'health_check',
+                         return_value={"status": "ok"}), \
+             patch.object(orch.payment_manager, 'get_status',
+                         return_value={"active_providers": 0}):
+            orch.run()
+
+        backups = orch.backup_manager.list_backups("database")
+        assert len(backups) >= 1
+        assert backups[0]["size_bytes"] > 0
+
+    def test_backup_audited(self, integration_config, integration_db,
+                             mock_llm_responses):
+        """Backup operations should be logged to audit trail."""
+        llm = _create_mock_llm(integration_config, mock_llm_responses)
+        orch = Orchestrator(integration_config, integration_db, llm)
+
+        mock_telegram = MagicMock()
+        mock_telegram.has_token = False
+        mock_telegram.is_configured = False
+        orch.telegram = mock_telegram
+
+        with patch.object(orch.payment_manager, 'run_sweep_cycle',
+                         return_value={"flow": "none"}), \
+             patch.object(orch.payment_manager, 'health_check',
+                         return_value={"status": "ok"}), \
+             patch.object(orch.payment_manager, 'get_status',
+                         return_value={"active_providers": 0}):
+            orch.run()
+
+        entries = orch.audit.get_recent(limit=100, agent_name="orchestrator")
+        actions = [e["action"] for e in entries]
+        assert "backup_database" in actions
+
+    def test_lifecycle_bug_fixed(self, integration_config, integration_db,
+                                  mock_llm_responses):
+        """self.lifecycle → self.strategy_lifecycle bug should be fixed."""
+        llm = _create_mock_llm(integration_config, mock_llm_responses)
+        orch = Orchestrator(integration_config, integration_db, llm)
+        # Should have strategy_lifecycle, not lifecycle
+        assert hasattr(orch, "strategy_lifecycle")
+        assert not hasattr(orch, "lifecycle")

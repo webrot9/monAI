@@ -57,6 +57,8 @@ from monai.workflows.router import TaskRouter
 from monai.utils.privacy import get_anonymizer
 from monai.utils.resources import check_resources
 from monai.utils.sandbox import PROJECT_ROOT
+from monai.business.audit import AuditTrail
+from monai.business.backup import BackupManager
 from monai.utils.telegram import TelegramBot
 
 logger = logging.getLogger(__name__)
@@ -115,6 +117,10 @@ class Orchestrator(BaseAgent):
             payment_manager=self.payment_manager,
         )
         self.strategy_lifecycle = StrategyLifecycle(db)
+        self.audit = AuditTrail(db)
+        self.backup_manager = BackupManager(
+            db, config.data_dir / "backups", max_backups=10,
+        )
         self._ensure_llc_setup()
         # Load persisted cost tracker state
         cost_state_path = str(config.data_dir / "cost_tracker.json")
@@ -181,6 +187,8 @@ class Orchestrator(BaseAgent):
         self._cycle += 1
         self.log_action("cycle_start", f"Cycle {self._cycle} at {datetime.now()}")
         self.journal("plan", f"Starting cycle {self._cycle}")
+        self.audit.log("orchestrator", "system", "cycle_start",
+                       details={"cycle": self._cycle})
         cycle_result = {}
 
         # Phase -2: Anonymity check — creator must NEVER be traceable
@@ -193,6 +201,8 @@ class Orchestrator(BaseAgent):
                 self.learn("alert", "Anonymity check failed",
                            f"Cannot verify anonymous proxy. Status: {anon_status}",
                            rule="NEVER operate without verified anonymity", severity="critical")
+                self.audit.log("orchestrator", "system", "anonymity_check_failed",
+                               details=anon_status, success=False, risk_level="critical")
                 return {"status": "aborted", "reason": "anonymity_check_failed", **cycle_result}
             self.log_action("anonymity_ok",
                             f"Visible IP: {anon_status.get('visible_ip', 'unknown')}")
@@ -209,6 +219,8 @@ class Orchestrator(BaseAgent):
             self.log_action("RESOURCE_LIMIT", json.dumps(resources))
             self.learn("alert", "Resource limit exceeded", json.dumps(resources),
                        rule="Reduce resource usage before next cycle", severity="critical")
+            self.audit.log("orchestrator", "system", "resource_limit_exceeded",
+                           details=resources, success=False, risk_level="critical")
             return {"status": "aborted", "reason": "resource_limits_exceeded", **cycle_result}
 
         # Phase -0.5: Budget check — can we afford to operate?
@@ -216,6 +228,8 @@ class Orchestrator(BaseAgent):
         cycle_result["budget"] = budget
         if budget["balance"] <= 0:
             self.log_action("BUDGET_EXHAUSTED", json.dumps(budget))
+            self.audit.log("orchestrator", "system", "budget_exhausted",
+                           details=budget, success=False, risk_level="high")
             self.learn("alert", "Budget exhausted",
                        f"Balance: €{budget['balance']:.2f}. Cannot spend more.",
                        rule="Focus only on zero-cost revenue activities", severity="critical")
@@ -243,6 +257,9 @@ class Orchestrator(BaseAgent):
             return self._execute_cycle(cycle_result, budget)
         except BudgetExceededError as exc:
             self.log_action("CYCLE_BUDGET_EXCEEDED", str(exc))
+            self.audit.log("orchestrator", "system", "cycle_budget_exceeded",
+                           details={"error": str(exc), "cycle": self._cycle},
+                           success=False, risk_level="high")
             self.learn(
                 "alert", "Cycle budget exceeded",
                 str(exc),
@@ -312,6 +329,12 @@ class Orchestrator(BaseAgent):
                 logger.error(f"Sub-agent execution failed: {e}")
                 cycle_result["subagent_results"] = {"error": str(e)}
 
+        # Audit direct actions
+        for ar in action_results:
+            self.audit.log("orchestrator", "system", "execute_action",
+                           details={"action": ar["action"]},
+                           result=str(ar.get("result", ""))[:200])
+
         # Phase 5.5: Ethics check — test agents before letting them operate
         cycle_result["ethics"] = self._run_ethics_checks()
 
@@ -364,6 +387,8 @@ class Orchestrator(BaseAgent):
                     f"LEDGER IMBALANCE: {len(integrity['unbalanced_entries'])} "
                     f"unbalanced entries detected"
                 )
+                self.audit.log("orchestrator", "system", "ledger_imbalance",
+                               details=integrity, success=False, risk_level="critical")
         except Exception as e:
             logger.error(f"Ledger integrity check failed: {e}")
             cycle_result["ledger_integrity"] = {"error": str(e)}
@@ -383,8 +408,8 @@ class Orchestrator(BaseAgent):
             paused = []
             for s in perf["strategies_to_pause"]:
                 sid = s["id"]
-                if self.lifecycle.can_transition(sid, "paused"):
-                    self.lifecycle.pause(
+                if self.strategy_lifecycle.can_transition(sid, "paused"):
+                    self.strategy_lifecycle.pause(
                         sid,
                         reason=f"Auto-pause: net={s['net']:.2f}, "
                                f"ROI={s['roi_pct']}%, budget_used={s['budget_used_pct']}%",
@@ -393,6 +418,12 @@ class Orchestrator(BaseAgent):
                     self.log_action("strategy_auto_pause",
                                     f"Paused '{s['name']}': net=€{s['net']:.2f}, "
                                     f"ROI={s['roi_pct']}%")
+                    self.audit.log(
+                        "orchestrator", "system", "strategy_auto_pause",
+                        details={"strategy": s["name"], "net": s["net"],
+                                 "roi_pct": s["roi_pct"]},
+                        brand=s.get("name", ""), risk_level="medium",
+                    )
 
             if paused:
                 self.notify_creator(
@@ -446,9 +477,15 @@ class Orchestrator(BaseAgent):
                      {"net_profit": cycle_result["net_profit"]},
                      outcome="success")
         self.log_action("cycle_complete", json.dumps(cycle_result, default=str)[:1000])
+        self.audit.log("orchestrator", "system", "cycle_complete",
+                       details={"cycle": self._cycle,
+                                "net_profit": cycle_result["net_profit"]})
 
         # Persist cost tracker state for session continuity
         get_cost_tracker().save_state(str(self.config.data_dir / "cost_tracker.json"))
+
+        # Phase 9.5: Automated backups (DB every cycle, config every 7 cycles)
+        self._run_scheduled_backups()
 
         # Phase 10: Auto-alerts to creator via Telegram
         self._send_auto_alerts(cycle_result, updated_budget)
@@ -497,6 +534,42 @@ class Orchestrator(BaseAgent):
                 self.telegram.send_message(msg)
             except Exception as e:
                 logger.debug(f"Telegram alert failed: {e}")
+
+    def _run_scheduled_backups(self) -> dict[str, Any]:
+        """Run automated backups on schedule.
+
+        - Database backup: every cycle (lightweight via SQLite backup API)
+        - Config backup: every 7 cycles
+        """
+        results: dict[str, Any] = {}
+        try:
+            # Always back up the database
+            db_result = self.backup_manager.backup_database()
+            results["database"] = {
+                "path": db_result["path"],
+                "size_bytes": db_result["size_bytes"],
+                "verified": db_result["verified"],
+            }
+            self.audit.log("orchestrator", "system", "backup_database",
+                           details=results["database"])
+
+            # Config backup weekly (every 7 cycles)
+            if self._cycle % 7 == 0:
+                config_path = self.config.data_dir / "config.json"
+                if config_path.exists():
+                    cfg_result = self.backup_manager.backup_config(config_path)
+                    results["config"] = cfg_result
+                    self.audit.log("orchestrator", "config", "backup_config",
+                                   details={"path": cfg_result.get("path", "")})
+
+        except Exception as e:
+            logger.error(f"Scheduled backup failed: {e}")
+            results["error"] = str(e)
+            self.audit.log("orchestrator", "system", "backup_failed",
+                           details={"error": str(e)}, success=False,
+                           risk_level="high")
+
+        return results
 
     def _ensure_llc_setup(self) -> None:
         """Auto-provision LLC entity and contractor from config if not in DB."""
@@ -1394,6 +1467,12 @@ class Orchestrator(BaseAgent):
                 if invoice.get("status") == "generated":
                     self.log_action("payment_invoice",
                                     f"Invoice {invoice['invoice_number']}: €{invoice['amount']:.2f}")
+                    self.audit.log(
+                        "orchestrator", "payment", "invoice_generated",
+                        details={"invoice_number": invoice["invoice_number"],
+                                 "amount": invoice["amount"]},
+                        risk_level="high",
+                    )
                     self.notify_creator(
                         f"Invoice generated: {invoice['invoice_number']} — "
                         f"€{invoice['amount']:.2f}. Ready for payment."
@@ -1402,12 +1481,19 @@ class Orchestrator(BaseAgent):
                 if sweep_result.get("sweeps_successful", 0) > 0:
                     xmr = sweep_result.get("total_xmr_swept", 0)
                     self.log_action("payment_sweep", f"Swept {xmr:.8f} XMR")
+                    self.audit.log(
+                        "orchestrator", "payment", "xmr_sweep",
+                        details={"total_xmr": xmr}, risk_level="high",
+                    )
                     self.notify_creator(f"Swept {xmr:.8f} XMR to your wallet.")
 
             return result
 
         except Exception as e:
             logger.error(f"Payment cycle failed: {e}")
+            self.audit.log("orchestrator", "payment", "payment_cycle_failed",
+                           details={"error": str(e)}, success=False,
+                           risk_level="high")
             return {"status": "error", "error": str(e)}
 
     def _run_strategies(self) -> dict[str, Any]:

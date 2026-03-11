@@ -59,8 +59,13 @@
 - [x] Automated backup & restore (SQLite online backup, config backup, rotation, integrity verification)
 - [x] Total: 1299 tests, all passing
 
+- [x] Wire audit trail into orchestrator (cycle start/complete, budget exhaustion, ledger imbalance, payments, strategy pauses, direct actions)
+- [x] Automated scheduled backups in orchestrator (DB every cycle, config every 7 cycles)
+- [x] Fixed self.lifecycle → self.strategy_lifecycle bug in phase 6.97
+- [x] Total: 1308 tests, all passing
+
 ## Next Up
 - [ ] First real deployment test (end-to-end with a real Ko-fi page)
-- [ ] Wire audit trail into orchestrator (log all phase transitions and agent actions)
-- [ ] Automated scheduled backups in orchestrator (daily DB backup, weekly full backup)
 - [ ] Client portal / dashboard (web UI for strategy performance and financial reports)
+- [ ] Webhook-triggered audit events (audit log from webhook handlers)
+- [ ] Backup scheduling configurability (intervals from config rather than hardcoded)
