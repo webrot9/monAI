@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -110,22 +111,124 @@ class AgentSpawner:
         return output
 
     def plan_delegation(self, goal: str) -> list[dict[str, str]]:
-        """Use LLM to break down a goal into delegatable sub-tasks."""
+        """Break down a goal into delegatable sub-tasks with dependency analysis.
+
+        Uses keyword-based decomposition to extract action verbs and identify
+        parallelizable vs sequential tasks, then falls back to LLM for complex
+        goals that resist pattern matching.
+        """
+        # Try structured decomposition first
+        structured = self._decompose_structured(goal)
+        if structured:
+            logger.info(f"Structured decomposition: {len(structured)} sub-tasks for: {goal[:100]}")
+            return structured
+
+        # Fall back to LLM for complex/ambiguous goals
         response = self.llm.chat_json(
             [
                 {"role": "system", "content": (
                     "You are a task planner for an autonomous AI system. "
                     "Break down goals into independent sub-tasks that can run in parallel. "
-                    "Each sub-task should be self-contained and actionable."
+                    "Each sub-task should be self-contained and actionable. "
+                    "Mark tasks that depend on other tasks with a 'depends_on' field."
                 )},
                 {"role": "user", "content": (
                     f"Break this goal into sub-agent tasks:\n{goal}\n\n"
-                    "Return JSON: {\"tasks\": [{\"name\": str (short_snake_case), "
-                    "\"task\": str (detailed task description)}]}"
+                    "Return JSON: {{\"tasks\": [{{\"name\": str (short_snake_case), "
+                    "\"task\": str (detailed task description), "
+                    "\"depends_on\": [str] (names of tasks this depends on, empty if independent)}}]}}"
                 )},
             ],
             temperature=0.3,
         )
         tasks = response.get("tasks", [])
+        # Validate and clean up
+        tasks = self._resolve_dependencies(tasks)
         logger.info(f"Planned {len(tasks)} sub-tasks for: {goal[:100]}")
         return tasks
+
+    # ── Structured task decomposition ─────────────────────────────
+
+    # Action patterns that map to recognizable task types
+    _ACTION_PATTERNS = {
+        "research": ["research", "analyze", "investigate", "study", "explore", "find"],
+        "build": ["build", "create", "implement", "develop", "write", "code"],
+        "test": ["test", "verify", "validate", "check", "ensure"],
+        "deploy": ["deploy", "publish", "launch", "release", "ship"],
+        "market": ["market", "promote", "advertise", "outreach", "campaign"],
+        "monitor": ["monitor", "track", "watch", "observe", "measure"],
+    }
+
+    def _decompose_structured(self, goal: str) -> list[dict[str, str]] | None:
+        """Try to decompose a goal using keyword patterns.
+
+        Returns None if the goal is too complex for pattern matching.
+        """
+        goal_lower = goal.lower()
+
+        # Check for explicit list separators (numbered lists, bullet points, "and")
+        lines = [l.strip() for l in goal.split("\n") if l.strip()]
+        # Detect numbered/bulleted lists
+        list_items = []
+        for line in lines:
+            # Match "1. do X", "- do X", "* do X"
+            match = re.match(r'^(?:\d+[.)]\s*|[-*]\s+)(.+)', line)
+            if match:
+                list_items.append(match.group(1))
+
+        if len(list_items) >= 2:
+            tasks = []
+            for i, item in enumerate(list_items):
+                name = re.sub(r'[^a-z0-9]+', '_', item.lower()[:30]).strip('_')
+                tasks.append({"name": name or f"task_{i+1}", "task": item})
+            return tasks
+
+        # Check for "and"-separated tasks ("research X and build Y and test Z")
+        if " and " in goal_lower and len(goal_lower.split(" and ")) >= 2:
+            parts = goal.split(" and ")
+            if all(len(p.split()) <= 15 for p in parts):  # Short enough to be separate tasks
+                tasks = []
+                for i, part in enumerate(parts):
+                    part = part.strip().rstrip(".")
+                    name = re.sub(r'[^a-z0-9]+', '_', part.lower()[:30]).strip('_')
+                    tasks.append({"name": name or f"task_{i+1}", "task": part})
+                return tasks
+
+        return None
+
+    def _resolve_dependencies(self, tasks: list[dict]) -> list[dict[str, str]]:
+        """Validate dependency references and sort tasks topologically.
+
+        Ensures tasks with dependencies come after their prerequisites.
+        Invalid dependency references are silently dropped.
+        """
+        if not tasks:
+            return tasks
+
+        names = {t.get("name", "") for t in tasks}
+        # Clean up invalid dependencies
+        for t in tasks:
+            deps = t.get("depends_on", [])
+            if isinstance(deps, list):
+                t["depends_on"] = [d for d in deps if d in names]
+            else:
+                t["depends_on"] = []
+
+        # Topological sort (Kahn's algorithm)
+        in_degree = {t["name"]: len(t.get("depends_on", [])) for t in tasks}
+        queue = [t for t in tasks if in_degree.get(t["name"], 0) == 0]
+        sorted_tasks = []
+        while queue:
+            current = queue.pop(0)
+            sorted_tasks.append(current)
+            for t in tasks:
+                if current["name"] in t.get("depends_on", []):
+                    in_degree[t["name"]] -= 1
+                    if in_degree[t["name"]] == 0:
+                        queue.append(t)
+
+        # If cycle detected, return original order
+        if len(sorted_tasks) != len(tasks):
+            return tasks
+
+        return sorted_tasks

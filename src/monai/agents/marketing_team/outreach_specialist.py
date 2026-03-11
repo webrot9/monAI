@@ -99,16 +99,23 @@ class OutreachSpecialist(BaseAgent):
             strategy,
         )
 
-        # ── Layer 3: Plan outreach with real prospect data ─────────
+        # ── Layer 3: Segment prospects and select approach ──────────
+        segments = self._segment_prospects(prospects)
+        historical_perf = self._get_outreach_performance()
+
         outreach_plan = self.think_json(
             f"Plan outreach for:\n"
             f"Strategy: {strategy}\n"
             f"Campaign: {campaign.get('name', '')}\n"
             f"Target audience: {campaign.get('target_audience', '')}\n\n"
-            f"REAL PROSPECT DATA (from web research):\n"
-            f"{json.dumps(prospects, default=str)[:1000]}\n\n"
+            f"REAL PROSPECT DATA (segmented):\n"
+            f"{json.dumps(segments, default=str)[:800]}\n\n"
+            f"HISTORICAL OUTREACH PERFORMANCE:\n"
+            f"{json.dumps(historical_perf, default=str)[:500]}\n\n"
             "Design personalized outreach. NEVER spray and pray. "
-            "Each message must reference specific details about the prospect.\n\n"
+            "Each message must reference specific details about the prospect. "
+            "Use channels with highest historical response rates. "
+            "Skip prospect types that historically never respond.\n\n"
             "Return JSON: {{\"outreach_sequences\": [{{\"target_name\": str, "
             "\"target_type\": str, "
             "\"channel\": \"email\"|\"linkedin\"|\"twitter\"|\"partnership\", "
@@ -200,6 +207,103 @@ class OutreachSpecialist(BaseAgent):
             "sequences": sequences,
         }
 
+    # ── Prospect segmentation ──────────────────────────────────────
+
+    def _segment_prospects(self, prospects_data: dict[str, Any]) -> dict[str, Any]:
+        """Segment prospects by channel availability and engagement potential.
+
+        Groups prospects by best outreach channel and deduplicates against
+        existing outreach history to avoid double-contacting.
+        """
+        prospects = prospects_data.get("prospects", [])
+        if not prospects:
+            return {"segments": {}, "total": 0, "deduplicated": 0}
+
+        # Get already-contacted targets to avoid duplicates
+        contacted = set()
+        try:
+            rows = self.db.execute(
+                "SELECT target_email, target_handle FROM outreach_sequences "
+                "WHERE status != 'bounced'"
+            )
+            for r in rows:
+                if r["target_email"]:
+                    contacted.add(r["target_email"].lower())
+                if r["target_handle"]:
+                    contacted.add(r["target_handle"].lower())
+        except Exception:
+            pass
+
+        segments: dict[str, list[dict]] = {
+            "email": [], "linkedin": [], "twitter": [], "partnership": [],
+        }
+        deduplicated = 0
+
+        for p in prospects:
+            if not isinstance(p, dict):
+                continue
+            # Check for duplicates
+            email = (p.get("email") or "").lower()
+            handle = (p.get("linkedin") or p.get("twitter") or "").lower()
+            if (email and email in contacted) or (handle and handle in contacted):
+                deduplicated += 1
+                continue
+
+            # Route to best channel based on available data
+            if email:
+                segments["email"].append(p)
+            elif p.get("linkedin"):
+                segments["linkedin"].append(p)
+            elif p.get("twitter"):
+                segments["twitter"].append(p)
+            else:
+                segments["partnership"].append(p)
+
+        return {
+            "segments": {k: v for k, v in segments.items() if v},
+            "total": sum(len(v) for v in segments.values()),
+            "deduplicated": deduplicated,
+        }
+
+    def _get_outreach_performance(self) -> dict[str, Any]:
+        """Analyze historical outreach performance by channel.
+
+        Computes response rates per channel and identifies patterns
+        in successful vs. unsuccessful outreach.
+        """
+        try:
+            rows = self.db.execute(
+                "SELECT channel, "
+                "COUNT(*) as total, "
+                "SUM(CASE WHEN status = 'replied' THEN 1 ELSE 0 END) as replied, "
+                "SUM(CASE WHEN status = 'bounced' THEN 1 ELSE 0 END) as bounced, "
+                "AVG(follow_up_count) as avg_follow_ups "
+                "FROM outreach_sequences GROUP BY channel"
+            )
+            by_channel = {}
+            for r in rows:
+                r = dict(r)
+                total = r["total"] or 1
+                r["response_rate"] = round((r["replied"] or 0) / total, 3)
+                r["bounce_rate"] = round((r["bounced"] or 0) / total, 3)
+                by_channel[r["channel"]] = r
+
+            # Best channels ranked by response rate
+            ranked = sorted(by_channel.items(),
+                          key=lambda x: x[1]["response_rate"], reverse=True)
+
+            return {
+                "by_channel": by_channel,
+                "best_channel": ranked[0][0] if ranked else "email",
+                "total_sent": sum(r["total"] for r in by_channel.values()),
+                "overall_response_rate": round(
+                    sum(r["replied"] or 0 for r in by_channel.values()) /
+                    max(sum(r["total"] for r in by_channel.values()), 1), 3
+                ),
+            }
+        except Exception:
+            return {"by_channel": {}, "best_channel": "email"}
+
     # ── Real prospect research ─────────────────────────────────────
 
     def _research_prospects(self, target_audience: str, strategy: str) -> dict[str, Any]:
@@ -276,6 +380,41 @@ class OutreachSpecialist(BaseAgent):
             logger.warning(f"{platform} outreach failed to {target_name}: {e}")
             return False
 
+    # ── Follow-up templates ──────────────────────────────────────────
+
+    _FOLLOW_UP_TEMPLATES = {
+        1: (
+            "Hi {name},\n\n"
+            "I wanted to follow up on my previous message. I understand you're busy — "
+            "just wanted to make sure it didn't get buried.\n\n"
+            "Happy to hop on a quick call if that's easier.\n\n"
+            "Best"
+        ),
+        2: (
+            "Hi {name},\n\n"
+            "Following up one last time. If the timing isn't right, no worries at all. "
+            "Would love to reconnect when it makes sense for you.\n\n"
+            "Cheers"
+        ),
+    }
+
+    def _generate_follow_up(self, target_name: str, original_message: str,
+                            follow_up_num: int) -> str:
+        """Generate follow-up message — template for common cases, LLM for edge cases."""
+        name = target_name.split()[0] if target_name else "there"
+
+        template = self._FOLLOW_UP_TEMPLATES.get(follow_up_num)
+        if template:
+            return template.format(name=name)
+
+        # Fall back to LLM for unusual follow-up counts
+        return self.think(
+            f"Write a polite follow-up message to {target_name}. "
+            f"Original message was:\n{original_message[:500]}\n\n"
+            f"This is follow-up #{follow_up_num}. "
+            "Keep it brief, add value, don't be pushy."
+        )
+
     # ── Follow-up processing ───────────────────────────────────────
 
     def _process_follow_ups(self) -> int:
@@ -291,12 +430,11 @@ class OutreachSpecialist(BaseAgent):
         for seq in due:
             seq = dict(seq)
 
-            # Generate follow-up message
-            follow_up_body = self.think(
-                f"Write a polite follow-up message to {seq.get('target_name', 'the recipient')}. "
-                f"Original message was:\n{seq.get('message_body', '')[:500]}\n\n"
-                f"This is follow-up #{seq.get('follow_up_count', 0) + 1}. "
-                "Keep it brief, add value, don't be pushy."
+            # Generate follow-up — use template for common cases, LLM for edge cases
+            follow_up_num = (seq.get("follow_up_count", 0) or 0) + 1
+            follow_up_body = self._generate_follow_up(
+                seq.get("target_name", ""), seq.get("message_body", ""),
+                follow_up_num,
             )
 
             sent = False

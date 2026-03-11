@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from monai.agents.base import BaseAgent
@@ -106,6 +107,19 @@ class ContentMarketer(BaseAgent):
                 "Naturally incorporate the SEO keywords without keyword stuffing."
             )
 
+            # Validate content quality programmatically before storing
+            seo_keywords = piece.get("seo_keywords", [])
+            validation = self._validate_content(body, seo_keywords)
+            if not validation["pass"]:
+                # Regenerate content with specific feedback
+                body = self.think(
+                    f"Rewrite this content to fix these issues:\n"
+                    f"Issues: {', '.join(validation['issues'])}\n\n"
+                    f"Original content:\n{body[:2000]}\n\n"
+                    f"SEO keywords to include: {', '.join(seo_keywords)}\n"
+                    "Fix the issues while keeping the content quality high."
+                )
+
             # Store the content
             campaign_id = campaign.get("id")
             content_id = self.db.execute_insert(
@@ -139,6 +153,63 @@ class ContentMarketer(BaseAgent):
             "pieces_published": published,
             "pieces": pieces,
             "keywords_researched": keyword_data.get("keywords", []),
+        }
+
+    # ── Programmatic content validation ──────────────────────────────
+
+    def _validate_content(self, body: str, seo_keywords: list[str]) -> dict[str, Any]:
+        """Validate content quality with programmatic checks (no LLM).
+
+        Checks:
+        - Minimum word count for substantive content
+        - Keyword presence (at least some target keywords appear)
+        - Readability (average sentence length, paragraph structure)
+        - No keyword stuffing (keyword density < 3%)
+        - Has headings/structure for long-form content
+        """
+        issues: list[str] = []
+        words = body.split()
+        word_count = len(words)
+
+        # Minimum length check
+        if word_count < 100:
+            issues.append(f"Too short ({word_count} words, need 100+)")
+
+        # Keyword presence check
+        body_lower = body.lower()
+        found_keywords = [kw for kw in seo_keywords if kw.lower() in body_lower]
+        if seo_keywords and not found_keywords:
+            issues.append(f"None of the target keywords found: {seo_keywords[:3]}")
+
+        # Keyword stuffing check (density > 3% for any keyword)
+        # Use word-boundary matching to avoid counting substrings
+        for kw in found_keywords:
+            pattern = re.compile(r'\b' + re.escape(kw.lower()) + r'\b')
+            count = len(pattern.findall(body_lower))
+            density = count / max(word_count, 1) * 100
+            if density > 3.0:
+                issues.append(f"Keyword stuffing: '{kw}' density {density:.1f}% (max 3%)")
+
+        # Readability: average sentence length
+        sentences = re.split(r'[.!?]+', body)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        if sentences:
+            avg_sentence_len = sum(len(s.split()) for s in sentences) / len(sentences)
+            if avg_sentence_len > 30:
+                issues.append(f"Sentences too long (avg {avg_sentence_len:.0f} words, aim for <25)")
+
+        # Structure check for long-form content
+        if word_count > 300:
+            heading_markers = len(re.findall(r'^#{1,3}\s|\n#{1,3}\s|<h[1-3]', body))
+            if heading_markers == 0:
+                issues.append("Long content lacks headings/structure")
+
+        return {
+            "pass": len(issues) == 0,
+            "issues": issues,
+            "word_count": word_count,
+            "keywords_found": len(found_keywords),
+            "keywords_total": len(seo_keywords),
         }
 
     # ── Real SEO research methods ──────────────────────────────────
