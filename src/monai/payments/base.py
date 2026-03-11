@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+import logging
 from typing import Any
 
 from monai.payments.types import (
@@ -12,6 +13,27 @@ from monai.payments.types import (
     ProviderBalance,
     WebhookEvent,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_proxy_url(explicit_url: str = "") -> str:
+    """Resolve proxy URL: use explicit if given, else auto-detect from anonymizer.
+
+    This ensures payment providers ALWAYS go through the proxy even if
+    the caller forgets to pass proxy_url explicitly.
+    """
+    if explicit_url:
+        return explicit_url
+    try:
+        from monai.utils.privacy import get_anonymizer
+        anonymizer = get_anonymizer()
+        url = anonymizer.get_proxy_url()
+        if url:
+            return url
+    except Exception:
+        pass
+    return ""
 
 
 class PaymentProvider(abc.ABC):

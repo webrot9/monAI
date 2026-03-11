@@ -51,42 +51,47 @@ class StripeProvider(PaymentProvider):
         self.api_key = api_key
         self.webhook_secret = webhook_secret
         self.proxy_url = proxy_url
+        self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
-        kwargs: dict[str, Any] = {
-            "timeout": 30.0,
-            "headers": {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-        }
-        if self.proxy_url:
-            kwargs["proxy"] = self.proxy_url
-        return httpx.AsyncClient(**kwargs)
+        if self._client is None or self._client.is_closed:
+            kwargs: dict[str, Any] = {
+                "timeout": 30.0,
+                "headers": {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            }
+            from monai.payments.base import _resolve_proxy_url
+            proxy = _resolve_proxy_url(self.proxy_url)
+            if proxy:
+                kwargs["proxy"] = proxy
+            self._client = httpx.AsyncClient(**kwargs)
+        return self._client
 
     async def _api_call(self, method: str, endpoint: str,
                         data: dict | None = None) -> dict:
         """Make a Stripe API call."""
         url = f"{STRIPE_API_BASE}/{endpoint.lstrip('/')}"
-        async with self._get_client() as client:
-            if method == "GET":
-                resp = await client.get(url, params=data)
-            else:
-                resp = await client.post(url, data=data)
+        client = self._get_client()
+        if method == "GET":
+            resp = await client.get(url, params=data)
+        else:
+            resp = await client.post(url, data=data)
 
-            result = resp.json()
-            if resp.status_code >= 400:
-                error = result.get("error", {})
-                raise StripeAPIError(
-                    error.get("type", "api_error"),
-                    error.get("message", f"HTTP {resp.status_code}"),
-                    error.get("code", ""),
-                )
-            return result
+        result = resp.json()
+        if resp.status_code >= 400:
+            error = result.get("error", {})
+            raise StripeAPIError(
+                error.get("type", "api_error"),
+                error.get("message", f"HTTP {resp.status_code}"),
+                error.get("code", ""),
+            )
+        return result
 
     async def create_payment(self, intent: PaymentIntent) -> PaymentResult:
         """Create a Stripe Checkout Session (payment link)."""
-        amount_cents = int(intent.amount * 100)
+        amount_cents = intent.amount_cents
         currency = intent.currency.lower()
 
         line_items = {
@@ -95,8 +100,8 @@ class StripeProvider(PaymentProvider):
             "line_items[0][price_data][unit_amount]": str(amount_cents),
             "line_items[0][quantity]": "1",
             "mode": "payment",
-            "success_url": intent.metadata.get("success_url", "https://example.com/success"),
-            "cancel_url": intent.metadata.get("cancel_url", "https://example.com/cancel"),
+            "success_url": intent.metadata.get("success_url", ""),
+            "cancel_url": intent.metadata.get("cancel_url", ""),
         }
 
         if intent.customer_email:
@@ -183,11 +188,13 @@ class StripeProvider(PaymentProvider):
     async def handle_webhook(self, payload: bytes,
                              headers: dict[str, str]) -> WebhookEvent | None:
         """Verify and parse a Stripe webhook event."""
-        if self.webhook_secret:
-            sig_header = headers.get("stripe-signature", "")
-            if not self._verify_signature(payload, sig_header):
-                logger.warning("Invalid Stripe webhook signature")
-                return None
+        if not self.webhook_secret:
+            logger.error("Stripe webhook_secret not configured — rejecting webhook")
+            return None
+        sig_header = headers.get("stripe-signature", "")
+        if not self._verify_signature(payload, sig_header):
+            logger.warning("Invalid Stripe webhook signature")
+            return None
 
         try:
             event = json.loads(payload)
@@ -250,7 +257,8 @@ class StripeProvider(PaymentProvider):
     async def create_payment_link(self, amount: float, product: str,
                                   currency: str = "EUR") -> str:
         """Create a reusable Stripe Payment Link."""
-        amount_cents = int(amount * 100)
+        from monai.payments.types import _to_decimal
+        amount_cents = int(_to_decimal(amount) * 100)
 
         # First create a product
         product_data = await self._api_call("POST", "products", {

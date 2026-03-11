@@ -38,8 +38,8 @@ class TestPhoneProvisioner:
     def test_get_number_no_inventory(self, config, db, mock_llm):
         pp = PhoneProvisioner(config, db, mock_llm)
         result = pp.get_number("upwork", "test_agent")
-        assert result["status"] == "pending_api_integration"
-        assert result["platform"] == "upwork"
+        assert result["status"] == "error"
+        assert "No API key" in result["reason"]
 
     def test_get_number_reuses_existing(self, config, db, mock_llm):
         pp = PhoneProvisioner(config, db, mock_llm)

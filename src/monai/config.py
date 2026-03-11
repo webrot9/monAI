@@ -7,6 +7,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from monai.utils.crypto import decrypt_config_fields, encrypt_config_fields
+
 CONFIG_DIR = Path.home() / ".monai"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DB_PATH = CONFIG_DIR / "monai.db"
@@ -20,6 +22,40 @@ class RiskConfig:
     min_roi_threshold: float = 1.0  # Minimum 1x ROI to keep strategy active
     max_monthly_spend_new_strategy: float = 10.0  # Start small, scale on results
     review_period_days: int = 30  # Re-evaluate strategies every 30 days
+
+
+@dataclass
+class CaptchaConfig:
+    """CAPTCHA solving service for autonomous account creation."""
+    provider: str = "twocaptcha"  # twocaptcha, anticaptcha
+    twocaptcha_api_key: str = ""
+    anticaptcha_api_key: str = ""
+    api_key: str = ""  # Fallback: used if provider-specific key is empty
+    max_cost_per_solve_usd: float = 0.01  # Budget guard per CAPTCHA
+    max_daily_solves: int = 50  # Rate limit
+
+
+@dataclass
+class ReinvestmentConfig:
+    """Automatic profit reinvestment rules."""
+    enabled: bool = True
+    reinvest_pct: float = 40.0  # Reinvest 40% of net profit
+    reserve_pct: float = 30.0  # Keep 30% as safety reserve
+    creator_pct: float = 30.0  # 30% to creator (sweep)
+    min_profit_to_reinvest: float = 10.0  # Don't reinvest if profit < €10
+    max_strategy_boost: float = 50.0  # Max € to add to one strategy per cycle
+    max_daily_spend: float = 100.0  # Hard daily spending cap (all strategies combined)
+    max_single_transaction: float = 200.0  # Max spend per single transaction
+    require_approval_above: float = 500.0  # Pause and alert creator above this
+    scale_winners: bool = True  # Give more budget to high-ROI strategies
+    cut_losers: bool = True  # Reduce budget for negative-ROI strategies
+
+
+@dataclass
+class BudgetConfig:
+    max_cycle_cost: float = 5.0  # Max EUR per orchestration cycle
+    max_cycle_calls: int = 200  # Max LLM calls per cycle
+    budget_fraction_per_cycle: float = 0.1  # Never spend >10% of remaining budget in one cycle
 
 
 @dataclass
@@ -49,6 +85,9 @@ class PrivacyConfig:
     dns_over_proxy: bool = True  # Route DNS through proxy to prevent leaks
     verify_anonymity: bool = True  # Check real IP is hidden before operations
     max_requests_per_circuit: int = 50  # Rotate Tor circuit after N requests
+    residential_proxy: str = ""  # Residential proxy URL (socks5:// or http://)
+    datacenter_proxy: str = ""  # Datacenter proxy URL (socks5:// or http://)
+    fallback_enabled: bool = True  # Enable proxy fallback chain (Tor → residential → datacenter)
 
 
 @dataclass
@@ -98,7 +137,7 @@ class LLCConfig:
     contractor_alias: str = ""  # Professional alias for invoicing
     contractor_service: str = "Management consulting and technical advisory"
     contractor_rate_type: str = "percentage"  # percentage, monthly
-    contractor_rate_percentage: float = 90.0  # 90% of revenue to contractor
+    contractor_rate_percentage: float = 90.0  # 90% of revenue to contractor (max 100%)
     contractor_rate_amount: float = 0.0  # Fixed amount if monthly
     contractor_payment_method: str = "bank_transfer"
     contractor_tax_id: str = ""  # Creator's P.IVA or codice fiscale
@@ -152,6 +191,27 @@ class BTCPayConfig:
 
 
 @dataclass
+class SandboxConfig:
+    """Shell command execution sandbox configuration.
+
+    The base whitelist is always active. extra_allowed_commands lets
+    you extend it for deployment-specific needs without touching code.
+    """
+    extra_allowed_commands: list[str] = field(default_factory=list)
+    subprocess_timeout: int = 60  # Default timeout for shell commands
+    enable_namespace_isolation: bool = True  # Use Linux unshare if available
+
+
+@dataclass
+class BackupConfig:
+    """Automated backup scheduling and retention."""
+    db_interval_cycles: int = 1       # Backup DB every N cycles (1 = every cycle)
+    config_interval_cycles: int = 7   # Backup config every N cycles
+    max_backups: int = 10             # Max backup files to retain per type
+    enabled: bool = True              # Master switch for backups
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -163,6 +223,11 @@ class Config:
     bootstrap_wallet: BootstrapWalletConfig = field(default_factory=BootstrapWalletConfig)
     monero: MoneroConfig = field(default_factory=MoneroConfig)
     btcpay: BTCPayConfig = field(default_factory=BTCPayConfig)
+    budget: BudgetConfig = field(default_factory=BudgetConfig)
+    captcha: CaptchaConfig = field(default_factory=CaptchaConfig)
+    reinvestment: ReinvestmentConfig = field(default_factory=ReinvestmentConfig)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    backup: BackupConfig = field(default_factory=BackupConfig)
     initial_capital: float = 500.0  # €500 initial budget
     currency: str = "EUR"
     data_dir: Path = field(default_factory=lambda: CONFIG_DIR)
@@ -173,6 +238,7 @@ class Config:
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE) as f:
                 data = json.load(f)
+            data = decrypt_config_fields(data)
             if "llm" in data:
                 config.llm = LLMConfig(**data["llm"])
             if "risk" in data:
@@ -193,6 +259,14 @@ class Config:
                 config.monero = MoneroConfig(**data["monero"])
             if "btcpay" in data:
                 config.btcpay = BTCPayConfig(**data["btcpay"])
+            if "budget" in data:
+                config.budget = BudgetConfig(**data["budget"])
+            if "captcha" in data:
+                config.captcha = CaptchaConfig(**data["captcha"])
+            if "reinvestment" in data:
+                config.reinvestment = ReinvestmentConfig(**data["reinvestment"])
+            if "backup" in data:
+                config.backup = BackupConfig(**data["backup"])
             if "initial_capital" in data:
                 config.initial_capital = data["initial_capital"]
             if "currency" in data:
@@ -236,6 +310,9 @@ class Config:
                 "dns_over_proxy": self.privacy.dns_over_proxy,
                 "verify_anonymity": self.privacy.verify_anonymity,
                 "max_requests_per_circuit": self.privacy.max_requests_per_circuit,
+                "residential_proxy": self.privacy.residential_proxy,
+                "datacenter_proxy": self.privacy.datacenter_proxy,
+                "fallback_enabled": self.privacy.fallback_enabled,
             },
             "telegram": {
                 "bot_token": self.telegram.bot_token,
@@ -287,8 +364,35 @@ class Config:
                 "server_url": self.btcpay.server_url,
                 "store_id": self.btcpay.store_id,
             },
+            "budget": {
+                "max_cycle_cost": self.budget.max_cycle_cost,
+                "max_cycle_calls": self.budget.max_cycle_calls,
+                "budget_fraction_per_cycle": self.budget.budget_fraction_per_cycle,
+            },
+            "captcha": {
+                "provider": self.captcha.provider,
+                "max_cost_per_solve_usd": self.captcha.max_cost_per_solve_usd,
+                "max_daily_solves": self.captcha.max_daily_solves,
+            },
+            "reinvestment": {
+                "enabled": self.reinvestment.enabled,
+                "reinvest_pct": self.reinvestment.reinvest_pct,
+                "reserve_pct": self.reinvestment.reserve_pct,
+                "creator_pct": self.reinvestment.creator_pct,
+                "min_profit_to_reinvest": self.reinvestment.min_profit_to_reinvest,
+                "max_strategy_boost": self.reinvestment.max_strategy_boost,
+                "scale_winners": self.reinvestment.scale_winners,
+                "cut_losers": self.reinvestment.cut_losers,
+            },
+            "backup": {
+                "db_interval_cycles": self.backup.db_interval_cycles,
+                "config_interval_cycles": self.backup.config_interval_cycles,
+                "max_backups": self.backup.max_backups,
+                "enabled": self.backup.enabled,
+            },
             "initial_capital": self.initial_capital,
             "currency": self.currency,
         }
+        data = encrypt_config_fields(data)
         with open(CONFIG_FILE, "w") as f:
             json.dump(data, f, indent=2)

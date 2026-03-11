@@ -317,10 +317,12 @@ def _print_cycle_summary(result: dict, db: Database):
 def main():
     parser = argparse.ArgumentParser(description="monAI — Autonomous money-making AI")
     parser.add_argument("command", nargs="?", default="daemon",
-                        choices=["daemon", "run", "status", "init", "discover"],
-                        help="Command: daemon (default), run (single cycle), status, init, discover")
+                        choices=["daemon", "run", "status", "init", "discover", "dashboard"],
+                        help="Command: daemon (default), run (single cycle), status, init, discover, dashboard")
     parser.add_argument("--interval", type=int, default=300,
                         help="Seconds between daemon cycles (default: 300)")
+    parser.add_argument("--port", type=int, default=8421,
+                        help="Dashboard server port (default: 8421)")
     args = parser.parse_args()
 
     config = Config.load()
@@ -330,6 +332,12 @@ def main():
         print("Set it via: export OPENAI_API_KEY=sk-...")
         print("Or add it to ~/.monai/config.json")
         sys.exit(1)
+
+    if args.command == "dashboard":
+        import asyncio
+        from monai.dashboard.server import run_dashboard
+        asyncio.run(run_dashboard(config, port=args.port))
+        return
 
     if args.command == "init":
         config.save()

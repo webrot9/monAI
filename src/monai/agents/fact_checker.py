@@ -89,10 +89,89 @@ class FactChecker(BaseAgent):
             conn.executescript(FACT_CHECK_SCHEMA)
 
     def plan(self) -> list[str]:
-        return ["check_pending_content"]
+        """Plan autonomous fact-checking cycle."""
+        steps = []
+
+        # Check for brands with declining accuracy
+        brands = self.get_all_brand_accuracy()
+        declining = [b for b in brands if b["avg_accuracy"] < 0.8]
+        if declining:
+            steps.append("audit_low_accuracy_brands")
+
+        # Check for recent blocks that need review
+        blocked = self.db.execute(
+            "SELECT COUNT(*) as cnt FROM fact_check_results "
+            "WHERE verdict = 'block' AND created_at > datetime('now', '-24 hours')"
+        )
+        if blocked and blocked[0]["cnt"] > 0:
+            steps.append("review_recent_blocks")
+
+        steps.append("generate_accuracy_report")
+        return steps
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
-        return {"status": "ready"}
+        """Autonomous cycle: audit accuracy trends and flag problem areas."""
+        self.log_action("run", "Starting fact-checker autonomous cycle")
+        results: dict[str, Any] = {}
+
+        # 1. Audit brands with low accuracy — identify recurring false-claim categories
+        brands = self.get_all_brand_accuracy()
+        problem_brands = [b for b in brands if b["avg_accuracy"] < 0.8]
+        if problem_brands:
+            brand_issues = {}
+            for brand in problem_brands:
+                recent = self.db.execute(
+                    "SELECT claims_detail FROM fact_check_results "
+                    "WHERE brand = ? AND verdict IN ('block', 'revise') "
+                    "ORDER BY created_at DESC LIMIT 10",
+                    (brand["brand"],),
+                )
+                false_categories: list[str] = []
+                for row in recent:
+                    try:
+                        claims = json.loads(row["claims_detail"] or "[]")
+                        for c in claims:
+                            if c.get("status") in ("false", "unverifiable"):
+                                false_categories.append(c.get("category", "unknown"))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                from collections import Counter
+                common = Counter(false_categories).most_common(3)
+                brand_issues[brand["brand"]] = {
+                    "accuracy": brand["avg_accuracy"],
+                    "weak_categories": [cat for cat, _ in common],
+                }
+            results["problem_brands"] = brand_issues
+
+        # 2. Review recent blocks — share learnings with other agents
+        recent_blocks = self.get_blocked_content()
+        if recent_blocks:
+            blocking_patterns = []
+            for block in recent_blocks[:5]:
+                try:
+                    claims = json.loads(block.get("claims_detail", "[]"))
+                    false_claims = [c for c in claims if c.get("status") == "false"]
+                    for fc in false_claims:
+                        blocking_patterns.append({
+                            "brand": block["brand"],
+                            "claim": fc.get("claim", ""),
+                            "category": fc.get("category", ""),
+                        })
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if blocking_patterns:
+                self.share_knowledge(
+                    category="quality",
+                    topic="common_false_claims",
+                    content=json.dumps(blocking_patterns[:10], default=str),
+                    tags=["fact_check", "quality_alert"],
+                )
+            results["blocks_reviewed"] = len(recent_blocks)
+
+        # 3. Generate accuracy report
+        results["accuracy_report"] = self.get_accuracy_report()
+        self.log_action("run_complete", json.dumps(results, default=str)[:500])
+        return results
 
     # ── Main Entry Point ───────────────────────────────────────
 

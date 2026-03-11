@@ -65,7 +65,7 @@ class BrowserLearner:
         self.db = db
         self.llm = llm
         self.browser = Browser(config, headless=headless)
-        self._captcha_solver = None  # Lazy-loaded
+        self._captcha_solver = None  # Lazy-loaded on first CAPTCHA encounter
 
         with db.connect() as conn:
             conn.executescript(BROWSER_LEARNER_SCHEMA)
@@ -240,15 +240,64 @@ class BrowserLearner:
             return {"action": "needs_login", "domain": domain}
         return {"action": "none"}
 
+    def _get_captcha_solver(self):
+        """Lazy-load CAPTCHA solver."""
+        if self._captcha_solver is None:
+            from monai.agents.captcha_solver import CaptchaSolver
+            self._captcha_solver = CaptchaSolver(self.config, self.db)
+        return self._captcha_solver
+
     async def _handle_captcha(self, domain: str) -> dict[str, Any]:
-        """Handle CAPTCHA challenges."""
-        # Log for now — CAPTCHA solving service integration point
-        logger.warning(f"CAPTCHA detected on {domain}")
-        return {
-            "action": "captcha_detected",
-            "domain": domain,
-            "note": "CAPTCHA solving service needed (2captcha/anti-captcha)",
-        }
+        """Handle CAPTCHA challenges via external solving service."""
+        logger.warning(f"CAPTCHA detected on {domain}, attempting solve")
+        solver = self._get_captcha_solver()
+
+        try:
+            page = await self.browser._get_page()
+            page_url = page.url
+            result = await solver.solve_from_page(page, page_url, domain)
+
+            if result.get("status") == "solved":
+                logger.info(f"CAPTCHA solved on {domain} in {result.get('solve_time_ms')}ms")
+                self._log_action(domain, "captcha_solve", None, page_url, True,
+                                 countermeasure="captcha_service")
+                # Wait for page to process the token
+                await asyncio.sleep(2)
+                # Check if CAPTCHA is gone
+                page_info = await self.browser.get_page_info()
+                if not self._detect_failure(page_info):
+                    return {"action": "captcha_solved", "success": True,
+                            "cost_usd": result.get("cost_usd", 0)}
+
+                # Sometimes need to click submit after injection
+                try:
+                    submit_selectors = [
+                        "button[type='submit']", "input[type='submit']",
+                        "#captcha-submit", ".submit-button",
+                    ]
+                    for sel in submit_selectors:
+                        try:
+                            await page.click(sel, timeout=2000)
+                            break
+                        except Exception:
+                            continue
+                    await asyncio.sleep(2)
+                except Exception:
+                    pass
+
+                return {"action": "captcha_solved", "success": True,
+                        "cost_usd": result.get("cost_usd", 0)}
+
+            logger.warning(f"CAPTCHA solve failed on {domain}: {result.get('error')}")
+            self._log_action(domain, "captcha_solve", None, None, False,
+                             failure_type="captcha",
+                             error_message=result.get("error", "unknown"))
+            return {"action": "captcha_failed", "success": False,
+                    "error": result.get("error")}
+
+        except Exception as e:
+            logger.error(f"CAPTCHA handling error on {domain}: {e}")
+            return {"action": "captcha_error", "success": False, "error": str(e)}
 
     async def _handle_bot_detection(self, domain: str,
                                     url: str) -> dict[str, Any]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
@@ -36,6 +37,18 @@ class WebhookEventType(str, Enum):
     SUBSCRIPTION_CANCELLED = "subscription.cancelled"
 
 
+def _to_decimal(value: float | int | str | Decimal) -> Decimal:
+    """Safely convert a value to Decimal for financial precision."""
+    if isinstance(value, Decimal):
+        return value
+    # Convert via string to avoid float imprecision (e.g. Decimal(0.1) != Decimal("0.1"))
+    return Decimal(str(value))
+
+
+MIN_PAYMENT_AMOUNT = 0.01  # Minimum payment: 1 cent
+MAX_PAYMENT_AMOUNT = 100_000.00  # Safety cap: €100k per single payment
+
+
 @dataclass
 class PaymentIntent:
     """Request to create a payment link or invoice."""
@@ -45,6 +58,30 @@ class PaymentIntent:
     customer_email: str = ""
     brand: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Validate payment amount on creation."""
+        if not isinstance(self.amount, (int, float)):
+            raise ValueError(f"Payment amount must be a number, got {type(self.amount).__name__}")
+        if self.amount != self.amount:  # NaN check
+            raise ValueError("Payment amount cannot be NaN")
+        if self.amount < MIN_PAYMENT_AMOUNT:
+            raise ValueError(
+                f"Payment amount {self.amount} below minimum {MIN_PAYMENT_AMOUNT}"
+            )
+        if self.amount > MAX_PAYMENT_AMOUNT:
+            raise ValueError(
+                f"Payment amount {self.amount} exceeds maximum {MAX_PAYMENT_AMOUNT}"
+            )
+
+    @property
+    def amount_decimal(self) -> Decimal:
+        return _to_decimal(self.amount)
+
+    @property
+    def amount_cents(self) -> int:
+        """Amount in cents — safe integer conversion for Stripe/Gumroad."""
+        return int(self.amount_decimal * 100)
 
 
 @dataclass
@@ -58,6 +95,10 @@ class PaymentResult:
     checkout_url: str = ""  # For payment links
     error: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def amount_decimal(self) -> Decimal:
+        return _to_decimal(self.amount)
 
 
 @dataclass
@@ -74,6 +115,10 @@ class WebhookEvent:
     raw: dict[str, Any] = field(default_factory=dict)
     timestamp: datetime = field(default_factory=datetime.now)
 
+    @property
+    def amount_decimal(self) -> Decimal:
+        return _to_decimal(self.amount)
+
 
 @dataclass
 class ProviderBalance:
@@ -84,6 +129,14 @@ class ProviderBalance:
     provider: str = ""
     account_id: str = ""
     last_checked: datetime = field(default_factory=datetime.now)
+
+    @property
+    def available_decimal(self) -> Decimal:
+        return _to_decimal(self.available)
+
+    @property
+    def pending_decimal(self) -> Decimal:
+        return _to_decimal(self.pending)
 
 
 @dataclass
@@ -97,6 +150,10 @@ class SweepRequest:
     method: str = "crypto_xmr"  # crypto_xmr, crypto_btc_coinjoin, crypto_btc_direct
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def amount_decimal(self) -> Decimal:
+        return _to_decimal(self.amount)
+
 
 @dataclass
 class SweepResult:
@@ -109,3 +166,11 @@ class SweepResult:
     fee: float = 0.0
     error: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def amount_decimal(self) -> Decimal:
+        return _to_decimal(self.amount_crypto)
+
+    @property
+    def fee_decimal(self) -> Decimal:
+        return _to_decimal(self.fee)

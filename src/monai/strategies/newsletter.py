@@ -6,6 +6,7 @@ Builds email subscriber lists around specific niches, then monetizes via:
 - Affiliate links in content
 - Driving traffic to other monAI properties
 
+Uses REAL web research to find niches, sponsors, and growth opportunities.
 Compounds over time — subscribers are an owned asset.
 """
 
@@ -47,19 +48,46 @@ CREATE TABLE IF NOT EXISTS newsletter_issues (
 );
 """
 
+# Real newsletter platforms to research trending niches
+NEWSLETTER_PLATFORMS = [
+    {
+        "name": "substack",
+        "trending_url": "https://substack.com/discover",
+        "category_urls": [
+            "https://substack.com/discover/category/technology",
+            "https://substack.com/discover/category/business",
+            "https://substack.com/discover/category/finance",
+        ],
+    },
+    {
+        "name": "beehiiv",
+        "trending_url": "https://www.beehiiv.com/discover",
+    },
+]
+
+# Real sponsor discovery platforms
+SPONSOR_PLATFORMS = [
+    "https://www.sponsorgap.com/",
+    "https://swapstack.co/",
+    "https://www.paved.com/",
+]
+
 
 class NewsletterAgent(BaseAgent):
     name = "newsletter"
     description = (
-        "Builds and monetizes email newsletters. Picks profitable niches, "
-        "creates consistent high-quality content, grows subscriber lists, "
-        "and monetizes via sponsorships, premium tiers, and affiliate links."
+        "Builds and monetizes email newsletters. Picks profitable niches using "
+        "REAL market research, creates consistent high-quality content, grows "
+        "subscriber lists, and monetizes via sponsorships, premium tiers, and "
+        "affiliate links."
     )
 
     def __init__(self, config: Config, db: Database, llm: LLM):
         super().__init__(config, db, llm)
         with db.connect() as conn:
             conn.executescript(NEWSLETTER_SCHEMA)
+        self.content_dir = config.data_dir / "newsletter_content"
+        self.content_dir.mkdir(parents=True, exist_ok=True)
 
     def plan(self) -> list[str]:
         newsletters = self.db.execute("SELECT * FROM newsletters WHERE status != 'paused'")
@@ -93,22 +121,89 @@ class NewsletterAgent(BaseAgent):
         return results
 
     def _research_niches(self) -> dict[str, Any]:
-        """Find newsletter niches with monetization potential."""
-        return self.think_json(
-            "Research 5 newsletter niches. Requirements:\n"
+        """Find newsletter niches with monetization potential using REAL web data."""
+        self.log_action("niche_research", "Browsing real newsletter platforms for trending niches")
+
+        # Browse Substack trending/discover to see what's actually popular
+        substack_data = self.browse_and_extract(
+            "https://substack.com/discover",
+            "Extract trending newsletters and categories from this page. For each "
+            "newsletter or category, get:\n"
+            "- name: newsletter or category name\n"
+            "- niche/topic: what it covers\n"
+            "- subscriber_count: if shown\n"
+            "- description: brief summary\n"
+            "- is_paid: whether it has a paid tier\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"trending\": [{\"name\": str, \"niche\": str, "
+            "\"subscriber_count\": str, \"description\": str, \"is_paid\": bool}]}"
+        )
+
+        # Browse Substack business/technology categories
+        substack_biz = self.browse_and_extract(
+            "https://substack.com/discover/category/business",
+            "Extract newsletter listings from this business category page. For each "
+            "newsletter, get the name, description, subscriber count if shown, and "
+            "whether it has paid subscribers.\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"newsletters\": [{\"name\": str, \"description\": str, "
+            "\"subscribers\": str, \"is_paid\": bool}]}"
+        )
+
+        # Browse Beehiiv discover for additional market data
+        beehiiv_data = self.browse_and_extract(
+            "https://www.beehiiv.com/discover",
+            "Extract featured or trending newsletters from this page. For each, get:\n"
+            "- name, niche/topic, subscriber_count (if shown), description\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"newsletters\": [{\"name\": str, \"niche\": str, "
+            "\"subscribers\": str, \"description\": str}]}"
+        )
+
+        # Search for newsletter market gaps and underserved niches
+        market_gaps = self.search_web(
+            "most profitable newsletter niches 2026 underserved",
+            "Extract niche ideas, revenue data, audience sizes, and monetization "
+            "strategies mentioned for newsletter businesses. Only include REAL data "
+            "visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"niches\": [{\"niche\": str, \"revenue_data\": str, "
+            "\"audience_size\": str, \"monetization\": str}]}"
+        )
+
+        # Use LLM to analyze real data and pick the best niches
+        raw_data = {
+            "substack_trending": substack_data,
+            "substack_business": substack_biz,
+            "beehiiv": beehiiv_data,
+            "market_gaps": market_gaps,
+        }
+        niches = self.think_json(
+            "Based on the following REAL newsletter market data, identify 5 "
+            "profitable newsletter niches to pursue.\n\n"
+            f"Raw research data:\n{json.dumps(raw_data, default=str)[:4000]}\n\n"
+            "Requirements:\n"
             "- Audience willing to pay for info (professionals, hobbyists)\n"
             "- Sponsors exist in the space (B2B SaaS, tools, courses)\n"
             "- Can publish weekly with consistent value\n"
-            "- Not oversaturated (avoid generic 'AI news')\n"
+            "- Not oversaturated based on the real data above\n"
             "- Can hit 1,000 subscribers in 3 months with good content\n\n"
+            "IMPORTANT: Base your analysis on the real data above. Do not invent "
+            "market data or subscriber counts.\n\n"
             "Return: {\"niches\": [{\"niche\": str, \"audience\": str, "
             "\"content_angle\": str, \"monetization_path\": str, "
             "\"potential_sponsors\": [str], \"estimated_cpm\": float, "
-            "\"platform\": str, \"competition_level\": str}]}"
+            "\"platform\": str, \"competition_level\": str, \"source\": str}]}"
         )
 
+        self.share_knowledge(
+            "opportunity", "newsletter_niches",
+            json.dumps(niches.get("niches", []))[:1000],
+            tags=["newsletter", "niches"],
+        )
+        return niches
+
     def _plan_newsletter(self) -> dict[str, Any]:
-        """Plan a new newsletter from scratch."""
+        """Plan a new newsletter from scratch using LLM for creative planning."""
         plan = self.think_json(
             "Design a newsletter to launch. Include:\n"
             "- Name, tagline, niche\n"
@@ -134,7 +229,7 @@ class NewsletterAgent(BaseAgent):
         return plan
 
     def _write_issue(self) -> dict[str, Any]:
-        """Write a newsletter issue for an active newsletter."""
+        """Write a newsletter issue for an active newsletter using LLM content creation."""
         newsletters = self.db.execute(
             "SELECT * FROM newsletters WHERE status IN ('launched', 'growing', 'monetizing') LIMIT 1"
         )
@@ -142,29 +237,98 @@ class NewsletterAgent(BaseAgent):
             return {"status": "no_active_newsletters"}
 
         nl = dict(newsletters[0])
-        issue = self.think_json(
-            f"Write a newsletter issue for: {nl['name']}\n"
+
+        # Research current events/trends in the niche for the issue
+        niche_news = self.search_web(
+            f"{nl['niche']} latest news trends this week 2026",
+            "Extract the latest news, trends, and noteworthy developments mentioned. "
+            "Include article titles, key points, and sources.\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"news\": [{\"title\": str, \"summary\": str, "
+            "\"source\": str}]}"
+        )
+
+        # Plan the issue structure
+        issue_plan = self.think_json(
+            f"Plan a newsletter issue for: {nl['name']}\n"
             f"Niche: {nl['niche']}\n"
             f"Description: {nl['description']}\n\n"
-            "Create a compelling issue with:\n"
+            f"Recent news/trends in this niche:\n"
+            f"{json.dumps(niche_news, default=str)[:2000]}\n\n"
+            "Plan the issue with:\n"
             "- Attention-grabbing subject line\n"
             "- Opening hook (1-2 sentences)\n"
-            "- 3-5 content sections with real value\n"
+            "- 3-5 content section topics based on real news above\n"
             "- Call to action\n\n"
             "Return: {\"subject\": str, \"hook\": str, "
-            "\"sections\": [{\"heading\": str, \"content\": str}], "
+            "\"sections\": [{\"heading\": str, \"topic\": str}], "
             "\"cta\": str}"
         )
 
-        self.db.execute_insert(
-            "INSERT INTO newsletter_issues (newsletter_id, subject, status) VALUES (?, ?, 'draft')",
-            (nl["id"], issue.get("subject", "Untitled")),
+        # Write the full issue content using LLM
+        sections = issue_plan.get("sections", [])
+        written_sections = []
+        for section in sections:
+            content = self.llm.chat(
+                [
+                    {"role": "system", "content": (
+                        f"You are the author of '{nl['name']}', a {nl['niche']} newsletter. "
+                        "Write engaging, insightful content that provides genuine value to "
+                        "readers. Be opinionated and specific — not generic. Use a conversational "
+                        "but knowledgeable tone. The output must be indistinguishable from "
+                        "expert human work."
+                    )},
+                    {"role": "user", "content": (
+                        f"Write this newsletter section.\n"
+                        f"Heading: {section.get('heading', '')}\n"
+                        f"Topic: {section.get('topic', '')}\n"
+                        f"Context from real news:\n"
+                        f"{json.dumps(niche_news, default=str)[:1000]}\n\n"
+                        "Write 2-4 paragraphs of substantive content. Reference real "
+                        "developments where relevant."
+                    )},
+                ],
+                model=self.config.llm.model,
+            )
+            written_sections.append({
+                "heading": section.get("heading", ""),
+                "content": content,
+            })
+
+        # Track API cost
+        self.record_expense(
+            0.05, "api_cost", f"Newsletter issue for {nl['name']}",
         )
-        self.log_action("issue_written", issue.get("subject", ""))
-        return issue
+
+        # Save the full issue content
+        issue_data = {
+            "subject": issue_plan.get("subject", "Untitled"),
+            "hook": issue_plan.get("hook", ""),
+            "sections": written_sections,
+            "cta": issue_plan.get("cta", ""),
+            "newsletter_id": nl["id"],
+        }
+
+        safe_subject = "".join(
+            c if c.isalnum() or c in " -_" else "" for c in issue_data["subject"]
+        ).strip()[:50]
+        path = self.content_dir / f"issue_{nl['id']}_{safe_subject}.json"
+        path.write_text(json.dumps(issue_data, indent=2))
+
+        self.db.execute_insert(
+            "INSERT INTO newsletter_issues (newsletter_id, subject, content_path, status) "
+            "VALUES (?, ?, ?, 'draft')",
+            (nl["id"], issue_data["subject"], str(path)),
+        )
+        self.log_action("issue_written", issue_data["subject"])
+        return {
+            "subject": issue_data["subject"],
+            "sections": len(written_sections),
+            "content_path": str(path),
+        }
 
     def _find_sponsors(self) -> dict[str, Any]:
-        """Research potential sponsors for newsletters."""
+        """Find REAL potential sponsors by browsing sponsor platforms and newsletters."""
         newsletters = self.db.execute(
             "SELECT * FROM newsletters WHERE status IN ('growing', 'monetizing')"
         )
@@ -172,24 +336,193 @@ class NewsletterAgent(BaseAgent):
             return {"status": "no_newsletters_ready_for_sponsors"}
 
         nl = dict(newsletters[0])
-        return self.think_json(
-            f"Find 5 potential sponsors for newsletter: {nl['name']}\n"
-            f"Niche: {nl['niche']}, Subscribers: {nl['subscriber_count']}\n\n"
-            "Look for:\n"
-            "- SaaS tools the audience uses\n"
-            "- Courses/educational products\n"
-            "- Services relevant to the niche\n"
-            "- Companies with existing newsletter sponsorship programs\n\n"
-            "Return: {\"sponsors\": [{\"company\": str, \"product\": str, "
-            "\"relevance\": str, \"estimated_cpm\": float, "
-            "\"contact_method\": str}]}"
+        self.log_action("sponsor_research", f"Finding sponsors for {nl['name']}")
+
+        # Browse SponsorGap for real sponsor listings
+        sponsorgap_data = self.browse_and_extract(
+            "https://www.sponsorgap.com/",
+            "Extract any sponsor listings, advertiser names, industries, budget "
+            "ranges, and newsletter sponsorship opportunities shown on this page.\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"sponsors\": [{\"name\": str, \"industry\": str, "
+            "\"budget\": str, \"details\": str}]}"
         )
 
-    def _grow_subscribers(self) -> dict[str, Any]:
-        """Plan subscriber growth tactics."""
-        return self.think_json(
-            "Generate 5 specific, actionable growth tactics for a newsletter. "
-            "No generic advice. Specific platforms, communities, and methods.\n\n"
-            "Return: {\"tactics\": [{\"tactic\": str, \"platform\": str, "
-            "\"expected_subscribers\": int, \"effort\": str, \"cost\": float}]}"
+        # Browse Swapstack for real newsletter sponsorship marketplace data
+        swapstack_data = self.browse_and_extract(
+            "https://swapstack.co/",
+            "Extract any sponsor listings, brands, industries, CPM rates, and "
+            "newsletter sponsorship opportunities shown on this page.\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"sponsors\": [{\"name\": str, \"industry\": str, "
+            "\"cpm\": str, \"details\": str}]}"
         )
+
+        # Browse Paved for real sponsor data
+        paved_data = self.browse_and_extract(
+            "https://www.paved.com/",
+            "Extract any sponsor listings, advertiser names, industries, and "
+            "newsletter sponsorship information shown on this page.\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"sponsors\": [{\"name\": str, \"industry\": str, "
+            "\"details\": str}]}"
+        )
+
+        # Search for companies that sponsor newsletters in this niche
+        niche_sponsors = self.search_web(
+            f"companies sponsoring {nl['niche']} newsletters 2026",
+            "Extract company names, products, and any sponsorship details mentioned "
+            "for newsletter sponsorships in this niche.\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"sponsors\": [{\"company\": str, \"product\": str, "
+            "\"sponsorship_details\": str}]}"
+        )
+
+        # Browse existing newsletters in the niche to see who sponsors them
+        competitor_sponsors = self.search_web(
+            f"popular {nl['niche']} newsletter sponsors ads",
+            "Extract the names of companies and brands that appear as sponsors "
+            "or advertisers in newsletters in this niche. Include the newsletter "
+            "name and sponsor/advertiser name.\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"sponsor_sightings\": [{\"newsletter\": str, "
+            "\"sponsor\": str, \"product\": str}]}"
+        )
+
+        # Use LLM to select the most relevant sponsors from real data
+        raw_data = {
+            "sponsorgap": sponsorgap_data,
+            "swapstack": swapstack_data,
+            "paved": paved_data,
+            "niche_search": niche_sponsors,
+            "competitor_sponsors": competitor_sponsors,
+        }
+        sponsors = self.think_json(
+            f"Based on the following REAL sponsor data, find the 5 best potential "
+            f"sponsors for my newsletter '{nl['name']}' in the {nl['niche']} niche.\n"
+            f"Current subscribers: {nl['subscriber_count']}\n\n"
+            f"Raw research data:\n{json.dumps(raw_data, default=str)[:4000]}\n\n"
+            "IMPORTANT: Only include sponsors/companies that appeared in the real "
+            "data above. Do not invent companies.\n\n"
+            "Return: {\"sponsors\": [{\"company\": str, \"product\": str, "
+            "\"relevance\": str, \"estimated_cpm\": float, "
+            "\"contact_method\": str, \"source\": str}]}"
+        )
+
+        self.log_action("sponsors_found", f"{len(sponsors.get('sponsors', []))} potential sponsors")
+        return sponsors
+
+    def _grow_subscribers(self) -> dict[str, Any]:
+        """Execute REAL growth activities using platform actions."""
+        newsletters = self.db.execute(
+            "SELECT * FROM newsletters WHERE status IN ('launched', 'growing', 'monetizing') LIMIT 1"
+        )
+        if not newsletters:
+            return {"status": "no_active_newsletters"}
+
+        nl = dict(newsletters[0])
+        self.log_action("growth_start", f"Running growth tactics for {nl['name']}")
+
+        actions_taken = []
+
+        # 1. Cross-promote on Twitter/X by posting valuable content
+        promo_tweet = self.llm.chat(
+            [
+                {"role": "system", "content": (
+                    "You write engaging social media posts that drive newsletter signups. "
+                    "Be concise, provide a compelling hook, and include a clear CTA."
+                )},
+                {"role": "user", "content": (
+                    f"Write a Twitter/X post promoting the newsletter '{nl['name']}' "
+                    f"about {nl['niche']}. Share a valuable insight from the niche to "
+                    f"hook readers, then mention the newsletter. Keep under 280 characters."
+                )},
+            ],
+            model=self.config.llm.model,
+        )
+
+        twitter_result = self.platform_action(
+            "twitter",
+            f"Post this tweet to promote the newsletter:\n\n{promo_tweet}",
+            context=f"Newsletter: {nl['name']}, Niche: {nl['niche']}",
+        )
+        actions_taken.append({
+            "action": "twitter_post",
+            "status": twitter_result.get("status", "unknown"),
+            "content": promo_tweet[:100],
+        })
+
+        # 2. Post in relevant Reddit communities
+        reddit_post = self.llm.chat(
+            [
+                {"role": "system", "content": (
+                    "You write helpful Reddit posts that provide genuine value. "
+                    "Do NOT be promotional — focus on sharing knowledge. "
+                    "Mention the newsletter naturally only if relevant."
+                )},
+                {"role": "user", "content": (
+                    f"Write a Reddit post sharing a valuable insight about {nl['niche']}. "
+                    f"This should be genuinely useful, not promotional. At the end, "
+                    f"mention that you write a newsletter about this topic if people "
+                    f"want more. Keep it authentic."
+                )},
+            ],
+            model=self.config.llm.model,
+        )
+
+        reddit_result = self.platform_action(
+            "reddit",
+            f"Find a relevant subreddit for {nl['niche']} and post this content. "
+            f"Choose a subreddit where this would be on-topic and valuable.\n\n"
+            f"{reddit_post}",
+            context=f"Newsletter: {nl['name']}, Niche: {nl['niche']}",
+        )
+        actions_taken.append({
+            "action": "reddit_post",
+            "status": reddit_result.get("status", "unknown"),
+        })
+
+        # 3. Find and engage with cross-promotion opportunities
+        cross_promo = self.search_web(
+            f"{nl['niche']} newsletter cross promotion swap recommendations",
+            "Extract newsletter names, their topics, subscriber counts, and any "
+            "cross-promotion or recommendation swap opportunities mentioned.\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"newsletters\": [{\"name\": str, \"topic\": str, "
+            "\"subscribers\": str, \"contact\": str}]}"
+        )
+        actions_taken.append({
+            "action": "cross_promo_research",
+            "status": cross_promo.get("status", "unknown"),
+            "results": cross_promo,
+        })
+
+        # 4. Post on LinkedIn with professional angle
+        linkedin_post = self.llm.chat(
+            [
+                {"role": "system", "content": (
+                    "You write professional LinkedIn posts that share industry insights. "
+                    "Be thoughtful and data-driven. Include a newsletter CTA at the end."
+                )},
+                {"role": "user", "content": (
+                    f"Write a LinkedIn post sharing a professional insight about "
+                    f"{nl['niche']}. This should position you as a thought leader. "
+                    f"End with a mention of your newsletter '{nl['name']}' for those "
+                    f"who want more insights."
+                )},
+            ],
+            model=self.config.llm.model,
+        )
+
+        linkedin_result = self.platform_action(
+            "linkedin",
+            f"Post this content on LinkedIn:\n\n{linkedin_post}",
+            context=f"Newsletter: {nl['name']}, Niche: {nl['niche']}",
+        )
+        actions_taken.append({
+            "action": "linkedin_post",
+            "status": linkedin_result.get("status", "unknown"),
+        })
+
+        self.log_action("growth_complete", f"Executed {len(actions_taken)} growth actions")
+        return {"actions_taken": actions_taken, "newsletter": nl["name"]}

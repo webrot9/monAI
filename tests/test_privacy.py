@@ -1,5 +1,6 @@
 """Tests for monai.utils.privacy — anonymization layer."""
 
+import os
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -211,11 +212,21 @@ class TestAnonymityVerification:
         result = anon.verify_anonymity()
         assert result["proxy_active"] is False
 
-    def test_startup_check_no_proxy(self, no_proxy_config):
+    def test_startup_check_no_proxy_blocked(self, no_proxy_config):
+        """proxy_type=none must raise unless MONAI_ALLOW_NO_PROXY is set."""
         anon = NetworkAnonymizer(no_proxy_config)
-        result = anon.startup_check()
-        assert result["anonymous"] is False
-        assert "proxy disabled" in result["reason"]
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MONAI_ALLOW_NO_PROXY", None)
+            with pytest.raises(AnonymityError, match="proxy_type=none is dangerous"):
+                anon.startup_check()
+
+    def test_startup_check_no_proxy_allowed(self, no_proxy_config):
+        """proxy_type=none allowed with explicit MONAI_ALLOW_NO_PROXY=1."""
+        anon = NetworkAnonymizer(no_proxy_config)
+        with patch.dict(os.environ, {"MONAI_ALLOW_NO_PROXY": "1"}):
+            result = anon.startup_check()
+            assert result["anonymous"] is False
+            assert "explicit override" in result["reason"]
 
 
 class TestMetadataStripping:

@@ -16,6 +16,7 @@ from typing import Any
 
 from monai.config import Config
 from monai.db.database import Database
+from monai.utils.crypto import decrypt_value, encrypt_value
 from monai.utils.llm import LLM
 
 logger = logging.getLogger(__name__)
@@ -97,19 +98,40 @@ class IdentityManager:
             return {**dict(rows[0]), **meta}
         return {}
 
+    def _encrypt_credentials(self, credentials: dict | None) -> str | None:
+        """Encrypt credentials before storing in DB."""
+        if not credentials:
+            return None
+        return encrypt_value(json.dumps(credentials))
+
+    def _decrypt_credentials(self, encrypted: str | None) -> dict | None:
+        """Decrypt credentials read from DB."""
+        if not encrypted:
+            return None
+        try:
+            plaintext = decrypt_value(encrypted)
+            return json.loads(plaintext)
+        except Exception:
+            # Fallback for legacy plaintext entries
+            try:
+                return json.loads(encrypted)
+            except Exception:
+                logger.warning("Failed to decrypt credentials")
+                return None
+
     def store_account(self, platform: str, identifier: str,
                       credentials: dict | None = None, metadata: dict | None = None) -> int:
-        """Store a new platform account."""
+        """Store a new platform account with encrypted credentials."""
         return self.db.execute_insert(
             "INSERT INTO identities (type, platform, identifier, credentials, metadata) "
             "VALUES ('platform_account', ?, ?, ?, ?)",
             (platform, identifier,
-             json.dumps(credentials) if credentials else None,
+             self._encrypt_credentials(credentials),
              json.dumps(metadata) if metadata else None),
         )
 
     def get_account(self, platform: str) -> dict[str, Any] | None:
-        """Get stored account for a platform."""
+        """Get stored account for a platform (decrypts credentials)."""
         rows = self.db.execute(
             "SELECT * FROM identities WHERE platform = ? AND status = 'active' "
             "ORDER BY created_at DESC LIMIT 1",
@@ -118,9 +140,12 @@ class IdentityManager:
         if rows:
             row = dict(rows[0])
             if row.get("credentials"):
-                row["credentials"] = json.loads(row["credentials"])
+                row["credentials"] = self._decrypt_credentials(row["credentials"])
             if row.get("metadata"):
-                row["metadata"] = json.loads(row["metadata"])
+                try:
+                    row["metadata"] = json.loads(row["metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    row["metadata"] = {}
             return row
         return None
 
@@ -133,11 +158,11 @@ class IdentityManager:
 
     def store_api_key(self, provider: str, key_name: str, key_value: str,
                       cost_monthly: float = 0.0) -> int:
-        """Store an acquired API key."""
+        """Store an acquired API key (encrypted)."""
         self.db.execute_insert(
             "INSERT INTO identities (type, platform, identifier, credentials) "
             "VALUES ('api_key', ?, ?, ?)",
-            (provider, key_name, json.dumps({"key": key_value})),
+            (provider, key_name, self._encrypt_credentials({"key": key_value})),
         )
         return self.db.execute_insert(
             "INSERT INTO agent_resources (resource_type, name, provider, cost_monthly) "
@@ -152,8 +177,8 @@ class IdentityManager:
             (provider,),
         )
         if rows and rows[0]["credentials"]:
-            creds = json.loads(rows[0]["credentials"])
-            return creds.get("key")
+            creds = self._decrypt_credentials(rows[0]["credentials"])
+            return creds.get("key") if creds else None
         return None
 
     def store_domain(self, domain: str, registrar: str, metadata: dict | None = None) -> int:

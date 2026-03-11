@@ -27,6 +27,7 @@ from monai.agents.social_presence import SocialPresence
 from monai.agents.web_presence import WebPresence
 from monai.agents.identity import IdentityManager
 from monai.agents.legal import LegalAdvisorFactory
+from monai.agents.api_provisioner import APIProvisioner
 from monai.agents.llc_provisioner import LLCProvisioner
 from monai.agents.phone_provisioner import PhoneProvisioner
 from monai.agents.provisioner import Provisioner
@@ -39,18 +40,25 @@ from monai.business.commercialista import Commercialista
 from monai.business.bootstrap import BootstrapWallet
 from monai.business.crm import CRM
 from monai.business.email_marketing import EmailMarketing
-from monai.business.finance import Finance
+from monai.business.finance import Finance, GeneralLedger
+from monai.business.kofi import KofiCampaignManager
 from monai.business.pipeline import Pipeline
+from monai.business.exchange_rates import ExchangeRateService
+from monai.business.reconciliation import ReconciliationEngine
+from monai.business.reporting import FinancialReporter
 from monai.business.risk import RiskManager
+from monai.business.strategy_lifecycle import StrategyLifecycle
 from monai.config import Config
 from monai.db.database import Database
-from monai.utils.llm import LLM, get_cost_tracker
+from monai.utils.llm import LLM, BudgetExceededError, get_cost_tracker
 from monai.workflows.engine import WorkflowEngine
 from monai.workflows.pipelines import get_pipeline, list_pipelines, PIPELINE_REGISTRY
 from monai.workflows.router import TaskRouter
 from monai.utils.privacy import get_anonymizer
 from monai.utils.resources import check_resources
 from monai.utils.sandbox import PROJECT_ROOT
+from monai.business.audit import AuditTrail
+from monai.business.backup import BackupManager
 from monai.utils.telegram import TelegramBot
 
 logger = logging.getLogger(__name__)
@@ -68,6 +76,7 @@ class Orchestrator(BaseAgent):
         super().__init__(config, db, llm)
         self.crm = CRM(db)
         self.finance = Finance(db)
+        self.ledger = GeneralLedger(db)
         self.risk = RiskManager(config, db)
         self.identity = IdentityManager(config, db, llm)
         self.provisioner = Provisioner(config, db, llm)
@@ -91,20 +100,43 @@ class Orchestrator(BaseAgent):
         self.pipeline = Pipeline(db)
         self.email_marketing = EmailMarketing(db)
         self.brand_payments = BrandPayments(db)
-        self.payment_manager = UnifiedPaymentManager(config, db)
+        self.payment_manager = UnifiedPaymentManager(config, db, ledger=self.ledger)
         self.corporate = CorporateManager(db)
-        self.bootstrap_wallet = BootstrapWallet(config, db)
+        self.bootstrap_wallet = BootstrapWallet(config, db, ledger=self.ledger)
+        self.kofi_manager = KofiCampaignManager(
+            config, db, llm, bootstrap_wallet=self.bootstrap_wallet,
+        )
+        self.exchange_rates = ExchangeRateService(db)
+        self.reporter = FinancialReporter(
+            db, self.ledger, self.finance, bootstrap=self.bootstrap_wallet,
+        )
+        self.reconciliation = ReconciliationEngine(db)
         self.llc_provisioner = LLCProvisioner(config, db, llm)
+        self.api_provisioner = APIProvisioner(
+            config, db, llm,
+            payment_manager=self.payment_manager,
+        )
+        self.strategy_lifecycle = StrategyLifecycle(db)
+        self.audit = AuditTrail(db)
+        self.backup_manager = BackupManager(
+            db, config.data_dir / "backups",
+            max_backups=config.backup.max_backups,
+        )
         self._ensure_llc_setup()
+        # Load persisted cost tracker state
+        cost_state_path = str(config.data_dir / "cost_tracker.json")
+        get_cost_tracker().load_state(cost_state_path)
         self.workflow_engine = WorkflowEngine(config, db, llm)
         self.task_router = TaskRouter(config, db, llm)
         # Register utility agents with workflow engine
         self.workflow_engine.register_agent("humanizer", self.humanizer)
+        self.workflow_engine.register_agent("fact_checker", self.fact_checker)
         self.workflow_engine.register_agent("finance_expert", self.finance_expert)
         self.workflow_engine.register_agent("research_team", self.research_team)
         self.workflow_engine.register_agent("marketing_team", self.marketing_team)
         self.workflow_engine.register_agent("social_presence", self.social_presence)
         self.workflow_engine.register_agent("web_presence", self.web_presence)
+        self.workflow_engine.register_agent("api_provisioner", self.api_provisioner)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
     def register_strategy(self, agent: BaseAgent):
@@ -156,6 +188,8 @@ class Orchestrator(BaseAgent):
         self._cycle += 1
         self.log_action("cycle_start", f"Cycle {self._cycle} at {datetime.now()}")
         self.journal("plan", f"Starting cycle {self._cycle}")
+        self.audit.log("orchestrator", "system", "cycle_start",
+                       details={"cycle": self._cycle})
         cycle_result = {}
 
         # Phase -2: Anonymity check — creator must NEVER be traceable
@@ -168,6 +202,8 @@ class Orchestrator(BaseAgent):
                 self.learn("alert", "Anonymity check failed",
                            f"Cannot verify anonymous proxy. Status: {anon_status}",
                            rule="NEVER operate without verified anonymity", severity="critical")
+                self.audit.log("orchestrator", "system", "anonymity_check_failed",
+                               details=anon_status, success=False, risk_level="critical")
                 return {"status": "aborted", "reason": "anonymity_check_failed", **cycle_result}
             self.log_action("anonymity_ok",
                             f"Visible IP: {anon_status.get('visible_ip', 'unknown')}")
@@ -184,6 +220,8 @@ class Orchestrator(BaseAgent):
             self.log_action("RESOURCE_LIMIT", json.dumps(resources))
             self.learn("alert", "Resource limit exceeded", json.dumps(resources),
                        rule="Reduce resource usage before next cycle", severity="critical")
+            self.audit.log("orchestrator", "system", "resource_limit_exceeded",
+                           details=resources, success=False, risk_level="critical")
             return {"status": "aborted", "reason": "resource_limits_exceeded", **cycle_result}
 
         # Phase -0.5: Budget check — can we afford to operate?
@@ -191,6 +229,8 @@ class Orchestrator(BaseAgent):
         cycle_result["budget"] = budget
         if budget["balance"] <= 0:
             self.log_action("BUDGET_EXHAUSTED", json.dumps(budget))
+            self.audit.log("orchestrator", "system", "budget_exhausted",
+                           details=budget, success=False, risk_level="high")
             self.learn("alert", "Budget exhausted",
                        f"Balance: €{budget['balance']:.2f}. Cannot spend more.",
                        rule="Focus only on zero-cost revenue activities", severity="critical")
@@ -199,6 +239,47 @@ class Orchestrator(BaseAgent):
                         f"€{budget['balance']:.2f} remaining, "
                         f"burn: €{budget['burn_rate_daily']:.4f}/day")
 
+        # Set per-cycle budget limits based on remaining balance
+        tracker = get_cost_tracker()
+        tracker.reset_cycle()
+        max_cycle_cost = min(
+            self.config.budget.max_cycle_cost,
+            budget["balance"] * self.config.budget.budget_fraction_per_cycle,
+        )
+        tracker.set_cycle_limits(
+            max_cost=max_cycle_cost,
+            max_calls=self.config.budget.max_cycle_calls,
+        )
+        self.log_action("cycle_budget",
+                        f"Cycle limits: €{max_cycle_cost:.2f} cost, "
+                        f"{self.config.budget.max_cycle_calls} calls")
+
+        try:
+            return self._execute_cycle(cycle_result, budget)
+        except BudgetExceededError as exc:
+            self.log_action("CYCLE_BUDGET_EXCEEDED", str(exc))
+            self.audit.log("orchestrator", "system", "cycle_budget_exceeded",
+                           details={"error": str(exc), "cycle": self._cycle},
+                           success=False, risk_level="high")
+            self.learn(
+                "alert", "Cycle budget exceeded",
+                str(exc),
+                rule="Reduce LLM calls per cycle — use cheaper models or fewer calls",
+                severity="warning",
+            )
+            cycle_result["status"] = "budget_exceeded"
+            cycle_result["budget_error"] = str(exc)
+            # Still run the commercialista report so we have financial data
+            cycle_result["timestamp"] = datetime.now().isoformat()
+            api_costs = get_cost_tracker().get_summary()
+            cycle_result["api_costs_session"] = api_costs
+            cycle_result["budget_after"] = self.commercialista.get_budget()
+            self.journal("execute", f"Cycle {self._cycle} ended early (budget exceeded)",
+                         {"error": str(exc)}, outcome="budget_exceeded")
+            return cycle_result
+
+    def _execute_cycle(self, cycle_result: dict, budget: dict) -> dict[str, Any]:
+        """Execute the main cycle phases. Separated to allow BudgetExceededError handling."""
         # Phase 0: Start cycle for all registered agents (process messages, load lessons)
         for agent in self._strategy_agents.values():
             agent.start_cycle(self._cycle)
@@ -238,9 +319,8 @@ class Orchestrator(BaseAgent):
 
         # Phase 5: Run delegated tasks via sub-agents (parallel)
         if subagent_tasks:
-            loop = asyncio.new_event_loop()
             try:
-                subagent_results = loop.run_until_complete(
+                subagent_results = self._run_async(
                     self.spawner.run_parallel(subagent_tasks)
                 )
                 cycle_result["subagent_results"] = {
@@ -249,8 +329,12 @@ class Orchestrator(BaseAgent):
             except Exception as e:
                 logger.error(f"Sub-agent execution failed: {e}")
                 cycle_result["subagent_results"] = {"error": str(e)}
-            finally:
-                loop.close()
+
+        # Audit direct actions
+        for ar in action_results:
+            self.audit.log("orchestrator", "system", "execute_action",
+                           details={"action": ar["action"]},
+                           result=str(ar.get("result", ""))[:200])
 
         # Phase 5.5: Ethics check — test agents before letting them operate
         cycle_result["ethics"] = self._run_ethics_checks()
@@ -267,12 +351,13 @@ class Orchestrator(BaseAgent):
         # Phase 6.5: Self-improvement — analyze and improve agents
         cycle_result["self_improvement"] = self._run_self_improvement()
 
-        # Phase 6.6: Finance + Research + Marketing + Social + Web teams
-        cycle_result["finance_analysis"] = self._run_finance_expert()
-        cycle_result["market_research"] = self._run_market_research()
-        cycle_result["marketing"] = self._run_marketing_team()
-        cycle_result["social_presence"] = self._run_social_presence()
-        cycle_result["web_presence"] = self._run_web_presence()
+        # Phase 6.6: Finance + Research + Marketing + Social + Web teams (parallelized)
+        team_results = self._run_teams_parallel()
+        cycle_result["finance_analysis"] = team_results.get("finance", {})
+        cycle_result["market_research"] = team_results.get("research", {})
+        cycle_result["marketing"] = team_results.get("marketing", {})
+        cycle_result["social_presence"] = team_results.get("social", {})
+        cycle_result["web_presence"] = team_results.get("web", {})
 
         # Phase 6.7: Engineering team — self-healing bug fixes
         cycle_result["engineering"] = self._run_engineering_team()
@@ -280,8 +365,85 @@ class Orchestrator(BaseAgent):
         # Phase 6.8: Browser automation metrics
         cycle_result["browser_metrics"] = self._get_browser_metrics()
 
+        # Phase 6.85: Refresh exchange rates (every 6 cycles ≈ hourly)
+        if self._cycle % 6 == 0:
+            try:
+                import asyncio
+                fetched = asyncio.get_event_loop().run_until_complete(
+                    self.exchange_rates.fetch_live_rates()
+                )
+                cycle_result["exchange_rates_refreshed"] = len(fetched)
+            except Exception as e:
+                logger.warning(f"Exchange rate refresh failed: {e}")
+
         # Phase 6.9: Payment processing — sweep profits to creator
         cycle_result["payments"] = self._run_payment_cycle()
+
+        # Phase 6.95: Ledger integrity check
+        try:
+            integrity = self.ledger.verify_integrity()
+            cycle_result["ledger_integrity"] = integrity
+            if not integrity["balanced"]:
+                logger.critical(
+                    f"LEDGER IMBALANCE: {len(integrity['unbalanced_entries'])} "
+                    f"unbalanced entries detected"
+                )
+                self.audit.log("orchestrator", "system", "ledger_imbalance",
+                               details=integrity, success=False, risk_level="critical")
+        except Exception as e:
+            logger.error(f"Ledger integrity check failed: {e}")
+            cycle_result["ledger_integrity"] = {"error": str(e)}
+
+        # Phase 6.97: Strategy performance evaluation + auto-actions
+        try:
+            perf = self.reporter.get_strategy_performance()
+            cycle_result["strategy_performance"] = {
+                "total_revenue": perf["total_revenue"],
+                "total_expenses": perf["total_expenses"],
+                "overall_roi_pct": perf["overall_roi_pct"],
+                "to_review": len(perf["strategies_to_review"]),
+                "to_pause": len(perf["strategies_to_pause"]),
+                "to_scale": len(perf["strategies_to_scale"]),
+            }
+
+            paused = []
+            for s in perf["strategies_to_pause"]:
+                sid = s["id"]
+                if self.strategy_lifecycle.can_transition(sid, "paused"):
+                    self.strategy_lifecycle.pause(
+                        sid,
+                        reason=f"Auto-pause: net={s['net']:.2f}, "
+                               f"ROI={s['roi_pct']}%, budget_used={s['budget_used_pct']}%",
+                    )
+                    paused.append(s["name"])
+                    self.log_action("strategy_auto_pause",
+                                    f"Paused '{s['name']}': net=€{s['net']:.2f}, "
+                                    f"ROI={s['roi_pct']}%")
+                    self.audit.log(
+                        "orchestrator", "system", "strategy_auto_pause",
+                        details={"strategy": s["name"], "net": s["net"],
+                                 "roi_pct": s["roi_pct"]},
+                        brand=s.get("name", ""), risk_level="medium",
+                    )
+
+            if paused:
+                self.notify_creator(
+                    f"*Auto-paused {len(paused)} underperforming "
+                    f"{'strategy' if len(paused) == 1 else 'strategies'}:*\n"
+                    + "\n".join(f"- {name}" for name in paused)
+                    + "\n\nUse /resume <name> to re-activate."
+                )
+
+            for s in perf["strategies_to_review"]:
+                self.log_action("strategy_review",
+                                f"Strategy '{s['name']}' needs review: "
+                                f"net=€{s['net']:.2f}, 7d_net=€{s['trend_7d']['net']:.2f}")
+
+            # Auto-scale: boost budget for growing strategies
+            scaled = self._auto_scale_strategies(perf["strategies_to_scale"])
+            cycle_result["strategy_performance"]["scaled"] = len(scaled)
+        except Exception as e:
+            logger.error(f"Strategy performance eval failed: {e}")
 
         # Phase 7: Commercialista report
         cycle_result["timestamp"] = datetime.now().isoformat()
@@ -294,6 +456,9 @@ class Orchestrator(BaseAgent):
                         f"API calls: {api_costs['total_calls']}, "
                         f"cost: €{api_costs['total_cost_eur']:.4f}, "
                         f"budget: €{updated_budget['balance']:.2f}")
+
+        # Phase 7.5: Automated financial reports
+        self._send_financial_reports()
 
         # Phase 8: Reflect and learn
         self._reflect_on_cycle(cycle_result)
@@ -313,7 +478,100 @@ class Orchestrator(BaseAgent):
                      {"net_profit": cycle_result["net_profit"]},
                      outcome="success")
         self.log_action("cycle_complete", json.dumps(cycle_result, default=str)[:1000])
+        self.audit.log("orchestrator", "system", "cycle_complete",
+                       details={"cycle": self._cycle,
+                                "net_profit": cycle_result["net_profit"]})
+
+        # Persist cost tracker state for session continuity
+        get_cost_tracker().save_state(str(self.config.data_dir / "cost_tracker.json"))
+
+        # Phase 9.5: Automated backups (DB every cycle, config every 7 cycles)
+        self._run_scheduled_backups()
+
+        # Phase 10: Auto-alerts to creator via Telegram
+        self._send_auto_alerts(cycle_result, updated_budget)
+
         return cycle_result
+
+    def _send_auto_alerts(self, cycle_result: dict, budget: dict):
+        """Send automatic Telegram alerts for critical events."""
+        if not self.config.telegram.enabled or not self.config.telegram.bot_token:
+            return
+
+        alerts = []
+
+        # Revenue alert — celebrate first money
+        net_profit = cycle_result.get("net_profit", 0)
+        if net_profit > 0:
+            today = self.finance.get_daily_summary()
+            if today.get("revenue", 0) > 0:
+                alerts.append(f"💰 Revenue today: €{today['revenue']:.2f} "
+                              f"(Net: €{today['net']:.2f})")
+
+        # Budget critical
+        if budget.get("balance", 0) <= 0:
+            alerts.append("🚨 BUDGET EXHAUSTED — all spending paused")
+        elif budget.get("days_until_broke") and budget["days_until_broke"] < 3:
+            alerts.append(f"⚠️ {budget['days_until_broke']} days of budget left "
+                          f"(€{budget['balance']:.2f})")
+
+        # Self-sustaining milestone
+        if budget.get("self_sustaining") and self._cycle <= 5:
+            alerts.append("🎉 MILESTONE: monAI is self-sustaining! Revenue ≥ Expenses")
+
+        # Strategy stopped
+        reviews = cycle_result.get("reviews", {})
+        if isinstance(reviews, dict):
+            for strat_name, review in reviews.items():
+                if isinstance(review, dict) and review.get("paused"):
+                    alerts.append(f"⏸ Strategy paused: {strat_name} "
+                                  f"({review.get('reason', 'low performance')})")
+
+        # Send condensed report
+        if alerts:
+            msg = "📊 monAI Cycle Report\n\n" + "\n".join(alerts)
+            msg += f"\n\n💶 Balance: €{budget.get('balance', 0):.2f}"
+            try:
+                self.telegram.send_message(msg)
+            except Exception as e:
+                logger.debug(f"Telegram alert failed: {e}")
+
+    def _run_scheduled_backups(self) -> dict[str, Any]:
+        """Run automated backups on schedule (intervals from config.backup)."""
+        bcfg = self.config.backup
+        if not bcfg.enabled:
+            return {"status": "disabled"}
+
+        results: dict[str, Any] = {}
+        try:
+            # Database backup on configured interval
+            if self._cycle % bcfg.db_interval_cycles == 0:
+                db_result = self.backup_manager.backup_database()
+                results["database"] = {
+                    "path": db_result["path"],
+                    "size_bytes": db_result["size_bytes"],
+                    "verified": db_result["verified"],
+                }
+                self.audit.log("orchestrator", "system", "backup_database",
+                               details=results["database"])
+
+            # Config backup on configured interval
+            if self._cycle % bcfg.config_interval_cycles == 0:
+                config_path = self.config.data_dir / "config.json"
+                if config_path.exists():
+                    cfg_result = self.backup_manager.backup_config(config_path)
+                    results["config"] = cfg_result
+                    self.audit.log("orchestrator", "config", "backup_config",
+                                   details={"path": cfg_result.get("path", "")})
+
+        except Exception as e:
+            logger.error(f"Scheduled backup failed: {e}")
+            results["error"] = str(e)
+            self.audit.log("orchestrator", "system", "backup_failed",
+                           details={"error": str(e)}, success=False,
+                           risk_level="high")
+
+        return results
 
     def _ensure_llc_setup(self) -> None:
         """Auto-provision LLC entity and contractor from config if not in DB."""
@@ -367,9 +625,14 @@ class Orchestrator(BaseAgent):
 
         if bootstrap_phase == "pre_bootstrap":
             self.log_action("bootstrap",
-                            "No funding source configured. "
-                            "Creator must provide anonymous prepaid card or start crowdfunding.")
-            result["bootstrap"] = {"status": "awaiting_funding"}
+                            "No funding source configured. Starting Ko-fi campaign.")
+            # Auto-setup Ko-fi campaign as primary funding source
+            kofi_result = self._setup_kofi_campaign()
+            result["bootstrap"] = kofi_result
+        else:
+            # Campaign exists — sync donations periodically
+            if self._cycle % 3 == 0:
+                result["kofi_sync"] = self._sync_kofi_donations()
 
         # LLC provisioning — runs if enabled but not yet complete
         llc_status = self.llc_provisioner.get_provision_status()
@@ -398,16 +661,182 @@ class Orchestrator(BaseAgent):
                     f"Will continue next cycle."
                 )
 
-        if not needs and "llc" not in result:
+        # API key provisioning — ensure brands have payment provider keys
+        api_prov_result = self._run_api_provisioning()
+        if api_prov_result.get("provisioned"):
+            result["api_keys"] = api_prov_result
+
+        if not needs and "llc" not in result and "api_keys" not in result:
             return {"status": "infrastructure_ok", "accounts": len(accounts)}
 
         return {"provisioned": needs, "result": result}
 
+    def _setup_kofi_campaign(self) -> dict[str, Any]:
+        """Set up Ko-fi crowdfunding campaign for bootstrap funding."""
+        try:
+            result = self.kofi_manager.run()
+            if result.get("status") == "live":
+                self.notify_creator(
+                    f"Ko-fi campaign is live! {result.get('kofi_url', '')} — "
+                    f"Goal: €500. Share it to get funded!"
+                )
+            self.log_action("kofi_setup", json.dumps(result, default=str)[:500])
+            return result
+        except Exception as e:
+            logger.error(f"Ko-fi campaign setup failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def _sync_kofi_donations(self) -> dict[str, Any]:
+        """Sync Ko-fi donations into bootstrap system."""
+        try:
+            return self.kofi_manager.run()
+        except Exception as e:
+            logger.error(f"Ko-fi sync failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def _auto_scale_strategies(self, to_scale: list[dict]) -> list[str]:
+        """Increase budget for strategies with strong growth trends.
+
+        Rules:
+        - Only scale if ROI > 0 and 7-day revenue trend is positive
+        - Boost = 20% of current budget (capped at max_strategy_boost from config)
+        - Respects max_strategy_allocation_pct from risk config
+        - Notifies creator of budget increases
+        """
+        if not to_scale:
+            return []
+
+        max_boost = getattr(
+            getattr(self.config, "reinvestment", None), "max_strategy_boost", 50.0
+        )
+        max_alloc_pct = self.config.risk.max_strategy_allocation_pct
+
+        total_active_budget = self.db.execute(
+            "SELECT COALESCE(SUM(allocated_budget), 0) as total "
+            "FROM strategies WHERE status = 'active'"
+        )[0]["total"]
+
+        scaled = []
+        for s in to_scale:
+            sid = s["id"]
+            current_budget = s.get("budget", 0)
+
+            # Skip if no budget set
+            if current_budget <= 0:
+                continue
+
+            # Calculate boost (20% of current, capped)
+            boost = min(current_budget * 0.2, max_boost)
+            new_budget = current_budget + boost
+
+            # Check allocation limit
+            if total_active_budget > 0:
+                new_pct = (new_budget / (total_active_budget + boost)) * 100
+                if new_pct > max_alloc_pct:
+                    logger.info(
+                        f"Skip scaling '{s['name']}': would exceed "
+                        f"{max_alloc_pct}% allocation ({new_pct:.1f}%)"
+                    )
+                    continue
+
+            # Update budget in DB
+            self.db.execute(
+                "UPDATE strategies SET allocated_budget = ?, updated_at = ? "
+                "WHERE id = ?",
+                (new_budget, datetime.now().isoformat(), sid),
+            )
+
+            total_active_budget += boost
+            scaled.append(s["name"])
+            self.log_action(
+                "strategy_auto_scale",
+                f"Scaled '{s['name']}': €{current_budget:.0f} → "
+                f"€{new_budget:.0f} (+€{boost:.0f}), "
+                f"ROI={s['roi_pct']}%, 7d_rev=€{s['trend_7d']['revenue']:.2f}"
+            )
+
+        if scaled:
+            self.notify_creator(
+                f"*Auto-scaled {len(scaled)} growing "
+                f"{'strategy' if len(scaled) == 1 else 'strategies'}:*\n"
+                + "\n".join(f"- {name}" for name in scaled)
+            )
+
+        return scaled
+
+    def _send_financial_reports(self) -> None:
+        """Send periodic financial reports to creator via Telegram."""
+        try:
+            # Monthly report: send on 1st of month
+            if self.reporter.should_send_monthly_report():
+                report = self.reporter.generate_monthly_report()
+                msg = self.reporter.format_telegram_report(report)
+                self.notify_creator(msg)
+                self.log_action("monthly_report", f"Sent monthly P&L for {report['period']}")
+
+            # Weekly strategy dashboard + reconciliation: send every Monday
+            elif self.reporter.should_send_weekly_report():
+                dashboard = self.reporter.generate_strategy_dashboard()
+                self.notify_creator(dashboard)
+                self.log_action("weekly_dashboard", "Sent strategy performance dashboard")
+
+                # Run weekly reconciliation
+                recon = self.reconciliation.run_reconciliation()
+                if not recon.is_clean:
+                    msg = self.reconciliation.format_telegram_report(recon)
+                    self.notify_creator(msg)
+                self.log_action("reconciliation",
+                                f"Run #{recon.run_id}: {recon.matched} matched, "
+                                f"{recon.discrepancy_count} discrepancies")
+
+            # Daily snapshot: every cycle (creator can mute in Telegram)
+            elif self._cycle % 10 == 0:
+                snapshot = self.reporter.generate_daily_snapshot()
+                self.notify_creator(snapshot)
+
+        except Exception as e:
+            logger.error(f"Financial reporting failed: {e}")
+
+    def _run_api_provisioning(self) -> dict[str, Any]:
+        """Run API key provisioning for brands that need payment provider keys.
+
+        Checks all active brands and provisions missing API keys
+        (Stripe, Gumroad, LemonSqueezy, BTCPay) via the APIProvisioner agent.
+        Runs every 5 cycles to avoid excessive provisioning attempts.
+        """
+        if self._cycle % 5 != 1:
+            return {"status": "skipped", "reason": "not_provisioning_cycle"}
+
+        try:
+            plan = self.api_provisioner.plan()
+            if not plan:
+                return {"status": "ok", "provisioned": []}
+
+            result = self.api_provisioner.run()
+            self.log_action("api_provisioning", json.dumps(result, default=str)[:500])
+            return result
+        except Exception as e:
+            logger.error(f"API provisioning failed: {e}")
+            return {"status": "error", "error": str(e)}
+
     def discover_opportunities(self) -> list[dict[str, Any]]:
-        """Discover new money-making opportunities."""
+        """Discover new money-making opportunities.
+
+        Enriched with research team findings — if research briefs exist,
+        they're included in the context so the LLM can prioritize validated niches.
+        """
         current = self.db.execute("SELECT name, category, status FROM strategies")
         current_list = [dict(r) for r in current]
         identity = self.identity.get_identity()
+
+        # Pull actionable research briefs to inform opportunity discovery
+        research_briefs = self.research_team.get_pursue_briefs()
+        research_context = ""
+        if research_briefs:
+            research_context = (
+                "\n\nRESEARCH TEAM FINDINGS (validated opportunities):\n"
+                + json.dumps(research_briefs[:5], default=str)[:1500]
+            )
 
         response = self.think_json(
             "Brainstorm 5 NEW money-making opportunities. Think creatively. "
@@ -415,12 +844,17 @@ class Orchestrator(BaseAgent):
             "affiliate marketing, SaaS, automation, consulting, reselling, "
             "domain flipping, social media, courses, newsletter monetization, "
             "API services, data products, and anything else. "
+            "PRIORITIZE opportunities backed by research team findings if available. "
             "For each: {\"opportunities\": [{\"name\": str, \"category\": str, "
             "\"description\": str, \"how_to_start\": str, "
             "\"estimated_monthly_revenue\": float, \"startup_cost\": float, "
             "\"risk_level\": str, \"time_to_first_revenue_days\": int, "
             "\"platforms_needed\": [str], \"can_automate\": bool}]}",
-            context=f"Current strategies: {json.dumps(current_list)}\nIdentity: {json.dumps(identity, default=str)}",
+            context=(
+                f"Current strategies: {json.dumps(current_list)}\n"
+                f"Identity: {json.dumps(identity, default=str)}"
+                f"{research_context}"
+            ),
         )
         opportunities = response.get("opportunities", [])
         self.log_action("discover", f"Found {len(opportunities)} opportunities")
@@ -441,10 +875,13 @@ class Orchestrator(BaseAgent):
             }
             if pause_check["should_pause"]:
                 self.log_action("pause_strategy", s["name"], json.dumps(pause_check["reasons"]))
-                self.db.execute(
-                    "UPDATE strategies SET status = 'paused', updated_at = ? WHERE id = ?",
-                    (datetime.now().isoformat(), s["id"]),
-                )
+                try:
+                    self.strategy_lifecycle.pause(
+                        s["id"],
+                        reason="; ".join(pause_check["reasons"][:3]),
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not pause strategy {s['name']}: {e}")
             reviews.append(review)
         return reviews
 
@@ -653,13 +1090,9 @@ class Orchestrator(BaseAgent):
                 self.collab.start_work(req["id"])
 
                 try:
-                    loop = asyncio.new_event_loop()
-                    try:
-                        results = loop.run_until_complete(
-                            self.spawner.run_parallel(subagent_tasks, max_steps=20)
-                        )
-                    finally:
-                        loop.close()
+                    results = self._run_async(
+                        self.spawner.run_parallel(subagent_tasks, max_steps=20)
+                    )
 
                     task_name = subagent_tasks[0]["name"]
                     result = results.get(task_name, {})
@@ -941,6 +1374,54 @@ class Orchestrator(BaseAgent):
             logger.error(f"Web presence failed: {e}")
             return {"status": "error", "error": str(e)}
 
+    def _run_teams_parallel(self) -> dict[str, Any]:
+        """Run finance, research, marketing, social, and web teams in parallel.
+
+        Uses asyncio to run independent team operations concurrently,
+        reducing total cycle time compared to sequential execution.
+        """
+        import concurrent.futures
+
+        teams = {
+            "finance": self._run_finance_expert,
+            "research": self._run_market_research,
+            "marketing": self._run_marketing_team,
+            "social": self._run_social_presence,
+            "web": self._run_web_presence,
+        }
+
+        results = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(fn): name
+                for name, fn in teams.items()
+            }
+            for future in concurrent.futures.as_completed(futures):
+                name = futures[future]
+                try:
+                    results[name] = future.result(timeout=120)
+                except Exception as e:
+                    logger.error(f"Team {name} failed in parallel execution: {e}")
+                    results[name] = {"status": "error", "error": str(e)}
+
+        # Wire research findings into next discovery cycle
+        research = results.get("research", {})
+        if research.get("briefs"):
+            pursue_briefs = [
+                b for b in research["briefs"]
+                if b.get("recommended_action") == "pursue"
+            ]
+            if pursue_briefs:
+                self.share_knowledge(
+                    "opportunity", "research_recommendations",
+                    json.dumps(pursue_briefs, default=str)[:2000],
+                    tags=["research", "actionable"],
+                )
+                self.log_action("research_wired",
+                                f"{len(pursue_briefs)} actionable research briefs shared")
+
+        return results
+
     def request_research(self, topic: str) -> dict[str, Any]:
         """Request on-demand market research. Available to all agents."""
         return self.research_team.research_specific(topic)
@@ -967,16 +1448,12 @@ class Orchestrator(BaseAgent):
             return {"status": "skipped", "reason": "not_payment_cycle"}
 
         try:
-            loop = asyncio.new_event_loop()
-            try:
-                sweep_result = loop.run_until_complete(
-                    self.payment_manager.run_sweep_cycle()
-                )
-                health = loop.run_until_complete(
-                    self.payment_manager.health_check()
-                )
-            finally:
-                loop.close()
+            sweep_result = self._run_async(
+                self.payment_manager.run_sweep_cycle()
+            )
+            health = self._run_async(
+                self.payment_manager.health_check()
+            )
 
             result = {
                 "sweep": sweep_result,
@@ -992,6 +1469,12 @@ class Orchestrator(BaseAgent):
                 if invoice.get("status") == "generated":
                     self.log_action("payment_invoice",
                                     f"Invoice {invoice['invoice_number']}: €{invoice['amount']:.2f}")
+                    self.audit.log(
+                        "orchestrator", "payment", "invoice_generated",
+                        details={"invoice_number": invoice["invoice_number"],
+                                 "amount": invoice["amount"]},
+                        risk_level="high",
+                    )
                     self.notify_creator(
                         f"Invoice generated: {invoice['invoice_number']} — "
                         f"€{invoice['amount']:.2f}. Ready for payment."
@@ -1000,12 +1483,19 @@ class Orchestrator(BaseAgent):
                 if sweep_result.get("sweeps_successful", 0) > 0:
                     xmr = sweep_result.get("total_xmr_swept", 0)
                     self.log_action("payment_sweep", f"Swept {xmr:.8f} XMR")
+                    self.audit.log(
+                        "orchestrator", "payment", "xmr_sweep",
+                        details={"total_xmr": xmr}, risk_level="high",
+                    )
                     self.notify_creator(f"Swept {xmr:.8f} XMR to your wallet.")
 
             return result
 
         except Exception as e:
             logger.error(f"Payment cycle failed: {e}")
+            self.audit.log("orchestrator", "payment", "payment_cycle_failed",
+                           details={"error": str(e)}, success=False,
+                           risk_level="high")
             return {"status": "error", "error": str(e)}
 
     def _run_strategies(self) -> dict[str, Any]:

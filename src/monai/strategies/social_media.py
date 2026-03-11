@@ -7,12 +7,16 @@ Recurring monthly retainers. Uses Humanizer for content quality.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from monai.agents.base import BaseAgent
 from monai.config import Config
 from monai.db.database import Database
+from monai.social.api import create_platform_client, SocialAPIError
 from monai.utils.llm import LLM
+
+logger = logging.getLogger(__name__)
 
 SMM_SCHEMA = """
 CREATE TABLE IF NOT EXISTS smm_clients (
@@ -37,6 +41,8 @@ CREATE TABLE IF NOT EXISTS social_posts (
     hashtags TEXT,
     scheduled_for TIMESTAMP,
     status TEXT DEFAULT 'draft',             -- draft, approved, scheduled, posted, failed
+    post_id TEXT,                            -- platform post ID after posting
+    post_url TEXT,                           -- URL to the live post
     engagement_likes INTEGER DEFAULT 0,
     engagement_comments INTEGER DEFAULT 0,
     engagement_shares INTEGER DEFAULT 0,
@@ -88,22 +94,79 @@ class SocialMediaAgent(BaseAgent):
         return results
 
     def _find_clients(self) -> dict[str, Any]:
-        """Find SMBs that need social media management."""
-        return self.think_json(
-            "Research 5 types of small businesses that need social media management. "
-            "Focus on:\n"
-            "- Businesses too busy to post themselves\n"
-            "- Industries where social presence directly drives sales\n"
-            "- Businesses with budget ($300-1500/month range)\n"
-            "- Low-complexity content (not requiring real photos constantly)\n\n"
-            "Return: {\"prospects\": [{\"business_type\": str, \"industry\": str, "
-            "\"platforms\": [str], \"content_types\": [str], "
-            "\"typical_retainer\": float, \"pitch_angle\": str, "
-            "\"where_to_find\": str}]}"
+        """Find REAL SMBs that need social media management by browsing actual platforms."""
+        prospects = []
+
+        # Search LinkedIn for small businesses posting infrequently
+        linkedin_data = self.browse_and_extract(
+            "https://www.linkedin.com/search/results/companies/?companySize=B&companySize=C&origin=FACETED_SEARCH",
+            "Find small businesses (1-50 employees) that appear to have inactive or "
+            "infrequent social media activity. For each business extract:\n"
+            "- company_name: the business name\n"
+            "- industry: what industry they are in\n"
+            "- employee_count: approximate number of employees\n"
+            "- linkedin_url: their LinkedIn profile URL\n"
+            "- last_post_date: when they last posted (if visible)\n"
+            "- posting_frequency: how often they post (daily/weekly/monthly/rarely)\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"businesses\": [...]}"
         )
+        for biz in linkedin_data.get("businesses", []):
+            biz["source"] = "linkedin"
+            prospects.append(biz)
+
+        # Search Twitter for businesses with low engagement
+        twitter_data = self.search_web(
+            "small business social media help needed site:twitter.com OR site:x.com",
+            "Find real small businesses on Twitter/X that are struggling with social media "
+            "or posting inconsistently. For each extract:\n"
+            "- company_name: the business name\n"
+            "- industry: what industry\n"
+            "- twitter_handle: their @handle\n"
+            "- follower_count: approximate followers\n"
+            "- posting_frequency: how often they post\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"businesses\": [...]}"
+        )
+        for biz in twitter_data.get("businesses", []):
+            biz["source"] = "twitter"
+            prospects.append(biz)
+
+        # Search for businesses actively looking for SMM help
+        seeking_help = self.search_web(
+            "looking for social media manager small business 2024 2025",
+            "Find real job postings, forum threads, or classified ads from small businesses "
+            "looking for social media management help. For each extract:\n"
+            "- business_name: the business or poster name\n"
+            "- industry: what industry\n"
+            "- platform_url: where the listing was found\n"
+            "- budget_mentioned: any budget they mentioned\n"
+            "- requirements: what they need\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"listings\": [...]}"
+        )
+        for listing in seeking_help.get("listings", []):
+            listing["source"] = "job_board"
+            prospects.append(listing)
+
+        # Store qualifying prospects in DB
+        stored = 0
+        for prospect in prospects:
+            name = prospect.get("company_name") or prospect.get("business_name", "Unknown")
+            industry = prospect.get("industry", "")
+            if name and name != "Unknown":
+                self.db.execute_insert(
+                    "INSERT INTO smm_clients (client_name, industry, platforms, status) "
+                    "VALUES (?, ?, ?, 'prospect')",
+                    (name, industry, json.dumps(["twitter", "linkedin", "instagram"])),
+                )
+                stored += 1
+
+        self.log_action("find_clients", f"Found {len(prospects)} prospects, stored {stored}")
+        return {"prospects_found": len(prospects), "stored": stored, "prospects": prospects}
 
     def _create_content_batch(self) -> dict[str, Any]:
-        """Create a batch of social media posts for active clients."""
+        """Create a batch of social media posts for active clients and POST them live."""
         clients = self.db.execute(
             "SELECT * FROM smm_clients WHERE status = 'active'"
         )
@@ -111,12 +174,14 @@ class SocialMediaAgent(BaseAgent):
             return {"status": "no_active_clients"}
 
         total_posts = 0
+        total_posted = 0
         for client in clients:
             c = dict(client)
             platforms = json.loads(c["platforms"])
             posts_per_platform = c["content_per_week"]
 
             for platform in platforms:
+                # Use LLM for content creation — this is legitimate creative work
                 batch = self.think_json(
                     f"Create {posts_per_platform} {platform} posts for:\n"
                     f"Client: {c['client_name']}\n"
@@ -127,17 +192,81 @@ class SocialMediaAgent(BaseAgent):
                 )
 
                 for post in batch.get("posts", []):
-                    self.db.execute_insert(
+                    content = post.get("content", "")
+                    hashtags = post.get("hashtags", [])
+                    full_content = content
+                    if hashtags:
+                        full_content += "\n\n" + " ".join(
+                            f"#{h}" if not h.startswith("#") else h for h in hashtags
+                        )
+
+                    # Save draft to DB first
+                    post_row_id = self.db.execute_insert(
                         "INSERT INTO social_posts (client_id, platform, content, "
                         "hashtags, media_description, status) VALUES (?, ?, ?, ?, ?, 'draft')",
-                        (c["id"], platform, post.get("content", ""),
-                         json.dumps(post.get("hashtags", [])),
+                        (c["id"], platform, content,
+                         json.dumps(hashtags),
                          post.get("media_suggestion", "")),
                     )
                     total_posts += 1
 
-        self.log_action("content_created", f"{total_posts} posts for {len(clients)} clients")
-        return {"posts_created": total_posts, "clients_served": len(clients)}
+                    # Actually POST via the social API client
+                    try:
+                        creds = self.get_platform_credentials(platform)
+                        if creds:
+                            api_client = create_platform_client(
+                                platform, self.config, creds
+                            )
+                            result = api_client.post(full_content)
+                            # Update DB with live post info
+                            self.db.execute(
+                                "UPDATE social_posts SET status = 'posted', "
+                                "post_id = ?, post_url = ? WHERE id = ?",
+                                (result.get("post_id", ""),
+                                 result.get("url", ""), post_row_id),
+                            )
+                            total_posted += 1
+                            self.log_action(
+                                "post_published", platform,
+                                f"client={c['client_name']} post_id={result.get('post_id', '')}"
+                            )
+                        else:
+                            # No credentials — use platform_action as fallback
+                            result = self.platform_action(
+                                platform,
+                                f"Post the following content:\n\n{full_content}",
+                                f"Posting on behalf of client: {c['client_name']}"
+                            )
+                            self.db.execute(
+                                "UPDATE social_posts SET status = 'posted', "
+                                "post_id = ?, post_url = ? WHERE id = ?",
+                                (result.get("post_id", ""),
+                                 result.get("url", ""), post_row_id),
+                            )
+                            total_posted += 1
+                    except SocialAPIError as e:
+                        self.db.execute(
+                            "UPDATE social_posts SET status = 'failed' WHERE id = ?",
+                            (post_row_id,),
+                        )
+                        self.log_action("post_failed", platform, str(e)[:300])
+                        self.learn_from_error(e, f"Posting to {platform} for {c['client_name']}")
+                    except Exception as e:
+                        self.db.execute(
+                            "UPDATE social_posts SET status = 'failed' WHERE id = ?",
+                            (post_row_id,),
+                        )
+                        self.log_action("post_failed", platform, str(e)[:300])
+
+        self.log_action(
+            "content_created",
+            f"{total_posts} drafted, {total_posted} posted for {len(clients)} clients"
+        )
+        return {
+            "posts_created": total_posts,
+            "posts_published": total_posted,
+            "clients_served": len(clients),
+        }
 
     def _analyze_engagement(self) -> dict[str, Any]:
         """Analyze engagement metrics for posted content."""

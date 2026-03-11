@@ -1,8 +1,8 @@
-"""Micro-SaaS strategy agent — builds small tools and API wrappers.
+"""Micro-SaaS strategy agent — builds small tools and deploys them for real.
 
 Identifies opportunities for small, focused software tools that solve
 specific problems. Uses the Coder agent to build them. Deploys on
-free tiers (Vercel, Railway, Render, etc.).
+free tiers (Vercel, Railway, Render, etc.) via executor.
 """
 
 from __future__ import annotations
@@ -15,13 +15,34 @@ from monai.config import Config
 from monai.db.database import Database
 from monai.utils.llm import LLM
 
+# Real deployment targets with free tiers
+DEPLOY_PLATFORMS = {
+    "railway": {
+        "url": "https://railway.app",
+        "signup_url": "https://railway.app/login",
+        "deploy_url": "https://railway.app/new",
+        "free_tier": "$5/month credit",
+    },
+    "render": {
+        "url": "https://render.com",
+        "signup_url": "https://dashboard.render.com/register",
+        "deploy_url": "https://dashboard.render.com/create",
+        "free_tier": "750 hours/month free",
+    },
+    "vercel": {
+        "url": "https://vercel.com",
+        "signup_url": "https://vercel.com/signup",
+        "deploy_url": "https://vercel.com/new",
+        "free_tier": "Hobby plan free",
+    },
+}
+
 
 class MicroSaaSAgent(BaseAgent):
     name = "micro_saas"
     description = (
         "Identifies and builds micro-SaaS tools — small, focused software "
-        "that solves specific problems. API wrappers, converters, calculators, "
-        "generators. Deploys on free tiers for zero-cost hosting."
+        "that solves specific problems. Deploys them for real on free hosting tiers."
     )
 
     def __init__(self, config: Config, db: Database, llm: LLM):
@@ -35,7 +56,7 @@ class MicroSaaSAgent(BaseAgent):
             f"I have {len(existing)} micro-SaaS products. Plan next actions.\n"
             "Return: {\"steps\": [str]}.\n"
             "Options: research_opportunities, design_product, build_mvp, "
-            "deploy, create_landing_page, analyze_usage.",
+            "deploy, create_landing_page, check_usage.",
         )
         return plan.get("steps", ["research_opportunities"])
 
@@ -51,25 +72,55 @@ class MicroSaaSAgent(BaseAgent):
                 results["design"] = self._design_product()
             elif step == "build_mvp":
                 results["build"] = self._build_mvp()
+            elif step == "deploy":
+                results["deploy"] = self._deploy()
+            elif step == "create_landing_page":
+                results["landing"] = self._create_landing_page()
+            elif step == "check_usage":
+                results["usage"] = self._check_usage()
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results
 
     def _research_opportunities(self) -> dict[str, Any]:
-        """Find micro-SaaS opportunities — small tools people would pay for."""
+        """Find micro-SaaS opportunities by analyzing REAL market data."""
+        # Browse real sources for micro-SaaS ideas
+        ph_result = self.browse_and_extract(
+            "https://www.producthunt.com/topics/developer-tools",
+            "Extract trending developer tools and micro-SaaS products.\n"
+            "For each: name, tagline, category, upvotes, pricing model.\n"
+            "Return JSON: {\"products\": [{\"name\": str, \"tagline\": str, "
+            "\"category\": str, \"upvotes\": int, \"pricing\": str}]}\n"
+            "Only include REAL products visible on the page.",
+        )
+
+        # Check IndieHackers for real revenue data
+        ih_result = self.browse_and_extract(
+            "https://www.indiehackers.com/products?revenueVerification=stripe&sorting=highest-revenue",
+            "Extract micro-SaaS products with verified revenue.\n"
+            "For each: name, description, monthly revenue, founder.\n"
+            "Return JSON: {\"products\": [{\"name\": str, \"description\": str, "
+            "\"revenue\": str, \"founder\": str}]}\n"
+            "Only include REAL products visible on the page.",
+        )
+
+        real_data = {
+            "product_hunt": ph_result.get("result", {}),
+            "indie_hackers": ih_result.get("result", {}),
+        }
+
+        # Use real data to identify gaps
         opportunities = self.think_json(
-            "Brainstorm 5 micro-SaaS product ideas. Requirements:\n"
+            "Based on this REAL market data, identify 5 micro-SaaS opportunities.\n"
+            "Requirements:\n"
             "- Can be built in a day by an AI agent\n"
             "- Solves a specific, real problem\n"
             "- Can be deployed free (Vercel, Render, Railway)\n"
-            "- Has a clear monetization path (freemium, one-time, API pricing)\n"
-            "- Low competition in the exact niche\n\n"
-            "Think about: API wrappers, format converters, calculators, "
-            "generators, validators, scrapers-as-a-service, data enrichment tools.\n\n"
+            "- Has a clear monetization path\n\n"
+            f"Real market data:\n{json.dumps(real_data, default=str)[:3000]}\n\n"
             "Return: {\"ideas\": [{\"name\": str, \"problem\": str, "
             "\"solution\": str, \"tech_stack\": str, \"pricing_model\": str, "
-            "\"estimated_monthly_revenue\": float, \"build_time_hours\": int, "
-            "\"deploy_platform\": str}]}"
+            "\"deploy_platform\": str}]}",
         )
         self.share_knowledge(
             "opportunity", "micro_saas_ideas",
@@ -91,7 +142,6 @@ class MicroSaaSAgent(BaseAgent):
             "\"deploy_target\": str}"
         )
 
-        # Save design
         name = spec.get("name", "untitled")
         safe_name = "".join(c if c.isalnum() or c in " -_" else "" for c in name).strip()
         design_path = self.products_dir / f"{safe_name}.json"
@@ -102,14 +152,12 @@ class MicroSaaSAgent(BaseAgent):
 
     def _build_mvp(self) -> dict[str, Any]:
         """Build an MVP using the Coder agent."""
-        # Find a designed but not built product
         for path in self.products_dir.glob("*.json"):
             data = json.loads(path.read_text())
             if data.get("status") == "designed":
                 design = data["design"]
                 name = design.get("name", "untitled")
 
-                # Use Coder to build it
                 spec = (
                     f"Build a micro-SaaS MVP: {name}\n"
                     f"Tagline: {design.get('tagline', '')}\n"
@@ -117,7 +165,9 @@ class MicroSaaSAgent(BaseAgent):
                     f"Tech stack: {json.dumps(design.get('tech_stack', {}))}\n"
                     f"API endpoints: {json.dumps(design.get('api_endpoints', []))}\n"
                     f"Build a working Python backend with all endpoints. "
-                    f"Include proper error handling and input validation."
+                    f"Include proper error handling and input validation. "
+                    f"Include a Dockerfile and requirements.txt for deployment. "
+                    f"Include a simple landing page (index.html) with the product description."
                 )
 
                 build_result = self.coder.generate_module(spec)
@@ -129,3 +179,128 @@ class MicroSaaSAgent(BaseAgent):
                 return {"product": name, "build_status": build_result.get("status")}
 
         return {"status": "no_products_to_build"}
+
+    def _deploy(self) -> dict[str, Any]:
+        """Deploy built products to REAL hosting platforms."""
+        deployed = 0
+
+        for path in self.products_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "built":
+                continue
+
+            design = data.get("design", {})
+            name = design.get("name", "untitled")
+            target = design.get("deploy_target", "railway")
+
+            if target not in DEPLOY_PLATFORMS:
+                target = "railway"  # Default
+
+            platform_info = DEPLOY_PLATFORMS[target]
+
+            # Ensure account on the deployment platform
+            self.ensure_platform_account(target)
+
+            # Deploy via executor
+            build_info = data.get("build", {})
+            project_dir = build_info.get("project_dir", "")
+
+            result = self.execute_task(
+                f"Deploy this micro-SaaS product to {target}.\n\n"
+                f"Product: {name}\n"
+                f"Deploy URL: {platform_info['deploy_url']}\n"
+                f"Project directory: {project_dir}\n\n"
+                f"Steps:\n"
+                f"1. Navigate to {platform_info['deploy_url']}\n"
+                f"2. Create a new project/service\n"
+                f"3. Connect it to the project code (upload or git deploy)\n"
+                f"4. Configure environment variables if needed\n"
+                f"5. Deploy and wait for the build to complete\n"
+                f"6. Return the deployed URL\n\n"
+                f"If there's a GitHub deploy option, create a repo first and push the code.",
+            )
+
+            if result.get("status") == "completed":
+                data["status"] = "deployed"
+                data["deploy_result"] = result.get("result", "")
+                data["deploy_platform"] = target
+                path.write_text(json.dumps(data, indent=2))
+                deployed += 1
+                self.log_action("deployed", f"Deployed {name} to {target}")
+            else:
+                self.log_action("deploy_failed",
+                                f"Failed to deploy {name}: {result.get('reason', '')}")
+
+        return {"deployed": deployed}
+
+    def _create_landing_page(self) -> dict[str, Any]:
+        """Create a real landing page for deployed products."""
+        created = 0
+
+        for path in self.products_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "deployed":
+                continue
+            if data.get("landing_page_created"):
+                continue
+
+            design = data.get("design", {})
+            name = design.get("name", "untitled")
+            deploy_url = data.get("deploy_result", "")
+
+            # Build a landing page with the coder
+            landing_spec = (
+                f"Create a professional, conversion-optimized landing page for:\n"
+                f"Product: {name}\n"
+                f"Tagline: {design.get('tagline', '')}\n"
+                f"Problem it solves: {design.get('problem', '')}\n"
+                f"Features: {json.dumps(design.get('features', []))}\n"
+                f"Pricing: {json.dumps(design.get('pricing', {}))}\n"
+                f"App URL: {deploy_url}\n\n"
+                f"Build a single-page HTML/CSS/JS landing page with:\n"
+                f"- Hero section with tagline and CTA\n"
+                f"- Features section\n"
+                f"- Pricing section\n"
+                f"- Sign up / Try free CTA buttons linking to {deploy_url}\n"
+                f"Make it professional and mobile-responsive."
+            )
+
+            build_result = self.coder.generate_module(landing_spec)
+            if build_result.get("status") == "success":
+                data["landing_page_created"] = True
+                path.write_text(json.dumps(data, indent=2))
+                created += 1
+                self.log_action("landing_page", f"Created landing page for {name}")
+
+        return {"landing_pages_created": created}
+
+    def _check_usage(self) -> dict[str, Any]:
+        """Check real usage metrics for deployed products."""
+        metrics = {}
+
+        for path in self.products_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "deployed":
+                continue
+
+            design = data.get("design", {})
+            name = design.get("name", "untitled")
+            deploy_url = data.get("deploy_result", "")
+            platform = data.get("deploy_platform", "")
+
+            if not deploy_url:
+                continue
+
+            # Check the deployment platform dashboard for real metrics
+            result = self.browse_and_extract(
+                deploy_url,
+                f"Check if this deployed app at {deploy_url} is running. "
+                "Return: {\"status\": \"up\" or \"down\", \"response_time\": str}",
+            )
+            metrics[name] = {
+                "deploy_url": deploy_url,
+                "platform": platform,
+                "health": result.get("result", {}),
+            }
+
+        return {"products_checked": len(metrics), "metrics": metrics}

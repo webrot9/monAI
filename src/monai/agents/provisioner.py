@@ -158,25 +158,19 @@ class Provisioner(BaseAgent):
 
     def _execute_provisioning(self, step: str) -> dict[str, Any]:
         """Execute a provisioning step (sync wrapper for async operations)."""
-        loop = asyncio.new_event_loop()
-        try:
-            if "register" in step.lower() and "platform" in step.lower():
-                # Extract platform name from step description
-                platform = self.think(
-                    f"Extract just the platform name from this step: '{step}'. "
-                    "Reply with just the platform name, lowercase."
-                ).strip().lower()
-                return loop.run_until_complete(self.register_on_platform(platform))
-            elif "email" in step.lower():
-                return loop.run_until_complete(self.setup_email())
-            elif "domain" in step.lower():
-                return loop.run_until_complete(self.register_domain(step))
-            elif "api" in step.lower():
-                return loop.run_until_complete(self.acquire_api_key(step))
-            else:
-                # Generic task execution
-                return loop.run_until_complete(
-                    self.executor.execute_task(step, json.dumps(self.identity.get_identity(), default=str))
-                )
-        finally:
-            loop.close()
+        if "register" in step.lower() and "platform" in step.lower():
+            platform = self.think(
+                f"Extract just the platform name from this step: '{step}'. "
+                "Reply with just the platform name, lowercase."
+            ).strip().lower()
+            return self._run_async(self.register_on_platform(platform))
+        elif "email" in step.lower():
+            return self._run_async(self.setup_email())
+        elif "domain" in step.lower():
+            return self._run_async(self.register_domain(step))
+        elif "api" in step.lower():
+            return self._run_async(self.acquire_api_key(step))
+        else:
+            return self._run_async(
+                self.executor.execute_task(step, json.dumps(self.identity.get_identity(), default=str))
+            )

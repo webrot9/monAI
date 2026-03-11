@@ -5,7 +5,7 @@ Covers: Newsletter, LeadGen, SocialMedia, CourseCreation,
 """
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -36,9 +36,35 @@ def config(tmp_path):
 def mock_llm():
     llm = MagicMock()
     llm.quick.return_value = "test"
+    llm.quick_json.return_value = {
+        "name": "TestCo", "tagline": "Test", "description": "Test company",
+        "preferred_username": "testco", "business_type": "digital_services",
+    }
     llm.chat_json.return_value = {"steps": []}
     llm.chat.return_value = "test content"
     return llm
+
+
+@pytest.fixture(autouse=True)
+def mock_real_actions(monkeypatch):
+    """Mock BaseAgent real-action methods so tests don't need playwright/browser."""
+    from monai.agents.base import BaseAgent
+
+    monkeypatch.setattr(BaseAgent, "execute_task", lambda self, *a, **kw: {
+        "status": "completed", "result": {}, "steps": 1,
+    })
+    monkeypatch.setattr(BaseAgent, "browse_and_extract", lambda self, *a, **kw: {
+        "status": "completed", "result": {}, "steps": 1,
+    })
+    monkeypatch.setattr(BaseAgent, "search_web", lambda self, *a, **kw: {
+        "status": "completed", "result": {}, "steps": 1,
+    })
+    monkeypatch.setattr(BaseAgent, "ensure_platform_account", lambda self, *a, **kw: {
+        "status": "exists", "account": {"platform": a[0] if a else "test"},
+    })
+    monkeypatch.setattr(BaseAgent, "platform_action", lambda self, *a, **kw: {
+        "status": "completed", "result": "done", "steps": 1,
+    })
 
 
 # ── Newsletter ────────────────────────────────────────────────
@@ -251,15 +277,16 @@ class TestPrintOnDemandAgent:
     def test_create_listings(self, config, db, mock_llm):
         agent = PrintOnDemandAgent(config, db, mock_llm)
         db.execute_insert(
-            "INSERT INTO pod_designs (title, niche, description, products, tags, status) "
-            "VALUES ('Test', 'test', 'desc', '[\"t-shirt\"]', '[\"tag\"]', 'concept')"
+            "INSERT INTO pod_designs (title, niche, description, products, tags, status, design_path, platforms) "
+            "VALUES ('Test', 'test', 'desc', '[\"t-shirt\"]', '[\"tag\"]', 'designed', "
+            "'/tmp/test.svg', '[\"redbubble\"]')"
         )
         mock_llm.chat_json.return_value = {
             "listing_title": "Test", "description": "Great design",
-            "tags": ["test"], "platforms": ["redbubble"], "pricing_strategy": "default"
+            "tags": ["test"], "pricing_notes": "default"
         }
         result = agent._create_listings()
-        assert result["listed"] == 1
+        assert result["listed"] >= 1
         rows = db.execute("SELECT * FROM pod_designs WHERE status = 'listed'")
         assert len(rows) == 1
 

@@ -1,5 +1,6 @@
 """Tests for monai.utils.sandbox."""
 
+import os
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -10,10 +11,14 @@ from monai.utils.sandbox import (
     PROJECT_ROOT,
     DATA_DIR,
     TEMP_PREFIX,
+    _SAFE_ENV_KEYS,
+    _CAN_BWRAP,
+    _make_clean_env,
     is_path_allowed,
     safe_read,
     safe_write,
     safe_delete,
+    sandbox_run,
     get_sandbox_info,
 )
 
@@ -113,3 +118,145 @@ class TestGetSandboxInfo:
         assert "temp_prefix" in info
         assert "project_size_mb" in info
         assert "data_size_mb" in info
+
+
+class TestMakeCleanEnv:
+    def test_strips_sensitive_vars(self):
+        """Env vars not in the safe list must be stripped."""
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "sk-secret",
+            "AWS_SECRET_ACCESS_KEY": "secret",
+            "DATABASE_URL": "postgres://...",
+            "PATH": "/usr/bin",
+        }):
+            env = _make_clean_env()
+            assert "OPENAI_API_KEY" not in env
+            assert "AWS_SECRET_ACCESS_KEY" not in env
+            assert "DATABASE_URL" not in env
+
+    def test_keeps_safe_vars(self):
+        """Env vars in the safe list must be preserved."""
+        with patch.dict(os.environ, {
+            "LANG": "en_US.UTF-8",
+            "USER": "testuser",
+            "TERM": "xterm",
+        }):
+            env = _make_clean_env()
+            assert env.get("LANG") == "en_US.UTF-8"
+            assert env.get("USER") == "testuser"
+
+    def test_path_restricted(self):
+        """PATH must be restricted to standard locations."""
+        env = _make_clean_env()
+        assert "/usr/local/bin" in env["PATH"]
+        assert "/usr/bin" in env["PATH"]
+
+    def test_virtualenv_preserved(self):
+        """If VIRTUAL_ENV is set, its bin dir is in PATH."""
+        with patch.dict(os.environ, {"VIRTUAL_ENV": "/home/user/venv"}):
+            env = _make_clean_env()
+            assert "/home/user/venv/bin" in env["PATH"]
+
+
+class TestSandboxRun:
+    def test_runs_simple_command(self):
+        """Basic command execution should work."""
+        result = sandbox_run(["echo", "hello"])
+        assert result["returncode"] == 0
+        assert "hello" in result["stdout"]
+
+    def test_env_secrets_not_leaked(self):
+        """Child process must NOT see parent's secret env vars."""
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-secret-test-key"}):
+            result = sandbox_run(["env"])
+            assert "sk-secret-test-key" not in result["stdout"]
+            assert "OPENAI_API_KEY" not in result["stdout"]
+
+    def test_timeout_respected(self):
+        """Commands that exceed timeout must be killed."""
+        result = sandbox_run(["sleep", "10"], timeout=1)
+        assert result["returncode"] == -1
+        assert "timed out" in result["stderr"].lower()
+
+    def test_cwd_is_workspace(self):
+        """Default working directory should be the workspace."""
+        result = sandbox_run(["pwd"])
+        assert result["returncode"] == 0
+        assert "workspace" in result["stdout"]
+
+    def test_custom_cwd(self, tmp_path):
+        """Custom cwd should be respected."""
+        result = sandbox_run(["pwd"], cwd=tmp_path)
+        assert result["returncode"] == 0
+        assert str(tmp_path) in result["stdout"]
+
+    def test_stdout_truncated(self):
+        """Long output should be truncated to prevent memory issues."""
+        # Generate output longer than 2000 chars
+        result = sandbox_run(["python3", "-c", "print('A' * 5000)"])
+        assert len(result["stdout"]) <= 2000
+
+    def test_stderr_truncated(self):
+        """Long stderr should be truncated."""
+        result = sandbox_run(["python3", "-c", "import sys; sys.stderr.write('E' * 1000)"])
+        assert len(result["stderr"]) <= 500
+
+    def test_python_script_cant_read_secrets(self):
+        """A Python script in the sandbox should not see secret env vars."""
+        with patch.dict(os.environ, {"SUPER_SECRET": "hidden_value_12345"}):
+            result = sandbox_run([
+                "python3", "-c",
+                "import os; print(os.environ.get('SUPER_SECRET', 'NOT_FOUND'))"
+            ])
+            assert "hidden_value_12345" not in result["stdout"]
+            assert "NOT_FOUND" in result["stdout"]
+
+    def test_home_set_to_workspace(self):
+        """HOME should be set to workspace dir, not real home."""
+        result = sandbox_run(["python3", "-c", "import os; print(os.environ.get('HOME', ''))"])
+        assert result["returncode"] == 0
+        real_home = str(Path.home())
+        # HOME should NOT be the real home directory
+        assert real_home not in result["stdout"] or "workspace" in result["stdout"]
+
+    def test_invalid_command(self):
+        """Non-existent commands should fail gracefully."""
+        result = sandbox_run(["nonexistent_command_xyz"])
+        assert result["returncode"] != 0
+
+    @pytest.mark.skipif(not _CAN_BWRAP, reason="bubblewrap not available")
+    def test_bwrap_blocks_etc_passwd(self):
+        """With bwrap, /etc/passwd should NOT be readable."""
+        result = sandbox_run([
+            "python3", "-c",
+            "import os; print('exists' if os.path.exists('/etc/passwd') else 'hidden')"
+        ])
+        assert result["returncode"] == 0
+        assert "hidden" in result["stdout"]
+
+    @pytest.mark.skipif(not _CAN_BWRAP, reason="bubblewrap not available")
+    def test_bwrap_blocks_home_directory(self):
+        """With bwrap, real home directory should NOT be accessible."""
+        real_home = str(Path.home())
+        result = sandbox_run([
+            "python3", "-c",
+            f"import os; print('exists' if os.path.isdir('{real_home}') else 'hidden')"
+        ])
+        assert result["returncode"] == 0
+        assert "hidden" in result["stdout"]
+
+    @pytest.mark.skipif(not _CAN_BWRAP, reason="bubblewrap not available")
+    def test_bwrap_workspace_writable(self, tmp_path):
+        """Workspace directory should still be writable under bwrap."""
+        result = sandbox_run(
+            ["python3", "-c", "open('test_write.txt', 'w').write('ok'); print('wrote')"],
+            cwd=tmp_path,
+        )
+        assert result["returncode"] == 0
+        assert "wrote" in result["stdout"]
+
+    def test_get_sandbox_info_has_backend(self):
+        """get_sandbox_info should include the isolation backend."""
+        info = get_sandbox_info()
+        assert "isolation_backend" in info
+        assert info["isolation_backend"] in ("bubblewrap", "unshare", "none")

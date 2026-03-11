@@ -118,7 +118,7 @@ PHASE 3: Self-Sustaining
 ## Content Quality Pipeline
 
 ```
-Content Generation → Humanizer → FactChecker → Publish/Revise/Block
+Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 ```
 
 - **Humanizer**: Ensures content passes AI detection tools
@@ -129,7 +129,13 @@ Content Generation → Humanizer → FactChecker → Publish/Revise/Block
 ## Key Technical Details
 
 ### Agent System
-- All agents inherit from `BaseAgent` (LLM reasoning, collaboration, learning, journaling)
+- All agents inherit from `BaseAgent` which provides:
+  - LLM reasoning (think, think_json, think_cheap)
+  - Real-world actions (execute_task, browse_and_extract, search_web, platform_action)
+  - Self-provisioning (ensure_platform_account, get_platform_credentials)
+  - Lazy-loaded executor, identity manager, provisioner, and coder
+  - Collaboration, learning, journaling
+- **ZERO simulation**: All strategy agents use real browser automation and API calls — never LLM hallucination for market data
 - Orchestrator manages lifecycle of all agents
 - Agents collaborate via `CollaborationHub` and `SharedMemory`
 - Ethics enforced at BaseAgent level; `EthicsTester` destroys agents that fail
@@ -152,8 +158,9 @@ Content Generation → Humanizer → FactChecker → Publish/Revise/Block
 
 ### Config
 - Dataclass-based config in `config.py`
-- Stored at `~/.monai/config.json`
-- Sections: LLM, risk, comms, privacy, telegram, LLC, bootstrap_wallet, creator_wallet, monero, btcpay
+- Stored at `~/.monai/config.json` (secrets encrypted at rest via Fernet)
+- Sections: LLM, risk, comms, privacy, telegram, LLC, bootstrap_wallet, creator_wallet, monero, btcpay, budget
+- Structured LLM outputs via Pydantic models in `models.py`
 
 ## Module Index
 
@@ -180,6 +187,10 @@ Content Generation → Humanizer → FactChecker → Publish/Revise/Block
 | `memory.py` | Shared knowledge base |
 | `collaboration.py` | Agent-to-agent help system |
 | `spawner.py` | Sub-agent creation |
+| `base.py` | Base agent class with lazy-loaded mixins (coder, executor, identity, provisioner) |
+| `api_provisioner.py` | Autonomous payment provider API key self-provisioning |
+| `captcha_solver.py` | Autonomous CAPTCHA solving for account registration |
+| `email_verifier.py` | Email verification and temporary email management |
 | `eng_team/` | Engineering team (tech lead + engineers) |
 | `research_team/` | Research team (market, trends, competitors) |
 | `marketing_team/` | Marketing team (content, growth, outreach) |
@@ -187,16 +198,24 @@ Content Generation → Humanizer → FactChecker → Publish/Revise/Block
 ### Business (`src/monai/business/`)
 | Module | Purpose |
 |--------|---------|
-| `finance.py` | Revenue & expense tracking |
+| `finance.py` | Revenue & expense tracking + double-entry GeneralLedger + multi-brand P&L segmentation |
 | `commercialista.py` | Accounting, budgets, ROI per agent |
 | `corporate.py` | LLC management, expenses, tax obligations |
 | `bootstrap.py` | Seed capital (crowdfunding, Paysafecard, creator seed) |
+| `kofi.py` | Ko-fi campaign automation (setup, monitoring, donation sync) |
+| `reporting.py` | Automated financial reporting (P&L, balance sheet, strategy dashboards via Telegram) |
+| `exchange_rates.py` | Multi-currency exchange rate service (EUR/USD/BTC/XMR with caching, persistence, rate limiting) |
+| `reconciliation.py` | Reconciliation engine (matches GL entries with webhook events, finds discrepancies) |
 | `crm.py` | Lead management, contacts, pipeline |
 | `pipeline.py` | Conversion funnel tracking |
 | `risk.py` | Diversification, spend limits, stop-loss |
 | `projections.py` | Financial forecasting |
-| `invoicing.py` | Creator contractor invoices |
-| `payments.py` | Payment coordination (legacy) |
+| `strategy_lifecycle.py` | Strategy state machine (pending→active→paused→stopped) |
+| `invoicing.py` | Invoice generation (HTML + PDF via weasyprint, client + contractor invoices) |
+| `tax_estimation.py` | Quarterly tax estimation (Italian forfettario + US federal, SE tax, brackets) |
+| `audit.py` | Audit trail (queryable activity log, risk assessment, per-agent summaries, Telegram reports) |
+| `backup.py` | Automated backup & restore (SQLite online backup, config backup, rotation, integrity verification) |
+| ~~`payments.py`~~ | **REMOVED** — superseded by `payments/manager.py` + `business/brand_payments.py` |
 | `brand_payments.py` | Per-brand payment accounts |
 | `comms.py` | Email engine (SMTP/IMAP) |
 | `email_marketing.py` | Email campaigns & subscriber lists |
@@ -210,26 +229,88 @@ Content Generation → Humanizer → FactChecker → Publish/Revise/Block
 | `gumroad_provider.py` | Gumroad sales |
 | `lemonsqueezy_provider.py` | LemonSqueezy payments |
 | `monero_provider.py` | Monero privacy-first crypto |
+| `kofi_provider.py` | Ko-fi webhook handler (donation/subscription verification) |
 | `sweep_engine.py` | Automated profit sweeping |
-| `webhook_server.py` | Webhook handler for all providers |
+| `webhook_server.py` | Webhook handler for all providers (with audit trail integration) |
+
+### Dashboard (`src/monai/dashboard/`)
+| Module | Purpose |
+|--------|---------|
+| `server.py` | Real-time web UI (SSE, financial overview, strategies, audit trail, brand P&L, backup status) |
 
 ### Strategies (`src/monai/strategies/`)
-13 strategy agents, each implementing an autonomous revenue channel:
-freelance_writing, digital_products, content_sites, micro_saas, saas, affiliate, newsletter, lead_gen, social_media, course_creation, domain_flipping, print_on_demand, telegram_bots
+13 strategy agents, each implementing a FULLY FUNCTIONAL autonomous revenue channel.
+All strategies use real browser automation and APIs — zero simulation:
+
+| Strategy | Real Actions |
+|----------|-------------|
+| `freelance_writing` | Browses Upwork/Fiverr/Freelancer for real gigs, submits real proposals, delivers work on platforms |
+| `digital_products` | Creates products, lists on real Gumroad via API, tracks real sales |
+| `content_sites` | Researches keywords via real SEO tools, writes content, finds real affiliate programs |
+| `micro_saas` | Builds MVPs, deploys to Railway/Render/Vercel, creates landing pages |
+| `saas` | Researches real competitors on G2/Capterra, builds and deploys real products |
+| `affiliate` | Browses real affiliate networks (ShareASale, CJ, Amazon), writes real reviews |
+| `newsletter` | Researches Substack/Beehiiv trends, writes real issues, finds real sponsors |
+| `lead_gen` | Scrapes real business directories, enriches leads via web, qualifies with real data |
+| `social_media` | Posts real content via social APIs (Twitter, LinkedIn, Reddit) |
+| `course_creation` | Researches real Udemy/Skillshare trends, writes lessons, lists on platforms |
+| `domain_flipping` | Browses real expired domain sites, checks real metrics, lists on Sedo/Dan.com |
+| `print_on_demand` | Researches real POD trends, generates designs, lists on Redbubble/TeeSpring |
+| `telegram_bots` | Researches real bot market, builds bots, deploys via BotFather |
+
+### Web (`src/monai/web/`)
+| Module | Purpose |
+|--------|---------|
+| `landing/index.html` | Crowdfunding landing page (static, self-contained, dark theme) |
+| `landing/generator.py` | Dynamic page generator — fills payment links, funding progress from DB |
+| `landing/deploy.py` | Deployment helper for Netlify, Vercel, Cloudflare Pages |
+
+### Workflows (`src/monai/workflows/`)
+| Module | Purpose |
+|--------|---------|
+| `workflows/` | Task orchestration, pipeline definitions, and workflow engine |
+
+### Integrations (`src/monai/integrations/`)
+| Module | Purpose |
+|--------|---------|
+| `base.py` | PlatformConnection + PlatformIntegration ABC (per-agent connections, rate limiting, retry) |
+| `gumroad.py` | Gumroad API (products CRUD, sales, subscribers, revenue) |
 
 ### Utils (`src/monai/utils/`)
 | Module | Purpose |
 |--------|---------|
-| `llm.py` | OpenAI integration with per-call cost tracking |
+| `llm.py` | OpenAI integration, model tiers (FULL/MINI/NANO), CostTracker with save/load, BudgetExceededError |
+| `crypto.py` | Fernet config encryption (auto-key, sensitive field detection, ENC: prefix) |
 | `browser.py` | Playwright browser automation |
 | `privacy.py` | Tor/proxy anonymization |
 | `resources.py` | CPU/memory/disk monitoring |
 | `sandbox.py` | Sandboxed execution |
 | `telegram.py` | Telegram Bot API client |
 
+## Cost Management
+
+### Model Tiers
+- **FULL** (`gpt-4o`): Complex reasoning, strategy decisions, evaluations
+- **MINI** (`gpt-4o-mini`): Content generation, research summaries, standard tasks
+- **NANO** (`gpt-4.1-nano`): Classification, tagging, simple extraction, bulk operations
+
+### Budget Enforcement
+- Per-cycle cost limit (`max_cycle_cost`, default €5)
+- Per-cycle call limit (`max_cycle_calls`, default 200)
+- Never spend >10% of remaining budget in one cycle
+- `BudgetExceededError` gracefully stops cycle when limits hit
+- CostTracker persists state to `~/.monai/cost_tracker.json`
+- Minor costs tracked: platform fees, subscriptions, tools, hosting
+
+### Platform Integrations
+- Each agent owns its platform connections (no shared clients)
+- `PlatformConnection`: lazy httpx.Client, rate limiting, automatic retry
+- Rate limits tracked in DB per platform
+- First integration: Gumroad (products, sales, subscribers)
+
 ## Test Suite
 
-- **911 tests** across 51 test files
+- **1216 tests** across 62 test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
@@ -239,24 +320,95 @@ freelance_writing, digital_products, content_sites, micro_saas, saas, affiliate,
 ### What's Been Built (as of 2026-03-10)
 Everything listed above is implemented, tested, and passing. The codebase is functional from config through to payment sweep.
 
+**Major refactor completed 2026-03-10**: All 13 strategy agents rewired from simulated/hallucinated operations to REAL browser automation and API integrations. BaseAgent now provides `execute_task()`, `browse_and_extract()`, `search_web()`, `ensure_platform_account()`, and `platform_action()` to all agents. Zero simulation remaining.
+
 ### What's Next
-1. **Wire FactChecker into content pipelines** — content_pipeline, affiliate_content_pipeline, etc. should call `fact_checker.check()` before publishing
-2. **End-to-end integration tests** — full payment flow from Stripe webhook to creator wallet
-3. **Crowdfunding landing page** — monAI's first website for the AI crowdfunding campaign
-4. **Ko-fi campaign setup** — automated campaign creation and monitoring
+1. ~~**Crowdfunding landing page**~~ — DONE: `src/monai/web/landing/` (static page + generator + deploy helper)
+2. **Ko-fi campaign setup** — automated campaign creation and monitoring
+3. **End-to-end integration tests** — full payment flow from Stripe webhook to creator wallet
+4. **More platform integrations** — LemonSqueezy, Stripe connect, etc.
 
 ### Key Design Decisions Made
-- **OpenAI, not Claude**: All LLM calls use OpenAI SDK (gpt-4o / gpt-4o-mini)
+- **OpenAI, not Claude**: All LLM calls use OpenAI SDK (gpt-4o / gpt-4o-mini / gpt-4.1-nano)
 - **Creator donates via crowdfunding**: Simplest bootstrap — no Paysafecard needed
 - **Multi-LLC rotation**: Avoids single-client invoice pattern suspicion
 - **P.IVA forfettario**: 5% tax first 5 years, creator invoices as contractor
 - **Ko-fi preferred**: 0% platform fee for donations
 - **Wyoming LLC**: No public member disclosure
 - **Paysafecard optional**: Only if creator needs domain before crowdfunding is set up
+- **Config encryption**: Fernet with auto-generated key at `~/.monai/.config_key`
+- **Per-agent connections**: Each agent manages its own platform connections with rate limiting
+- **Strategy state machine**: Formal lifecycle (pending→active→paused→stopped) prevents invalid transitions
+- **Zero simulation**: All strategies use real browser/API actions, never LLM hallucination for market data
+- **Only OpenAI key provided**: Agents self-provision all other credentials via browser automation
+
+## Recent Changes
+
+### Security Hardening (Critical)
+- **Webhook signature enforcement**: ALL providers now REJECT unsigned webhooks (was: optional)
+- **Atomic webhook idempotency**: Idempotency check + event log in single DB transaction (was: separate, racy)
+- **PaymentIntent validation**: Amount validated on creation (min €0.01, max €100k, no NaN/negative)
+- **Webhook amount validation**: Rejects negative amounts and suspiciously large (>€1M) webhook claims
+- **Rate limiting on webhook server**: Per-IP rate limiting (10/sec, 200/min) with 429 responses
+- **Spending caps**: Hard daily limit on auto-reinvestment, per-transaction max, creator approval above threshold
+
+### Financial Fixes
+- **Currency mismatch fix**: Platform fees now always in same currency as payment (was: hardcoded per-provider)
+- **Contractor rate cap**: Percentage capped at 100% (was: uncapped, could exceed revenue)
+- **Negative sweep validation**: Rejects negative/zero sweep amounts
+- **Transactional payment recording**: Payment + fee recorded atomically in single transaction
+- **Refund-after-sweep detection**: Logs CRITICAL alert if refund occurs after funds already swept
+- **Dispute handling**: Proper alerting with CRITICAL log level on disputes
+
+### Feature Completions
+- **LemonSqueezy full integration**: Auto-creates products and variants (was: checkout-only)
+- **LemonSqueezy platform integration**: `integrations/lemonsqueezy.py` for strategy agents
+- **Tor detection fallback**: `ProxyFallbackChain` — auto-falls back Tor → residential → datacenter
+- **Crowdfunding landing page**: `web/landing/` — deployable static site with payment integration
+- **Team agents with real logic**: Engineering, research, marketing teams now use browser automation
+- **API key self-provisioning**: `agents/api_provisioner.py` — autonomous provider registration
+
+### Integration Fixes (2026-03-11)
+- **APIProvisioner wired into orchestrator**: Now runs every 5 cycles, auto-provisions Stripe/Gumroad/LemonSqueezy/BTCPay API keys for brands
+- **LemonSqueezy auto-registered in PaymentManager**: On startup, checks DB for provisioned LS keys and registers brand-specific providers
+- **Landing page generator wired into WebPresence**: `run()` now regenerates crowdfunding page with live funding data; new `deploy_crowdfunding_page()` method
+- **Double-entry bookkeeping (GeneralLedger)**: Full chart of accounts, journal entries with balanced debit/credit, trial balance, balance sheet, income statement, reconciliation, integrity verification
+- **Ledger integrity check in orchestrator cycle**: Phase 6.95 verifies all entries balanced before commercialista report
+- **GL auto-entries on webhooks**: Every payment_completed webhook auto-creates a GL entry (cash debit + revenue credit + fee debit)
+- **GL auto-entries on sweeps**: Successful sweeps auto-create GL entries (creator payable debit + cash credit)
+- **GL refund reversals**: Refund webhooks auto-create reversal GL entries
+- **Ko-fi campaign automation**: `KofiCampaignManager` agent — auto-registers on Ko-fi, creates campaign page, syncs donations into bootstrap wallet
+- **Ko-fi wired into orchestrator bootstrap**: Pre-bootstrap phase auto-triggers Ko-fi setup; donation sync every 3 cycles
+- **E2E payment flow tests**: 13 tests covering webhook→GL→sweep→GL→balance-sheet lifecycle
+- **GL wired into bootstrap wallet**: Contributions → crowdfunding revenue GL; creator seed → equity GL; spending → expense GL
+- **FinancialReporter module**: Monthly P&L + balance sheet, daily snapshots, strategy dashboards — all via Telegram
+- **Strategy performance analysis**: Per-strategy ROI, 7d/30d trends, auto-recommendations (continue/review/pause/scale)
+- **Phase 6.97**: Strategy performance eval in orchestrator cycle — logs underperformers and growth candidates
+- **Phase 7.5**: Automated report dispatch — monthly, weekly dashboard, daily snapshot every 10 cycles
+- **Auto-pause underperformers**: Phase 6.97 now calls `lifecycle.pause()` on strategies recommended for pause, with Telegram notification to creator
+- **Ko-fi webhook provider**: `KofiProvider` handles Ko-fi form-encoded webhooks with verification_token constant-time comparison
+- **All 6 payment providers** have HMAC/token signature verification: Stripe (v1+timestamp), BTCPay (sha256= prefix), Gumroad, LemonSqueezy, Ko-fi (token), Monero (confirmations-based)
+- **ExchangeRateService**: Multi-currency support with memory+DB caching, fallback rates, inverse pair computation, rate history
+- **`get_income_statement_normalized()`**: GL income statement with FX conversion to target currency (EUR default)
+- **Live rate fetching**: ECB (EUR/USD fiat) + CoinGecko (BTC/XMR crypto) with async httpx, runs every 6 cycles
+- **Auto-scale strategies**: Phase 6.97 boosts budget +20% for growing strategies (capped, allocation-limited)
+- **ReconciliationEngine**: Matches GL entries (by `reference`) to `webhook_events` (by `payment_ref`), flags mismatches/orphans
+- **Weekly reconciliation**: Runs every Monday, sends Telegram alert only if discrepancies found
+
+### Earlier Changes
+- **Webhook idempotency**: `processed_webhooks` table prevents double-processing
+- **Decimal support**: Financial precision via `_to_decimal` and `amount_decimal` properties
+- **Gumroad webhook verification**: HMAC-SHA256 signature verification
+- **Platform fee tracking**: `platform_fees` table, auto-recorded on payment
+- **Database performance indexes**: Added on frequently-queried columns
+- **HTTP client pooling**: Connection pooling for all payment providers
+- **Executor timeout enforcement**: Configurable per-task, default 1h
+- **DB transaction helper**: `db.transaction()` context manager for atomic operations
+- **Expanded sensitive data filtering**: Regex-based filtering in agent identity
 
 ### Creator Preferences (Italian)
-- Currency: EUR
-- Initial budget: €500
+- Currency: USD (with EUR conversion when needed)
+- Initial budget: $500
 - Tax regime: P.IVA forfettario (5% first 5 years)
 - Communication: Telegram (username: Cristal89)
 - Privacy: Maximum — Tor by default, full anonymity

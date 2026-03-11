@@ -48,39 +48,44 @@ class BTCPayProvider(PaymentProvider):
         self.store_id = store_id
         self.webhook_secret = webhook_secret
         self.proxy_url = proxy_url
+        self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
-        kwargs: dict[str, Any] = {
-            "timeout": 30.0,
-            "headers": {
-                "Authorization": f"token {self.api_key}",
-                "Content-Type": "application/json",
-            },
-        }
-        if self.proxy_url:
-            kwargs["proxy"] = self.proxy_url
-        return httpx.AsyncClient(**kwargs)
+        if self._client is None or self._client.is_closed:
+            kwargs: dict[str, Any] = {
+                "timeout": 30.0,
+                "headers": {
+                    "Authorization": f"token {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+            }
+            from monai.payments.base import _resolve_proxy_url
+            proxy = _resolve_proxy_url(self.proxy_url)
+            if proxy:
+                kwargs["proxy"] = proxy
+            self._client = httpx.AsyncClient(**kwargs)
+        return self._client
 
     async def _api_call(self, method: str, endpoint: str,
                         data: dict | None = None) -> dict:
         url = f"{self.server_url}/api/v1/{endpoint.lstrip('/')}"
-        async with self._get_client() as client:
-            if method == "GET":
-                resp = await client.get(url, params=data)
-            elif method == "POST":
-                resp = await client.post(url, json=data)
-            elif method == "DELETE":
-                resp = await client.delete(url)
-            else:
-                resp = await client.request(method, url, json=data)
+        client = self._get_client()
+        if method == "GET":
+            resp = await client.get(url, params=data)
+        elif method == "POST":
+            resp = await client.post(url, json=data)
+        elif method == "DELETE":
+            resp = await client.delete(url)
+        else:
+            resp = await client.request(method, url, json=data)
 
-            if resp.status_code >= 400:
-                text = resp.text
-                raise BTCPayAPIError(f"HTTP {resp.status_code}: {text}")
+        if resp.status_code >= 400:
+            text = resp.text
+            raise BTCPayAPIError(f"HTTP {resp.status_code}: {text}")
 
-            if resp.status_code == 204:
-                return {}
-            return resp.json()
+        if resp.status_code == 204:
+            return {}
+        return resp.json()
 
     async def create_payment(self, intent: PaymentIntent) -> PaymentResult:
         """Create a BTCPay invoice (payment request)."""
@@ -176,11 +181,13 @@ class BTCPayProvider(PaymentProvider):
     async def handle_webhook(self, payload: bytes,
                              headers: dict[str, str]) -> WebhookEvent | None:
         """Parse BTCPay webhook event."""
-        if self.webhook_secret:
-            sig = headers.get("btcpay-sig", "")
-            if not self._verify_signature(payload, sig):
-                logger.warning("Invalid BTCPay webhook signature")
-                return None
+        if not self.webhook_secret:
+            logger.error("BTCPay webhook_secret not configured — rejecting webhook")
+            return None
+        sig = headers.get("btcpay-sig", "")
+        if not self._verify_signature(payload, sig):
+            logger.warning("Invalid BTCPay webhook signature")
+            return None
 
         try:
             event = json.loads(payload)

@@ -10,13 +10,22 @@ import json
 import logging
 import threading
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
 
 from openai import OpenAI
+from pydantic import BaseModel, ValidationError
 
 from monai.config import Config
 
+T = TypeVar("T", bound=BaseModel)
+
 logger = logging.getLogger(__name__)
+
+
+class BudgetExceededError(Exception):
+    """Raised when a cycle exceeds its cost or call budget."""
+    pass
+
 
 # Pricing per 1M tokens (EUR, approximate — updated March 2026)
 # Source: OpenAI pricing page. Adjust if prices change.
@@ -41,6 +50,11 @@ class CostTracker:
         self.calls = 0
         self.cost_by_model: dict[str, float] = {}
         self.cost_by_caller: dict[str, float] = {}
+        # Per-cycle budget enforcement
+        self.cycle_cost: float = 0.0
+        self.cycle_calls: int = 0
+        self.max_cycle_cost: float = 5.0  # EUR
+        self.max_cycle_calls: int = 200
 
     def record(self, model: str, input_tokens: int, output_tokens: int,
                caller: str = "unknown") -> float:
@@ -55,8 +69,61 @@ class CostTracker:
             self.calls += 1
             self.cost_by_model[model] = self.cost_by_model.get(model, 0) + cost
             self.cost_by_caller[caller] = self.cost_by_caller.get(caller, 0) + cost
+            # Cycle tracking
+            self.cycle_cost += cost
+            self.cycle_calls += 1
+            # Check cycle limits
+            if self.cycle_cost > self.max_cycle_cost:
+                raise BudgetExceededError(
+                    f"Cycle cost limit exceeded: €{self.cycle_cost:.4f} > €{self.max_cycle_cost:.2f}"
+                )
+            if self.cycle_calls > self.max_cycle_calls:
+                raise BudgetExceededError(
+                    f"Cycle call limit exceeded: {self.cycle_calls} > {self.max_cycle_calls}"
+                )
 
         return cost
+
+    def reset_cycle(self) -> None:
+        """Reset per-cycle counters. Called at the start of each orchestration cycle."""
+        with self._lock:
+            self.cycle_cost = 0.0
+            self.cycle_calls = 0
+            # Prevent unbounded dict growth — keep only top 100 entries
+            if len(self.cost_by_caller) > 100:
+                sorted_callers = sorted(self.cost_by_caller.items(), key=lambda x: x[1], reverse=True)
+                self.cost_by_caller = dict(sorted_callers[:50])
+            if len(self.cost_by_model) > 50:
+                sorted_models = sorted(self.cost_by_model.items(), key=lambda x: x[1], reverse=True)
+                self.cost_by_model = dict(sorted_models[:25])
+
+    def set_cycle_limits(self, max_cost: float, max_calls: int) -> None:
+        """Update per-cycle budget limits."""
+        with self._lock:
+            self.max_cycle_cost = max_cost
+            self.max_cycle_calls = max_calls
+
+    def record_minor(self, cost_type: str, cost_eur: float,
+                     caller: str = "unknown", description: str = "") -> float:
+        """Record a non-API cost (platform fees, subscriptions, tools, etc.).
+
+        Args:
+            cost_type: One of: platform_fee, subscription, tool, hosting, domain, other
+            cost_eur: Cost in EUR
+            caller: Which agent incurred this cost
+            description: Human-readable description
+        """
+        with self._lock:
+            self.total_cost_eur += cost_eur
+            self.cost_by_caller[caller] = self.cost_by_caller.get(caller, 0) + cost_eur
+            key = f"minor:{cost_type}"
+            self.cost_by_model[key] = self.cost_by_model.get(key, 0) + cost_eur
+            self.cycle_cost += cost_eur
+            if self.cycle_cost > self.max_cycle_cost:
+                raise BudgetExceededError(
+                    f"Cycle cost limit exceeded: €{self.cycle_cost:.4f} > €{self.max_cycle_cost:.2f}"
+                )
+        return cost_eur
 
     def get_summary(self) -> dict[str, Any]:
         with self._lock:
@@ -67,7 +134,47 @@ class CostTracker:
                 "total_cost_eur": round(self.total_cost_eur, 6),
                 "cost_by_model": {k: round(v, 6) for k, v in self.cost_by_model.items()},
                 "cost_by_caller": {k: round(v, 6) for k, v in self.cost_by_caller.items()},
+                "cycle_cost": round(self.cycle_cost, 6),
+                "cycle_calls": self.cycle_calls,
             }
+
+    def save_state(self, path: str) -> None:
+        """Persist tracker state to a JSON file for session continuity."""
+        with self._lock:
+            state = {
+                "total_input_tokens": self.total_input_tokens,
+                "total_output_tokens": self.total_output_tokens,
+                "total_cost_eur": self.total_cost_eur,
+                "calls": self.calls,
+                "cost_by_model": self.cost_by_model,
+                "cost_by_caller": self.cost_by_caller,
+            }
+        import pathlib
+        pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(state, f, indent=2)
+
+    def load_state(self, path: str) -> bool:
+        """Load tracker state from a JSON file. Returns True if loaded."""
+        import pathlib
+        p = pathlib.Path(path)
+        if not p.exists():
+            return False
+        try:
+            with open(p) as f:
+                state = json.load(f)
+            with self._lock:
+                self.total_input_tokens = state.get("total_input_tokens", 0)
+                self.total_output_tokens = state.get("total_output_tokens", 0)
+                self.total_cost_eur = state.get("total_cost_eur", 0.0)
+                self.calls = state.get("calls", 0)
+                self.cost_by_model = state.get("cost_by_model", {})
+                self.cost_by_caller = state.get("cost_by_caller", {})
+            logger.info(f"Loaded cost tracker state: {self.calls} calls, €{self.total_cost_eur:.4f}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to load cost tracker state: {e}")
+            return False
 
 
 # Global tracker — shared across all LLM instances
@@ -81,12 +188,49 @@ def get_cost_tracker() -> CostTracker:
 class LLM:
     """Wrapper around OpenAI API with mandatory cost tracking."""
 
+    # Model tiers for cost-aware selection
+    TIER_FULL = "full"       # gpt-4o / gpt-4.1 — complex reasoning, quality content
+    TIER_MINI = "mini"       # gpt-4o-mini / gpt-4.1-mini — routine tasks, planning
+    TIER_NANO = "nano"       # gpt-4.1-nano — simple extraction, classification, formatting
+
     def __init__(self, config: Config | None = None, caller: str = "unknown"):
         self.config = config or Config.load()
-        self.client = OpenAI(api_key=self.config.llm.api_key)
+        # Route OpenAI API calls through proxy to protect creator's IP
+        client_kwargs: dict[str, Any] = {"api_key": self.config.llm.api_key}
+        if self.config.privacy.proxy_type != "none":
+            proxy_url = self._get_proxy_url()
+            if proxy_url:
+                import httpx as _httpx
+                client_kwargs["http_client"] = _httpx.Client(proxy=proxy_url, timeout=120)
+        self.client = OpenAI(**client_kwargs)
         self.caller = caller  # Which agent/module is making the call
         self.tracker = _global_tracker
         self._db = None  # Lazy — set when DB is available
+
+    def _get_proxy_url(self) -> str | None:
+        """Get proxy URL from privacy config."""
+        cfg = self.config.privacy
+        if cfg.proxy_type == "tor":
+            return f"socks5://127.0.0.1:{cfg.tor_socks_port}"
+        elif cfg.proxy_type == "socks5":
+            return cfg.socks5_proxy or None
+        elif cfg.proxy_type == "http":
+            return cfg.http_proxy or None
+        return None
+
+    def get_model(self, tier: str = "mini") -> str:
+        """Get the appropriate model for a cost tier.
+
+        Tiers:
+            full — Complex reasoning, content generation, code writing
+            mini — Routine planning, analysis, JSON extraction (default)
+            nano — Simple classification, formatting, yes/no decisions
+        """
+        if tier == self.TIER_FULL:
+            return self.config.llm.model
+        elif tier == self.TIER_NANO:
+            return "gpt-4.1-nano"
+        return self.config.llm.model_mini
 
     def set_db(self, db):
         """Attach database for persistent cost logging."""
@@ -154,6 +298,88 @@ class LLM:
         messages.append({"role": "user", "content": prompt})
         return self.chat_json(messages, model=self.config.llm.model_mini)
 
+    def nano(self, prompt: str, system: str = "") -> str:
+        """Ultra-cheap call using nano model. For simple extraction/classification."""
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        return self.chat(messages, model=self.get_model(self.TIER_NANO), max_tokens=512)
+
+    def nano_json(self, prompt: str, system: str = "") -> dict:
+        """Ultra-cheap JSON call using nano model."""
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        return self.chat_json(messages, model=self.get_model(self.TIER_NANO))
+
+    def chat_structured(
+        self,
+        messages: list[dict[str, str]],
+        response_model: type[T],
+        model: str | None = None,
+        temperature: float = 0.3,
+    ) -> T:
+        """Chat that returns a validated pydantic model instance.
+
+        Uses json_mode to get JSON from the LLM, then validates it against
+        the provided pydantic model. Retries once on validation failure,
+        appending the error details so the LLM can self-correct.
+        """
+        schema_hint = json.dumps(response_model.model_json_schema(), indent=2)
+        # Inject schema instruction into the last user message (or system)
+        augmented = list(messages)
+        schema_instruction = (
+            f"\n\nRespond with JSON matching this exact schema:\n```json\n{schema_hint}\n```"
+        )
+        # Append to the last user message
+        if augmented and augmented[-1]["role"] == "user":
+            augmented[-1] = {
+                "role": "user",
+                "content": augmented[-1]["content"] + schema_instruction,
+            }
+        else:
+            augmented.append({"role": "user", "content": schema_instruction})
+
+        raw = self.chat(augmented, model=model, temperature=temperature, json_mode=True)
+
+        # First attempt at validation
+        try:
+            return response_model.model_validate_json(raw)
+        except ValidationError as e:
+            logger.warning(
+                f"Structured output validation failed, retrying: {e.error_count()} errors"
+            )
+
+        # Retry once with error feedback
+        augmented.append({"role": "assistant", "content": raw})
+        augmented.append({
+            "role": "user",
+            "content": (
+                f"The JSON you returned failed validation:\n{e}\n\n"
+                f"Fix the errors and return valid JSON matching the schema."
+            ),
+        })
+
+        raw_retry = self.chat(augmented, model=model, temperature=temperature, json_mode=True)
+        return response_model.model_validate_json(raw_retry)
+
+    def quick_structured(
+        self,
+        prompt: str,
+        response_model: type[T],
+        system: str = "",
+    ) -> T:
+        """Quick structured response using mini model. Returns a validated pydantic model."""
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        return self.chat_structured(
+            messages, response_model, model=self.config.llm.model_mini,
+        )
+
     def _persist_cost(self, model: str, input_tokens: int, output_tokens: int, cost: float):
         """Log cost to database for the commercialista."""
         try:
@@ -162,5 +388,5 @@ class LLM:
                 "VALUES ('expense', 'api_cost', ?, 'EUR', ?)",
                 (cost, f"OpenAI {model}: {input_tokens}in/{output_tokens}out by {self.caller}"),
             )
-        except Exception:
-            pass  # Don't let logging failures break the agent
+        except Exception as e:
+            logger.warning(f"Failed to persist cost to DB: {e}")

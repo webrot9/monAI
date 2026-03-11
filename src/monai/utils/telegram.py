@@ -161,6 +161,8 @@ class TelegramBot:
             f"If you received a Telegram message with this code,\n"
             f"it is genuinely from YOUR monAI agent running on this machine.\n"
         )
+        # Restrict file permissions to owner only
+        verify_file.chmod(0o600)
         logger.info(f"Verification token generated: {short_code}")
         return short_code
 
@@ -296,7 +298,9 @@ class TelegramBot:
             if text == "/start" and username.lower() == self.config.telegram.creator_username.lower():
                 self._creator_chat_id = chat_id
                 self._set_state("creator_chat_id", chat_id)
-                logger.info(f"Creator identified: @{username} (chat_id={chat_id})")
+                import hashlib as _hl
+                id_hash = _hl.sha256(chat_id.encode()).hexdigest()[:12]
+                logger.info(f"Creator identified (chat_id_hash={id_hash})")
 
                 # Send verification message
                 code = self.get_verification_code()

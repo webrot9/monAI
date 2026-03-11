@@ -16,6 +16,8 @@ from monai.agents.base import BaseAgent
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.llm import LLM
+from monai.web.landing import generator as landing_generator
+from monai.web.landing import deploy as landing_deploy
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,10 @@ class WebPresence(BaseAgent):
         brands = self._get_brands(brand_filter)
 
         results = {}
+
+        # Always regenerate crowdfunding page with latest funding progress
+        results["crowdfunding"] = self.generate_crowdfunding_page()
+
         for brand in brands:
             sites = self._get_brand_sites(brand)
             if not sites:
@@ -220,6 +226,77 @@ class WebPresence(BaseAgent):
 
         self.log_action("generate_landing", f"{brand}: {content.get('headline', '')[:50]}")
         return {"page_id": page_id, "content": content}
+
+    def generate_crowdfunding_page(
+        self,
+        stripe_links: dict[int, str] | None = None,
+        kofi_url: str | None = None,
+        monero_address: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate the crowdfunding landing page using the real template generator.
+
+        Uses web/landing/generator.py to fill the HTML template with live
+        funding progress from the DB and real payment links.
+        Writes to a build/ subdirectory to avoid overwriting the template.
+        """
+        from pathlib import Path
+        try:
+            build_dir = Path(landing_generator.OUTPUT_DIR) / "build"
+            build_dir.mkdir(parents=True, exist_ok=True)
+            output_path = landing_generator.generate(
+                config=self.config,
+                db=self.db,
+                output_path=build_dir / "index.html",
+                stripe_links=stripe_links,
+                kofi_url=kofi_url,
+                monero_address=monero_address,
+            )
+            self.log_action("generate_crowdfunding_page", f"Generated at {output_path}")
+            return {"status": "generated", "path": str(output_path)}
+        except Exception as e:
+            logger.error(f"Crowdfunding page generation failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def deploy_crowdfunding_page(
+        self,
+        provider: str = "netlify",
+        site_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Deploy the crowdfunding landing page to a hosting provider.
+
+        First generates the page with live data, then deploys it.
+        Uses web/landing/deploy.py for Netlify, Vercel, or Cloudflare Pages.
+        """
+        # Generate fresh page with live data
+        gen_result = self.generate_crowdfunding_page()
+        if gen_result.get("status") != "generated":
+            return {"status": "error", "error": f"Generation failed: {gen_result.get('error')}"}
+
+        try:
+            from pathlib import Path
+            build_dir = Path(landing_generator.OUTPUT_DIR) / "build"
+            deploy_result = landing_deploy.deploy(
+                provider=provider,
+                site_dir=build_dir,
+                site_name=site_name,
+            )
+            result = {
+                "status": "deployed" if deploy_result.success else "deploy_failed",
+                "url": deploy_result.url,
+                "provider": deploy_result.provider,
+                "error": deploy_result.error,
+            }
+            if deploy_result.success:
+                self.log_action("deploy_crowdfunding", f"Live at {deploy_result.url}")
+                self.share_knowledge(
+                    "website", "crowdfunding_page",
+                    f"Crowdfunding page live at {deploy_result.url}",
+                    tags=["crowdfunding", "website", "live"],
+                )
+            return result
+        except Exception as e:
+            logger.error(f"Crowdfunding page deploy failed: {e}")
+            return {"status": "error", "error": str(e)}
 
     def _plan_pages(self, brand: str,
                     site: dict[str, Any]) -> list[dict[str, Any]]:

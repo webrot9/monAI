@@ -159,8 +159,10 @@ class TestTechLead:
 
         db.execute_insert(
             "INSERT INTO bugs (title, description, severity, source, status, "
-            "fix_description) VALUES (?, ?, ?, ?, 'fix_ready', ?)",
-            ("Bug 1", "desc", "medium", "test", "Fixed the issue"),
+            "fix_description, fix_files, test_results) VALUES (?, ?, ?, ?, 'fix_ready', ?, ?, ?)",
+            ("Bug 1", "desc", "medium", "test", "Fixed the issue",
+             '["src/monai/agents/base.py"]',
+             '{"status": "success", "passed": 5, "failed": 0}'),
         )
 
         mock_llm.chat_json.return_value = {

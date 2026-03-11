@@ -48,9 +48,18 @@ class CommsEngine:
                 socks.wrapmodule(smtplib)
                 logger.info(f"SMTP routed through proxy {proxy_host}:{proxy_port}")
             except ImportError:
-                logger.warning("PySocks not installed — SMTP connection is direct")
+                logger.error(
+                    "PRIVACY VIOLATION: PySocks not installed — SMTP would be direct. "
+                    "Install PySocks (`pip install pysocks`) or disable proxy to proceed."
+                )
+                raise RuntimeError(
+                    "Cannot send email: SOCKS5 proxy configured but PySocks not installed. "
+                    "Direct SMTP would expose creator's IP."
+                )
 
-        return smtplib.SMTP(host, port)
+        # Use generic local_hostname to prevent leaking real machine hostname
+        # in SMTP EHLO/HELO command
+        return smtplib.SMTP(host, port, local_hostname="mail.client.local")
 
     def send_email(
         self,
@@ -79,6 +88,12 @@ class CommsEngine:
         msg["Subject"] = subject
         msg["From"] = f"{cfg.from_name} <{cfg.from_email}>"
         msg["To"] = to_email
+        # Generate safe Message-ID that doesn't leak hostname
+        import secrets as _secrets
+        safe_domain = cfg.from_email.split("@")[-1] if "@" in cfg.from_email else "mail.local"
+        msg["Message-ID"] = f"<{_secrets.token_hex(16)}@{safe_domain}>"
+        # Explicitly set X-Mailer to generic value (prevents Python/hostname leaks)
+        msg["X-Mailer"] = "Professional Mailer 1.0"
         msg.attach(MIMEText(body, "plain"))
         if html_body:
             msg.attach(MIMEText(html_body, "html"))

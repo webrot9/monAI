@@ -247,7 +247,7 @@ class RedditClient(BasePlatformClient):
                 "username": self._credentials.get("username", ""),
                 "password": self._credentials.get("password", ""),
             },
-            headers={"User-Agent": f"monAI/1.0 by {self._credentials.get('username', '')}"},
+            headers={"User-Agent": "monAI/1.0"},
         )
         if resp.status_code == 200:
             self._access_token = resp.json().get("access_token", "")
@@ -256,7 +256,7 @@ class RedditClient(BasePlatformClient):
         self._ensure_auth()
         return {
             "Authorization": f"Bearer {self._access_token}",
-            "User-Agent": f"monAI/1.0 by {self._credentials.get('username', '')}",
+            "User-Agent": "monAI/1.0",
         }
 
     def post(self, content: str, **kwargs) -> dict[str, Any]:
@@ -351,24 +351,111 @@ class RedditClient(BasePlatformClient):
 
 
 class IndieHackersClient(BasePlatformClient):
-    """Indie Hackers client — uses browser automation via executor for posting
-    since IH doesn't have a public API. Metrics tracking only for now."""
+    """Indie Hackers client — uses browser automation for posting
+    since IH doesn't have a public API."""
 
     platform = "indie_hackers"
+    IH_BASE = "https://www.indiehackers.com"
 
     def post(self, content: str, **kwargs) -> dict[str, Any]:
-        """IH doesn't have a public API — returns a placeholder for manual/browser posting."""
-        logger.info("Indie Hackers post queued (requires browser automation)")
-        return {
-            "platform": "indie_hackers",
-            "post_id": "",
-            "url": "",
-            "status": "requires_browser",
-            "content": content,
-        }
+        """Post on Indie Hackers using browser automation."""
+        from monai.utils.browser import Browser
+
+        group = kwargs.get("group", "")
+        title = kwargs.get("title", content[:80])
+
+        async def _post():
+            browser = Browser(self._config, headless=True)
+            try:
+                await browser.start()
+
+                if group:
+                    await browser.navigate(f"{self.IH_BASE}/group/{group}/posts/new")
+                else:
+                    await browser.navigate(f"{self.IH_BASE}/new-post")
+
+                page_info = await browser.get_page_info()
+                page_text = (page_info.get("text", "") or "").lower()
+
+                # Check if we need to log in
+                if "sign in" in page_text or "log in" in page_text:
+                    return {
+                        "platform": "indie_hackers",
+                        "post_id": "",
+                        "url": "",
+                        "status": "auth_required",
+                        "content": content,
+                    }
+
+                # Fill in post form
+                await browser.fill_form({
+                    "[name='title'], #title, .title-input": title,
+                    "[name='body'], #body, .body-input, .ProseMirror": content,
+                })
+                await browser.submit_form("form")
+
+                import asyncio
+                await asyncio.sleep(3)
+                final_info = await browser.get_page_info()
+                post_url = final_info.get("url", "")
+
+                return {
+                    "platform": "indie_hackers",
+                    "post_id": post_url.split("/")[-1] if post_url else "",
+                    "url": post_url,
+                    "status": "posted",
+                }
+            except Exception as e:
+                logger.error(f"IH post failed: {e}")
+                return {
+                    "platform": "indie_hackers",
+                    "post_id": "",
+                    "url": "",
+                    "status": "error",
+                    "error": str(e),
+                    "content": content,
+                }
+            finally:
+                await browser.stop()
+
+        import asyncio
+        from monai.agents.base import BaseAgent
+        return BaseAgent._run_async(_post())
 
     def get_post_metrics(self, post_id: str) -> dict[str, Any]:
-        return {"likes": 0, "comments": 0, "shares": 0, "clicks": 0}
+        """Scrape metrics from an IH post page."""
+        if not post_id:
+            return {"likes": 0, "comments": 0, "shares": 0, "clicks": 0}
+
+        from monai.utils.browser import Browser
+        import asyncio
+
+        async def _get_metrics():
+            browser = Browser(self._config, headless=True)
+            try:
+                await browser.start()
+                await browser.navigate(f"{self.IH_BASE}/post/{post_id}")
+                text = await browser.get_text()
+
+                # Extract metrics from page text (best-effort)
+                import re
+                likes = 0
+                comments = 0
+                like_match = re.search(r"(\d+)\s*(?:upvote|like|point)", text.lower())
+                if like_match:
+                    likes = int(like_match.group(1))
+                comment_match = re.search(r"(\d+)\s*(?:comment|repl)", text.lower())
+                if comment_match:
+                    comments = int(comment_match.group(1))
+
+                return {"likes": likes, "comments": comments, "shares": 0, "clicks": 0}
+            except Exception:
+                return {"likes": 0, "comments": 0, "shares": 0, "clicks": 0}
+            finally:
+                await browser.stop()
+
+        from monai.agents.base import BaseAgent
+        return BaseAgent._run_async(_get_metrics())
 
     def get_profile_metrics(self) -> dict[str, Any]:
         return {"followers": 0}

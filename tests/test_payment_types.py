@@ -1,5 +1,7 @@
 """Tests for payment types and base abstractions."""
 
+import pytest
+
 from monai.payments.types import (
     PaymentIntent,
     PaymentResult,
@@ -47,6 +49,27 @@ class TestPaymentIntent:
         assert intent.currency == "USD"
         assert intent.brand == "micro_saas"
         assert intent.metadata["lead_id"] == 42
+
+
+    def test_rejects_zero_amount(self):
+        with pytest.raises(ValueError, match="below minimum"):
+            PaymentIntent(amount=0)
+
+    def test_rejects_negative_amount(self):
+        with pytest.raises(ValueError, match="below minimum"):
+            PaymentIntent(amount=-10.0)
+
+    def test_rejects_excessive_amount(self):
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            PaymentIntent(amount=200_000.0)
+
+    def test_rejects_nan_amount(self):
+        with pytest.raises(ValueError, match="NaN"):
+            PaymentIntent(amount=float("nan"))
+
+    def test_minimum_amount_accepted(self):
+        intent = PaymentIntent(amount=0.01)
+        assert intent.amount == 0.01
 
 
 class TestPaymentResult:

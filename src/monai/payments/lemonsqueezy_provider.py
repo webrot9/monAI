@@ -47,50 +47,68 @@ class LemonSqueezyProvider(PaymentProvider):
         self.store_id = store_id
         self.webhook_secret = webhook_secret
         self.proxy_url = proxy_url
+        self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
-        kwargs: dict[str, Any] = {
-            "timeout": 30.0,
-            "headers": {
-                "Authorization": f"Bearer {self.api_key}",
-                "Accept": "application/vnd.api+json",
-                "Content-Type": "application/vnd.api+json",
-            },
-        }
-        if self.proxy_url:
-            kwargs["proxy"] = self.proxy_url
-        return httpx.AsyncClient(**kwargs)
+        if self._client is None or self._client.is_closed:
+            kwargs: dict[str, Any] = {
+                "timeout": 30.0,
+                "headers": {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Accept": "application/vnd.api+json",
+                    "Content-Type": "application/vnd.api+json",
+                },
+            }
+            from monai.payments.base import _resolve_proxy_url
+            proxy = _resolve_proxy_url(self.proxy_url)
+            if proxy:
+                kwargs["proxy"] = proxy
+            self._client = httpx.AsyncClient(**kwargs)
+        return self._client
 
     async def _api_call(self, method: str, endpoint: str,
                         data: dict | None = None) -> dict:
         url = f"{LS_API_BASE}/{endpoint.lstrip('/')}"
-        async with self._get_client() as client:
-            if method == "GET":
-                resp = await client.get(url, params=data)
-            elif method == "POST":
-                resp = await client.post(url, json=data)
-            elif method == "PATCH":
-                resp = await client.patch(url, json=data)
-            else:
-                resp = await client.request(method, url, json=data)
+        client = self._get_client()
+        if method == "GET":
+            resp = await client.get(url, params=data)
+        elif method == "POST":
+            resp = await client.post(url, json=data)
+        elif method == "PATCH":
+            resp = await client.patch(url, json=data)
+        else:
+            resp = await client.request(method, url, json=data)
 
-            if resp.status_code >= 400:
-                raise LemonSqueezyAPIError(f"HTTP {resp.status_code}: {resp.text}")
+        if resp.status_code >= 400:
+            raise LemonSqueezyAPIError(f"HTTP {resp.status_code}: {resp.text}")
 
-            return resp.json() if resp.text else {}
+        return resp.json() if resp.text else {}
 
     async def create_payment(self, intent: PaymentIntent) -> PaymentResult:
         """Create a checkout link via Lemon Squeezy API.
 
-        Requires an existing product/variant. The checkout URL
-        is what customers use to pay.
+        If ``variant_id`` is provided in metadata, uses that existing variant.
+        Otherwise, auto-creates a product and variant from the intent fields,
+        making the provider fully self-service.
         """
         variant_id = intent.metadata.get("variant_id")
+
         if not variant_id:
-            return PaymentResult(
-                success=False,
-                error="variant_id required in metadata for Lemon Squeezy checkout",
-            )
+            # Auto-create product + variant so callers don't need to pre-provision.
+            product_name = intent.product or intent.metadata.get("product_name", "Product")
+            description = intent.metadata.get("description", "")
+            try:
+                created = await self.create_product(
+                    name=product_name,
+                    description=description,
+                    price_cents=intent.amount_cents,
+                )
+                variant_id = created["variant"].get("id", "")
+            except (LemonSqueezyAPIError, KeyError) as e:
+                return PaymentResult(
+                    success=False,
+                    error=f"Failed to auto-create product/variant: {e}",
+                )
 
         checkout_data = {
             "data": {
@@ -184,11 +202,13 @@ class LemonSqueezyProvider(PaymentProvider):
     async def handle_webhook(self, payload: bytes,
                              headers: dict[str, str]) -> WebhookEvent | None:
         """Parse and verify Lemon Squeezy webhook."""
-        if self.webhook_secret:
-            sig = headers.get("x-signature", "")
-            if not self._verify_signature(payload, sig):
-                logger.warning("Invalid Lemon Squeezy webhook signature")
-                return None
+        if not self.webhook_secret:
+            logger.error("LemonSqueezy webhook_secret not configured — rejecting webhook")
+            return None
+        sig = headers.get("x-signature", "")
+        if not self._verify_signature(payload, sig):
+            logger.warning("Invalid Lemon Squeezy webhook signature")
+            return None
 
         try:
             data = json.loads(payload)
@@ -249,6 +269,95 @@ class LemonSqueezyProvider(PaymentProvider):
         ).hexdigest()
 
         return hmac.compare_digest(expected, signature)
+
+    # ── Product & Variant Management ─────────────────────────
+
+    async def create_product(
+        self,
+        name: str,
+        description: str = "",
+        price_cents: int = 0,
+        store_id: str = "",
+    ) -> dict:
+        """Create a product AND its default variant on Lemon Squeezy.
+
+        LS auto-creates one variant per product. We then update that
+        variant with the requested price.
+
+        Args:
+            name: Product name shown to customers.
+            description: Product description (HTML supported).
+            price_cents: Price in cents (e.g. 999 = $9.99).
+            store_id: Override store ID (defaults to self.store_id).
+
+        Returns:
+            Dict with ``product`` and ``variant`` API response data.
+        """
+        sid = store_id or self.store_id
+        product_body = {
+            "data": {
+                "type": "products",
+                "attributes": {
+                    "name": name,
+                    "description": description or name,
+                },
+                "relationships": {
+                    "store": {
+                        "data": {"type": "stores", "id": str(sid)},
+                    },
+                },
+            },
+        }
+
+        product_result = await self._api_call("POST", "products", product_body)
+        product_data = product_result.get("data", {})
+        product_id = product_data.get("id", "")
+
+        logger.info(f"Created LS product '{name}' (id={product_id})")
+
+        # Fetch the auto-created default variant for this product.
+        variants_result = await self._api_call(
+            "GET", "variants", {"filter[product_id]": product_id},
+        )
+        variants = variants_result.get("data", [])
+        if not variants:
+            raise LemonSqueezyAPIError(
+                f"Product {product_id} created but no default variant found"
+            )
+
+        variant_data = variants[0]
+        variant_id = variant_data.get("id", "")
+
+        # Update the variant with the correct price.
+        if price_cents:
+            variant_body = {
+                "data": {
+                    "type": "variants",
+                    "id": str(variant_id),
+                    "attributes": {
+                        "price": price_cents,
+                    },
+                },
+            }
+            variant_data = (
+                await self._api_call("PATCH", f"variants/{variant_id}", variant_body)
+            ).get("data", variant_data)
+            logger.info(
+                f"Updated LS variant {variant_id} price to {price_cents} cents"
+            )
+
+        return {"product": product_data, "variant": variant_data}
+
+    async def list_products(self) -> list[dict]:
+        """List all products in the configured store.
+
+        Returns:
+            List of product resource objects from the JSON API response.
+        """
+        result = await self._api_call(
+            "GET", "products", {"filter[store_id]": self.store_id},
+        )
+        return result.get("data", [])
 
     async def health_check(self) -> bool:
         try:

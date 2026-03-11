@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ from monai.db.database import Database
 from monai.utils.browser import Browser
 from monai.utils.llm import LLM
 from monai.utils.privacy import get_anonymizer
-from monai.utils.sandbox import is_path_allowed, safe_read, safe_write
+from monai.utils.sandbox import is_path_allowed, safe_read, safe_write, sandbox_run
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +57,13 @@ class AutonomousExecutor:
     """Executes complex multi-step tasks autonomously using an LLM-driven action loop."""
 
     def __init__(self, config: Config, db: Database, llm: LLM,
-                 max_steps: int = 50, headless: bool = True):
+                 max_steps: int = 50, headless: bool = True,
+                 timeout_seconds: int = 3600):
         self.config = config
         self.db = db
         self.llm = llm
         self.max_steps = max_steps
+        self.timeout_seconds = timeout_seconds
         self.browser = Browser(config, headless=headless)
         self._anonymizer = get_anonymizer(config)
         # HTTP client routed through proxy — no direct connections
@@ -79,11 +82,22 @@ class AutonomousExecutor:
         """
         logger.info(f"Starting autonomous task: {task[:100]}")
         self.action_history = []
+        start_time = time.time()
 
         try:
             await self.browser.start()
 
             for step in range(self.max_steps):
+                # Enforce time limit
+                elapsed = time.time() - start_time
+                if elapsed > self.timeout_seconds:
+                    self._log_task(task, "timeout", f"Exceeded {self.timeout_seconds}s")
+                    return {
+                        "status": "timeout",
+                        "steps": step,
+                        "elapsed_seconds": int(elapsed),
+                        "history": self.action_history,
+                    }
                 # THINK: Decide next action
                 action = self._think(task, context, step)
 
@@ -119,7 +133,15 @@ class AutonomousExecutor:
                     "history": self.action_history}
 
         finally:
-            await self.browser.stop()
+            try:
+                await self.browser.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping browser: {e}")
+            try:
+                if hasattr(self.http_client, 'close'):
+                    self.http_client.close()
+            except Exception as e:
+                logger.warning(f"Error closing HTTP client: {e}")
 
     def _think(self, task: str, context: str, step: int) -> dict[str, Any]:
         """Use LLM to decide the next action."""
@@ -202,34 +224,48 @@ class AutonomousExecutor:
                 return await self.browser.get_text()
 
             elif tool == "http_get":
-                self._anonymizer.maybe_rotate()
-                resp = self.http_client.get(
-                    args.get("url", ""),
-                    headers=args.get("headers", {}),
-                )
-                return {"status": resp.status_code, "body": resp.text[:2000]}
+                url = args.get("url", "")
+                if not url.startswith(("http://", "https://")):
+                    return "BLOCKED: only http/https URLs allowed"
+                try:
+                    self._anonymizer.maybe_rotate()
+                    resp = self.http_client.get(
+                        url, headers=args.get("headers", {}), timeout=30,
+                    )
+                    return {"status": resp.status_code, "body": resp.text[:2000]}
+                except Exception as e:
+                    return {"status": 0, "error": str(e)[:200]}
 
             elif tool == "http_post":
-                self._anonymizer.maybe_rotate()
-                resp = self.http_client.post(
-                    args.get("url", ""),
-                    json=args.get("data", {}),
-                    headers=args.get("headers", {}),
-                )
-                return {"status": resp.status_code, "body": resp.text[:2000]}
+                url = args.get("url", "")
+                if not url.startswith(("http://", "https://")):
+                    return "BLOCKED: only http/https URLs allowed"
+                try:
+                    self._anonymizer.maybe_rotate()
+                    resp = self.http_client.post(
+                        url, json=args.get("data", {}),
+                        headers=args.get("headers", {}), timeout=30,
+                    )
+                    return {"status": resp.status_code, "body": resp.text[:2000]}
+                except Exception as e:
+                    return {"status": 0, "error": str(e)[:200]}
 
             elif tool == "shell":
                 cmd = args.get("command", "")
                 if is_action_blocked(cmd):
                     return "BLOCKED: dangerous command"
-                # Sandbox: run shell commands from project workspace only
-                from monai.utils.sandbox import PROJECT_ROOT
-                result = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, timeout=60,
-                    cwd=str(PROJECT_ROOT / "workspace"),
-                )
-                return {"stdout": result.stdout[:2000], "stderr": result.stderr[:500],
-                        "returncode": result.returncode}
+                # Validate command against whitelist — no arbitrary shell execution
+                from monai.agents.ethics import is_shell_command_allowed
+                if not is_shell_command_allowed(cmd):
+                    return "BLOCKED: command not in allowed list. Only safe commands permitted."
+                # Parse and execute in OS-level sandbox (namespace isolation +
+                # sanitized env + forced cwd + no shell=True)
+                import shlex
+                try:
+                    cmd_parts = shlex.split(cmd)
+                except ValueError as e:
+                    return f"BLOCKED: invalid command syntax: {e}"
+                return sandbox_run(cmd_parts)
 
             elif tool == "write_file":
                 path = args.get("path", "")
@@ -259,13 +295,13 @@ class AutonomousExecutor:
 
             elif tool == "run_tests":
                 test_path = args.get("path", "")
-                result = subprocess.run(
+                result = sandbox_run(
                     ["python", "-m", "pytest", test_path, "-v", "--tb=short"],
-                    capture_output=True, text=True, timeout=60,
+                    timeout=120,
                 )
                 return {
-                    "passed": result.returncode == 0,
-                    "output": result.stdout + result.stderr,
+                    "passed": result["returncode"] == 0,
+                    "output": result["stdout"] + result["stderr"],
                 }
 
             elif tool == "wait":

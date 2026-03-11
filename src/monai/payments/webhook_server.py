@@ -26,6 +26,15 @@ from monai.payments.types import WebhookEvent
 
 logger = logging.getLogger(__name__)
 
+# Optional audit trail — set by caller (e.g. orchestrator)
+_audit_trail = None
+
+
+def set_webhook_audit(audit) -> None:
+    """Set the audit trail instance for webhook event logging."""
+    global _audit_trail
+    _audit_trail = audit
+
 # Schema for webhook event log
 WEBHOOK_LOG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS webhook_events (
@@ -44,6 +53,43 @@ CREATE TABLE IF NOT EXISTS webhook_events (
 """
 
 
+class _RateLimiter:
+    """Simple in-memory rate limiter for webhook endpoints."""
+
+    def __init__(self, max_per_second: int = 10, max_per_minute: int = 200):
+        self._max_per_second = max_per_second
+        self._max_per_minute = max_per_minute
+        self._second_counts: dict[str, int] = {}  # ip -> count
+        self._minute_counts: dict[str, int] = {}  # ip -> count
+        self._last_second: float = 0.0
+        self._last_minute: float = 0.0
+
+    def is_allowed(self, client_ip: str) -> bool:
+        import time
+        now = time.time()
+        current_second = int(now)
+        current_minute = int(now / 60)
+
+        # Reset per-second counters
+        if current_second != int(self._last_second):
+            self._second_counts.clear()
+            self._last_second = now
+        # Reset per-minute counters
+        if current_minute != int(self._last_minute / 60):
+            self._minute_counts.clear()
+            self._last_minute = now
+
+        sec_count = self._second_counts.get(client_ip, 0)
+        min_count = self._minute_counts.get(client_ip, 0)
+
+        if sec_count >= self._max_per_second or min_count >= self._max_per_minute:
+            return False
+
+        self._second_counts[client_ip] = sec_count + 1
+        self._minute_counts[client_ip] = min_count + 1
+        return True
+
+
 class WebhookServer:
     """Async HTTP server for receiving payment webhooks."""
 
@@ -53,6 +99,7 @@ class WebhookServer:
         self._providers: dict[str, PaymentProvider] = {}
         self._event_handlers: list[Callable[[WebhookEvent], Awaitable[None]]] = []
         self._server: asyncio.Server | None = None
+        self._rate_limiter = _RateLimiter(max_per_second=10, max_per_minute=200)
 
     def register_provider(self, route: str, provider: PaymentProvider) -> None:
         """Register a payment provider for a webhook route.
@@ -90,6 +137,14 @@ class WebhookServer:
                                  writer: asyncio.StreamWriter) -> None:
         """Handle a single HTTP connection."""
         try:
+            # Rate limit by client IP
+            peername = writer.get_extra_info("peername")
+            client_ip = peername[0] if peername else "unknown"
+            if not self._rate_limiter.is_allowed(client_ip):
+                logger.warning(f"Rate limit exceeded for {client_ip}")
+                await self._send_response(writer, 429, "Too Many Requests")
+                return
+
             # Read the full HTTP request
             request_line = await asyncio.wait_for(
                 reader.readline(), timeout=10.0
@@ -169,17 +224,29 @@ class WebhookServer:
             "btcpay-sig": headers.get("btcpay-sig", ""),
             "x-gumroad-signature": headers.get("x-gumroad-signature", ""),
             "x-signature": headers.get("x-signature", ""),
+            "content-type": headers.get("content-type", ""),
         }
 
         try:
             event = await provider.handle_webhook(body, original_headers)
         except Exception as e:
             logger.error(f"Webhook processing error ({route}): {e}")
+            if _audit_trail:
+                _audit_trail.log(
+                    "webhook_server", "api_call", "webhook_error",
+                    details={"provider": route, "error": str(e)},
+                    success=False, risk_level="high",
+                )
             await self._send_response(writer, 500, str(e))
             return
 
         if event is None:
             logger.warning(f"Webhook from {route} could not be parsed/verified")
+            if _audit_trail:
+                _audit_trail.log(
+                    "webhook_server", "api_call", "webhook_invalid",
+                    details={"provider": route}, success=False,
+                )
             await self._send_response(writer, 400, "Invalid webhook")
             return
 
@@ -189,6 +256,20 @@ class WebhookServer:
                 await handler(event)
             except Exception as e:
                 logger.error(f"Event handler error: {e}")
+
+        # Audit successful webhook
+        if _audit_trail:
+            _audit_trail.log(
+                "webhook_server", "payment", "webhook_received",
+                details={
+                    "provider": event.provider,
+                    "event_type": event.event_type.value,
+                    "payment_ref": event.payment_ref,
+                    "amount": event.amount,
+                    "currency": event.currency,
+                },
+                brand=event.metadata.get("brand", ""),
+            )
 
         logger.info(
             f"Webhook processed: {event.provider}/{event.event_type.value} "

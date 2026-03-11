@@ -7,12 +7,15 @@ Passive income once published. Uses existing content capabilities.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from monai.agents.base import BaseAgent
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.llm import LLM
+
+logger = logging.getLogger(__name__)
 
 COURSE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS courses (
@@ -29,6 +32,7 @@ CREATE TABLE IF NOT EXISTS courses (
     enrollments INTEGER DEFAULT 0,
     rating REAL DEFAULT 0.0,
     revenue REAL DEFAULT 0.0,
+    listing_url TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     published_at TIMESTAMP
 );
@@ -67,7 +71,7 @@ class CourseCreationAgent(BaseAgent):
             f"Course stats: {json.dumps(stats)}. Plan next actions.\n"
             "Return: {\"steps\": [str]}.\n"
             "Options: research_topics, design_curriculum, write_lessons, "
-            "review_content, plan_marketing, analyze_performance.",
+            "list_course, review_content, plan_marketing, analyze_performance.",
         )
         return plan.get("steps", ["research_topics"])
 
@@ -83,27 +87,109 @@ class CourseCreationAgent(BaseAgent):
                 results["curriculum"] = self._design_curriculum()
             elif step == "write_lessons":
                 results["lessons"] = self._write_lessons()
+            elif step == "list_course":
+                results["listing"] = self._list_course()
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results
 
     def _research_topics(self) -> dict[str, Any]:
-        """Find course topics with high demand and low competition."""
-        return self.think_json(
-            "Research 5 online course topics. Requirements:\n"
-            "- High demand on Udemy/Skillshare (people search for this)\n"
-            "- Can be taught without video (text + code + diagrams)\n"
-            "- Practical, skill-based (not theoretical)\n"
-            "- Students willing to pay $20-100\n"
-            "- Can be completed in 3-8 hours\n\n"
+        """Research REAL trending course topics by browsing actual course platforms."""
+        all_topics = []
+
+        # Browse Udemy for trending/bestselling courses to find gaps
+        udemy_data = self.browse_and_extract(
+            "https://www.udemy.com/courses/development/?sort=popularity",
+            "Analyze the trending and bestselling courses on this page. For each course extract:\n"
+            "- title: the course title\n"
+            "- instructor: who teaches it\n"
+            "- rating: the star rating\n"
+            "- num_students: number of enrolled students\n"
+            "- price: the listed price\n"
+            "- topics_covered: key topics/skills taught\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"courses\": [...]}"
+        )
+        for course in udemy_data.get("courses", []):
+            course["source"] = "udemy"
+            all_topics.append(course)
+
+        # Browse Skillshare for trending classes
+        skillshare_data = self.browse_and_extract(
+            "https://www.skillshare.com/en/browse/trending",
+            "Find trending classes on Skillshare. For each class extract:\n"
+            "- title: the class title\n"
+            "- instructor: who teaches it\n"
+            "- num_students: number of students if visible\n"
+            "- category: the category/topic area\n"
+            "- duration: class length if shown\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"classes\": [...]}"
+        )
+        for cls in skillshare_data.get("classes", []):
+            cls["source"] = "skillshare"
+            all_topics.append(cls)
+
+        # Browse Coursera for popular professional certificates and courses
+        coursera_data = self.browse_and_extract(
+            "https://www.coursera.org/courses?sortBy=BEST_MATCH",
+            "Find popular courses and professional certificates. For each extract:\n"
+            "- title: the course/certificate title\n"
+            "- provider: university or organization offering it\n"
+            "- rating: the star rating\n"
+            "- num_reviews: number of reviews\n"
+            "- skills: key skills taught\n"
+            "- difficulty_level: beginner/intermediate/advanced\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"courses\": [...]}"
+        )
+        for course in coursera_data.get("courses", []):
+            course["source"] = "coursera"
+            all_topics.append(course)
+
+        # Search for underserved course topics people are actively requesting
+        demand_data = self.search_web(
+            "online course topic ideas high demand 2025 2026 underserved",
+            "Find real discussions, articles, or forum posts about course topics "
+            "that are in high demand but underserved. For each extract:\n"
+            "- topic: the suggested course topic\n"
+            "- source_url: where this was discussed\n"
+            "- evidence_of_demand: why this is in demand\n"
+            "- competition_level: how many courses already exist on this\n\n"
+            "Only include REAL data visible on the page. Do NOT make up any information.\n"
+            "Return as JSON: {\"opportunities\": [...]}"
+        )
+        for opp in demand_data.get("opportunities", []):
+            opp["source"] = "web_research"
+            all_topics.append(opp)
+
+        # Use LLM to ANALYZE the real data and identify the best opportunities
+        analysis = self.think_json(
+            f"Based on this REAL market research data from course platforms, "
+            f"identify the 5 best course topic opportunities:\n\n"
+            f"Market data: {json.dumps(all_topics, default=str)[:3000]}\n\n"
+            "For each opportunity explain:\n"
+            "- Why it's a good opportunity based on the data\n"
+            "- What unique angle we could take\n"
+            "- Which platform to target\n\n"
             "Return: {\"topics\": [{\"title\": str, \"niche\": str, "
             "\"target_audience\": str, \"platform\": str, \"price\": float, "
-            "\"estimated_enrollments_monthly\": int, \"competition\": str, "
-            "\"unique_angle\": str, \"prerequisites\": [str]}]}"
+            "\"rationale\": str, \"unique_angle\": str, \"prerequisites\": [str]}]}"
         )
 
+        self.log_action(
+            "topics_researched",
+            f"Scraped {len(all_topics)} courses/topics from real platforms, "
+            f"identified {len(analysis.get('topics', []))} opportunities"
+        )
+        return {
+            "market_data_collected": len(all_topics),
+            "topics": analysis.get("topics", []),
+            "raw_market_data": all_topics[:20],  # keep first 20 for reference
+        }
+
     def _design_curriculum(self) -> dict[str, Any]:
-        """Design a full course curriculum."""
+        """Design a full course curriculum. LLM-based planning is legitimate."""
         curriculum = self.think_json(
             "Design a complete course curriculum. Include:\n"
             "- Course title and tagline\n"
@@ -191,3 +277,96 @@ class CourseCreationAgent(BaseAgent):
 
         self.log_action("lessons_written", f"{written} lessons scripted")
         return {"lessons_written": written}
+
+    def _list_course(self) -> dict[str, Any]:
+        """List a completed course on its target platform using platform_action."""
+        # Find courses that are fully scripted and ready to publish
+        courses = self.db.execute(
+            "SELECT c.*, "
+            "(SELECT COUNT(*) FROM course_lessons WHERE course_id = c.id AND status = 'scripted') as scripted, "
+            "(SELECT COUNT(*) FROM course_lessons WHERE course_id = c.id) as total "
+            "FROM courses c WHERE c.status = 'scripting'"
+        )
+
+        listed = 0
+        for course in courses:
+            c = dict(course)
+            # Only list if all lessons are scripted
+            if c["scripted"] < c["total"]:
+                logger.info(
+                    "Course %s has %d/%d lessons scripted, skipping listing",
+                    c["title"], c["scripted"], c["total"]
+                )
+                continue
+
+            # Gather all lesson content for the listing
+            lessons = self.db.execute(
+                "SELECT section, title, script, duration_minutes, lesson_order "
+                "FROM course_lessons WHERE course_id = ? ORDER BY lesson_order",
+                (c["id"],),
+            )
+            lesson_data = [dict(l) for l in lessons]
+
+            # Build a course description using LLM (legitimate creative work)
+            listing_copy = self.think_json(
+                f"Write a compelling course listing for a platform like {c['platform']}.\n"
+                f"Course title: {c['title']}\n"
+                f"Niche: {c['niche']}\n"
+                f"Target audience: {c['target_audience']}\n"
+                f"Price: ${c['price']}\n"
+                f"Total lessons: {c['total']}\n"
+                f"Sections and lessons: {json.dumps([(l['section'], l['title']) for l in lesson_data])}\n\n"
+                "Return: {\"headline\": str, \"description\": str, "
+                "\"what_youll_learn\": [str], \"requirements\": [str], "
+                "\"who_is_this_for\": str, \"tags\": [str]}"
+            )
+
+            platform = c["platform"]
+
+            # Ensure we have an account on the platform
+            self.ensure_platform_account(platform)
+
+            # Actually list the course on the platform
+            try:
+                result = self.platform_action(
+                    platform,
+                    f"Create a new course listing with the following details:\n"
+                    f"Title: {c['title']}\n"
+                    f"Price: ${c['price']}\n"
+                    f"Description: {listing_copy.get('description', '')}\n"
+                    f"Headline: {listing_copy.get('headline', '')}\n"
+                    f"What you'll learn: {json.dumps(listing_copy.get('what_youll_learn', []))}\n"
+                    f"Requirements: {json.dumps(listing_copy.get('requirements', []))}\n"
+                    f"Target audience: {listing_copy.get('who_is_this_for', '')}\n"
+                    f"Tags: {json.dumps(listing_copy.get('tags', []))}\n\n"
+                    f"Course has {c['total']} lessons across these sections:\n"
+                    + "\n".join(
+                        f"  Section '{l['section']}' - Lesson {l['lesson_order']}: {l['title']} "
+                        f"({l['duration_minutes']} min)"
+                        for l in lesson_data
+                    )
+                    + "\n\nFor each lesson, upload the following script content as the lesson body.",
+                    f"Listing course '{c['title']}' on {platform}. "
+                    f"Lesson scripts are ready for all {c['total']} lessons."
+                )
+
+                listing_url = result.get("url", "")
+                self.db.execute(
+                    "UPDATE courses SET status = 'published', listing_url = ?, "
+                    "published_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (listing_url, c["id"]),
+                )
+                listed += 1
+                self.log_action(
+                    "course_listed", c["title"],
+                    f"platform={platform} url={listing_url}"
+                )
+
+            except Exception as e:
+                self.log_action(
+                    "course_listing_failed", c["title"], str(e)[:300]
+                )
+                self.learn_from_error(e, f"Listing course '{c['title']}' on {platform}")
+
+        self.log_action("list_courses_complete", f"{listed} courses listed")
+        return {"courses_listed": listed}

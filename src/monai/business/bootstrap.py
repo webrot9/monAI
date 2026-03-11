@@ -140,8 +140,9 @@ NO_LLC_PLATFORMS = {
 class BootstrapWallet:
     """Manages monAI's seed capital from anonymous prepaid card + crowdfunding."""
 
-    def __init__(self, config: Config, db: Database):
+    def __init__(self, config: Config, db: Database, ledger=None):
         self.config = config
+        self.ledger = ledger  # GeneralLedger for double-entry bookkeeping
         self.db = db
         self._init_schema()
 
@@ -201,6 +202,9 @@ class BootstrapWallet:
         )
 
         logger.info(f"Bootstrap prepaid spend: €{amount:.2f} — {description} ({category})")
+
+        # Record in GL: debit expense, credit cash
+        self._record_gl_expense(amount, category, description, vendor)
 
         return {
             "id": tx_id,
@@ -276,6 +280,9 @@ class BootstrapWallet:
         )
 
         logger.info(f"Creator seed donation: €{amount:.2f} to campaign {campaign_id} as '{alias}'")
+
+        # Record in GL: debit cash (Ko-fi), credit equity (seed capital)
+        self._record_gl_seed(amount, campaign['platform'])
 
         return {
             "id": contrib_id,
@@ -358,6 +365,9 @@ class BootstrapWallet:
             (amount, f"Contribution from {backer_name}", f"campaign_{campaign_id}"),
         )
 
+        # Record in GL: debit cash, credit crowdfunding revenue
+        self._record_gl_contribution(amount, backer_name)
+
         return contrib_id
 
     def spend_crowdfunding(self, amount: float, description: str,
@@ -375,6 +385,9 @@ class BootstrapWallet:
         )
 
         logger.info(f"Crowdfunding spend: €{amount:.2f} — {description} ({category})")
+
+        # Record in GL: debit expense, credit cash
+        self._record_gl_expense(amount, category, description, vendor)
 
         return {
             "id": tx_id,
@@ -501,3 +514,75 @@ class BootstrapWallet:
             "SELECT * FROM bootstrap_transactions ORDER BY created_at DESC LIMIT ?",
             (limit,),
         )]
+
+    # ── GL Integration Helpers ────────────────────────────────
+
+    # Category → GL expense account mapping
+    _CATEGORY_GL_ACCOUNTS = {
+        "domain": "5300",              # Expense - Domain Registration
+        "hosting": "5100",             # Expense - Hosting & Infrastructure
+        "crowdfunding_setup": "5600",  # Expense - Marketing
+        "llc_formation": "5400",       # Expense - LLC Maintenance
+        "registered_agent": "5500",    # Expense - Registered Agent
+        "bank_setup": "5400",          # Expense - LLC Maintenance
+        "stripe_setup": "5200",        # Expense - Platform Fees
+        "platform_fee": "5200",        # Expense - Platform Fees
+        "software": "5100",            # Expense - Hosting & Infrastructure
+        "api_credits": "5000",         # Expense - API Costs
+    }
+
+    def _record_gl_expense(self, amount: float, category: str,
+                           description: str, vendor: str) -> None:
+        """Record a bootstrap expense in the general ledger."""
+        if not self.ledger:
+            return
+        try:
+            expense_acct = self._CATEGORY_GL_ACCOUNTS.get(category, "5900")
+            self.ledger.record_expense(
+                amount=amount,
+                expense_account=expense_acct,
+                cash_account="1000",  # Cash - Operating
+                description=f"Bootstrap: {description}" + (f" ({vendor})" if vendor else ""),
+                source="bootstrap",
+            )
+        except Exception as e:
+            logger.error(f"Failed to record GL bootstrap expense: {e}")
+
+    def _record_gl_seed(self, amount: float, platform: str) -> None:
+        """Record a creator seed donation in the GL (equity injection)."""
+        if not self.ledger:
+            return
+        try:
+            # Map platform to cash account
+            cash_accounts = {
+                "kofi": "1060", "buymeacoffee": "1000",
+                "gumroad": "1020", "github_sponsors": "1000",
+            }
+            cash_acct = cash_accounts.get(platform, "1000")
+            self.ledger.record_entry(
+                date=datetime.now().strftime("%Y-%m-%d"),
+                description=f"Creator seed donation via {platform}",
+                lines=[
+                    {"account_code": cash_acct, "debit": amount, "currency": "EUR"},
+                    {"account_code": "3000", "credit": amount, "currency": "EUR",
+                     "memo": "Owner's equity - seed capital"},
+                ],
+                source="bootstrap_seed",
+            )
+        except Exception as e:
+            logger.error(f"Failed to record GL seed donation: {e}")
+
+    def _record_gl_contribution(self, amount: float, backer_name: str) -> None:
+        """Record a crowdfunding contribution in the GL."""
+        if not self.ledger:
+            return
+        try:
+            self.ledger.record_revenue(
+                amount=amount,
+                revenue_account="4400",  # Revenue - Crowdfunding
+                cash_account="1060",     # Cash - Ko-fi (primary platform)
+                description=f"Crowdfunding contribution from {backer_name}",
+                source="bootstrap_crowdfunding",
+            )
+        except Exception as e:
+            logger.error(f"Failed to record GL contribution: {e}")

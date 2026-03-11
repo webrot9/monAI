@@ -14,6 +14,7 @@ from monai.business.brand_payments import BrandPayments
 from monai.config import Config
 from monai.db.database import Database
 from monai.payments.base import PaymentProvider
+from monai.payments.lemonsqueezy_provider import LemonSqueezyProvider
 from monai.payments.monero_provider import MoneroProvider
 from monai.payments.sweep_engine import SweepEngine
 from monai.payments.types import (
@@ -40,9 +41,10 @@ class UnifiedPaymentManager:
     6. Health monitoring — check all providers are operational
     """
 
-    def __init__(self, config: Config, db: Database):
+    def __init__(self, config: Config, db: Database, ledger=None):
         self.config = config
         self.db = db
+        self.ledger = ledger  # GeneralLedger for double-entry bookkeeping
         self.brand_payments = BrandPayments(db)
         self.sweep_engine = SweepEngine(config, db)
         self.webhook_server = WebhookServer()
@@ -53,6 +55,9 @@ class UnifiedPaymentManager:
         # Auto-register Monero if configured
         if config.monero.wallet_rpc_url:
             self._register_monero(config)
+
+        # Auto-register LemonSqueezy providers from DB (previously provisioned keys)
+        self._register_lemonsqueezy_from_db()
 
         # Register webhook event handler
         self.webhook_server.on_event(self._handle_webhook_event)
@@ -76,6 +81,14 @@ class UnifiedPaymentManager:
                     error TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS processed_webhooks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(provider, event_id)
+                );
             """)
 
     def _register_monero(self, config: Config) -> None:
@@ -88,6 +101,57 @@ class UnifiedPaymentManager:
             proxy_url=config.monero.proxy_url,
         )
         self.register_provider("crypto_xmr", monero)
+
+    def _register_lemonsqueezy_from_db(self) -> None:
+        """Auto-register LemonSqueezy providers from previously provisioned API keys.
+
+        Checks brand_api_keys table for active LemonSqueezy credentials
+        and registers a provider for each brand that has them.
+        """
+        try:
+            rows = self.db.execute(
+                "SELECT DISTINCT brand FROM brand_api_keys "
+                "WHERE provider = 'lemonsqueezy' AND status = 'active'"
+            )
+        except Exception:
+            # Table may not exist yet (APIProvisioner not initialized)
+            return
+
+        for row in rows:
+            brand = row["brand"]
+            try:
+                keys = self.db.execute(
+                    "SELECT key_type, key_value FROM brand_api_keys "
+                    "WHERE brand = ? AND provider = 'lemonsqueezy' AND status = 'active'",
+                    (brand,),
+                )
+                key_map = {k["key_type"]: k["key_value"] for k in keys}
+
+                api_key = key_map.get("access_token", "")
+                store_id = key_map.get("store_id", "")
+                webhook_secret = key_map.get("webhook_secret", "")
+
+                if not api_key or not store_id:
+                    continue
+
+                # Decrypt keys if encrypted
+                try:
+                    from monai.utils.crypto import decrypt_value
+                    api_key = decrypt_value(api_key)
+                    if webhook_secret:
+                        webhook_secret = decrypt_value(webhook_secret)
+                except Exception:
+                    pass  # Keys may not be encrypted
+
+                provider = LemonSqueezyProvider(
+                    api_key=api_key,
+                    store_id=store_id,
+                    webhook_secret=webhook_secret,
+                )
+                self.register_brand_provider(brand, "lemonsqueezy", provider)
+                logger.info(f"Auto-registered LemonSqueezy for brand: {brand}")
+            except Exception as e:
+                logger.warning(f"Failed to register LemonSqueezy for {brand}: {e}")
 
     def register_provider(self, name: str, provider: PaymentProvider) -> None:
         """Register a payment provider globally."""
@@ -166,6 +230,21 @@ class UnifiedPaymentManager:
                           amount: float | None = None) -> dict[str, Any]:
         """Manually trigger a sweep for a specific brand."""
         result = await self.sweep_engine.sweep_brand(brand, amount)
+
+        # Record sweep in GL
+        if result.success and result.amount_crypto > 0 and self.ledger:
+            try:
+                self.ledger.record_sweep(
+                    amount=result.amount_crypto,
+                    from_account="1050",  # Cash - Monero
+                    description=f"Sweep to creator: {brand} ({result.tx_hash or 'n/a'})",
+                    reference=result.tx_hash or "",
+                    source="sweep_engine",
+                    brand=brand,
+                )
+            except Exception as e:
+                logger.error(f"Failed to record GL sweep for {brand}: {e}")
+
         return {
             "success": result.success,
             "tx_hash": result.tx_hash,
@@ -194,22 +273,51 @@ class UnifiedPaymentManager:
     # ── Webhook Event Processing ────────────────────────────────
 
     async def _handle_webhook_event(self, event: WebhookEvent) -> None:
-        """Process a parsed webhook event — record payment in DB."""
-        # Log the event
-        self.db.execute_insert(
-            "INSERT INTO webhook_events "
-            "(provider, event_type, payment_ref, amount, currency, brand, raw_payload) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                event.provider,
-                event.event_type.value,
-                event.payment_ref,
-                event.amount,
-                event.currency,
-                event.metadata.get("brand", ""),
-                json.dumps(event.raw) if event.raw else None,
-            ),
-        )
+        """Process a parsed webhook event — record payment in DB.
+
+        Uses ATOMIC idempotency check: the INSERT into processed_webhooks
+        and webhook_events happens in a single transaction to prevent
+        race conditions from concurrent webhook deliveries.
+        """
+        event_id = f"{event.payment_ref}:{event.event_type.value}"
+        if not event_id or not event.payment_ref:
+            logger.warning("Webhook missing payment_ref — ignoring")
+            return
+
+        # Validate webhook amount (reject obviously wrong values)
+        if event.amount < 0:
+            logger.error(f"Webhook with negative amount rejected: {event.amount}")
+            return
+        if event.amount > 1_000_000:  # €1M safety cap per single webhook
+            logger.error(f"Webhook with suspicious amount rejected: {event.amount}")
+            return
+
+        # ATOMIC: idempotency check + event log in single transaction
+        with self.db.transaction() as conn:
+            try:
+                conn.execute(
+                    "INSERT INTO processed_webhooks (provider, event_id) VALUES (?, ?)",
+                    (event.provider, event_id),
+                )
+            except Exception:
+                # UNIQUE constraint violated — duplicate webhook
+                logger.info(f"Duplicate webhook ignored: {event.provider}/{event_id}")
+                return
+
+            conn.execute(
+                "INSERT INTO webhook_events "
+                "(provider, event_type, payment_ref, amount, currency, brand, raw_payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.provider,
+                    event.event_type.value,
+                    event.payment_ref,
+                    event.amount,
+                    event.currency,
+                    event.metadata.get("brand", ""),
+                    json.dumps(event.raw) if event.raw else None,
+                ),
+            )
 
         # Route to appropriate handler based on event type
         if event.event_type == WebhookEventType.PAYMENT_COMPLETED:
@@ -246,41 +354,177 @@ class UnifiedPaymentManager:
             except (ValueError, TypeError):
                 lead_id = None
 
-        self.brand_payments.record_payment(
-            brand=brand,
-            account_id=account_id,
-            amount=event.amount,
-            product=event.product,
-            customer_email=event.customer_email,
-            payment_ref=event.payment_ref,
-            lead_id=lead_id,
-            currency=event.currency,
-        )
+        # Record payment + fee atomically in a single transaction
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO brand_payments_received "
+                "(brand, account_id, lead_id, amount, currency, product, "
+                "customer_email, payment_ref) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (brand, account_id, lead_id, event.amount, event.currency,
+                 event.product, event.customer_email, event.payment_ref),
+            )
+            pay_id = cursor.lastrowid
+
+            # Auto-record platform fees in same transaction
+            rates = self.brand_payments.PLATFORM_FEE_RATES.get(event.provider)
+            if rates:
+                from decimal import Decimal
+                gross = Decimal(str(event.amount))
+                fee_amount = float(
+                    gross * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"]))
+                )
+                fee_currency = event.currency  # Fee in same currency as payment
+            else:
+                fee_amount = 0.0
+                fee_currency = event.currency
+
+            conn.execute(
+                "INSERT INTO platform_fees "
+                "(brand, provider, payment_id, gross_amount, fee_amount, fee_currency) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (brand, event.provider, pay_id, event.amount, fee_amount, fee_currency),
+            )
 
         logger.info(
             f"Payment recorded: {brand} received {event.amount} {event.currency} "
-            f"via {event.provider} for '{event.product}'"
+            f"via {event.provider} for '{event.product}' (fee: {fee_amount:.2f} {fee_currency})"
         )
+
+        # Record in double-entry ledger
+        self._record_payment_gl(brand, event, fee_amount)
+
+    def _record_payment_gl(self, brand: str, event: WebhookEvent,
+                           fee_amount: float) -> None:
+        """Record a payment in the general ledger (double-entry)."""
+        if not self.ledger:
+            return
+        # Round to 2 decimal places to avoid floating-point balance mismatches
+        fee_amount = round(fee_amount, 2)
+        try:
+            # Map provider to cash account
+            cash_accounts = {
+                "stripe": "1010",
+                "gumroad": "1020",
+                "lemonsqueezy": "1030",
+                "btcpay": "1040",
+                "crypto_xmr": "1050",
+            }
+            cash_acct = cash_accounts.get(event.provider, "1000")
+
+            # Determine revenue account based on product type
+            revenue_acct = "4900"  # Default: other revenue
+            product = (event.product or "").lower()
+            if any(w in product for w in ("service", "freelance", "consult")):
+                revenue_acct = "4000"
+            elif any(w in product for w in ("ebook", "template", "digital", "download")):
+                revenue_acct = "4100"
+            elif any(w in product for w in ("subscription", "saas", "plan")):
+                revenue_acct = "4200"
+            elif any(w in product for w in ("affiliate", "referral")):
+                revenue_acct = "4300"
+
+            if fee_amount > 0:
+                self.ledger.record_platform_fee(
+                    gross=event.amount,
+                    fee=fee_amount,
+                    revenue_account=revenue_acct,
+                    cash_account=cash_acct,
+                    description=f"Payment via {event.provider}: {event.product or 'sale'}",
+                    currency=event.currency,
+                    reference=event.payment_ref,
+                    source="webhook",
+                    brand=brand,
+                )
+            else:
+                self.ledger.record_revenue(
+                    amount=event.amount,
+                    revenue_account=revenue_acct,
+                    cash_account=cash_acct,
+                    description=f"Payment via {event.provider}: {event.product or 'sale'}",
+                    currency=event.currency,
+                    reference=event.payment_ref,
+                    source="webhook",
+                    brand=brand,
+                )
+        except Exception as e:
+            logger.error(f"Failed to record GL entry for payment {event.payment_ref}: {e}")
 
     async def _handle_payment_refunded(self, event: WebhookEvent) -> None:
-        """Handle a refund."""
-        # Find the payment by ref and refund it
+        """Handle a refund — mark payment and check if sweep already occurred."""
         payments = self.db.execute(
-            "SELECT id FROM brand_payments_received WHERE payment_ref = ? LIMIT 1",
+            "SELECT id, brand, amount, currency FROM brand_payments_received "
+            "WHERE payment_ref = ? LIMIT 1",
             (event.payment_ref,),
         )
-        if payments:
-            self.brand_payments.refund_payment(payments[0]["id"])
-            logger.info(f"Payment refunded: {event.payment_ref}")
+        if not payments:
+            logger.warning(f"Refund for unknown payment: {event.payment_ref}")
+            return
+
+        payment = dict(payments[0])
+        self.brand_payments.refund_payment(payment["id"])
+
+        # Check if this brand's funds were already swept to creator
+        swept = self.db.execute(
+            "SELECT id, status, tx_reference FROM brand_profit_sweeps "
+            "WHERE brand = ? AND status = 'completed' "
+            "ORDER BY completed_at DESC LIMIT 1",
+            (payment["brand"],),
+        )
+        if swept:
+            logger.critical(
+                f"REFUND AFTER SWEEP: Payment {event.payment_ref} for "
+                f"{payment['amount']} {payment['currency']} was already swept. "
+                f"Brand {payment['brand']} has NEGATIVE sweepable balance. "
+                f"Manual intervention required."
+            )
+
+        # Record refund in GL (reverse the original entry)
+        if self.ledger and payment:
+            try:
+                cash_accounts = {
+                    "stripe": "1010", "gumroad": "1020",
+                    "lemonsqueezy": "1030", "btcpay": "1040", "crypto_xmr": "1050",
+                }
+                cash_acct = cash_accounts.get(event.provider, "1000")
+                self.ledger.record_entry(
+                    date=__import__("datetime").datetime.now().strftime("%Y-%m-%d"),
+                    description=f"Refund: {event.payment_ref}",
+                    lines=[
+                        {"account_code": "4900", "debit": payment["amount"],
+                         "currency": payment["currency"], "memo": "Refund reversal"},
+                        {"account_code": cash_acct, "credit": payment["amount"],
+                         "currency": payment["currency"]},
+                    ],
+                    reference=event.payment_ref,
+                    source="webhook_refund",
+                    brand=payment["brand"],
+                )
+            except Exception as e:
+                logger.error(f"Failed to record GL refund for {event.payment_ref}: {e}")
+
+        logger.info(f"Payment refunded: {event.payment_ref}")
 
     async def _handle_payment_disputed(self, event: WebhookEvent) -> None:
-        """Handle a dispute."""
-        self.db.execute(
-            "UPDATE brand_payments_received SET status = 'disputed' "
-            "WHERE payment_ref = ?",
+        """Handle a dispute — mark and alert."""
+        payments = self.db.execute(
+            "SELECT id, brand, amount, currency FROM brand_payments_received "
+            "WHERE payment_ref = ? LIMIT 1",
             (event.payment_ref,),
         )
-        logger.warning(f"Payment disputed: {event.payment_ref}")
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE brand_payments_received SET status = 'disputed' "
+                "WHERE payment_ref = ?",
+                (event.payment_ref,),
+            )
+
+        brand = dict(payments[0])["brand"] if payments else "unknown"
+        amount = dict(payments[0])["amount"] if payments else 0
+        logger.critical(
+            f"PAYMENT DISPUTED: {event.payment_ref} — {amount} from brand {brand}. "
+            f"Action required: respond to dispute within deadline."
+        )
 
     # ── Health & Status ─────────────────────────────────────────
 

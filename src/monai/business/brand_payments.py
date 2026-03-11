@@ -72,6 +72,27 @@ CREATE TABLE IF NOT EXISTS brand_profit_sweeps (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP
 );
+
+-- Platform fees tracking (Stripe 2.9%+€0.30, Gumroad 10%, etc.)
+CREATE TABLE IF NOT EXISTS platform_fees (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    brand TEXT NOT NULL,
+    provider TEXT NOT NULL,            -- stripe, gumroad, btcpay, etc.
+    payment_id INTEGER REFERENCES brand_payments_received(id),
+    gross_amount REAL NOT NULL,
+    fee_amount REAL NOT NULL,
+    fee_currency TEXT DEFAULT 'EUR',
+    fee_type TEXT DEFAULT 'transaction', -- transaction, payout, subscription
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Performance indexes for brand payments
+CREATE INDEX IF NOT EXISTS idx_bpr_brand ON brand_payments_received(brand);
+CREATE INDEX IF NOT EXISTS idx_bpr_status ON brand_payments_received(brand, status);
+CREATE INDEX IF NOT EXISTS idx_bpr_payment_ref ON brand_payments_received(payment_ref);
+CREATE INDEX IF NOT EXISTS idx_bps_brand ON brand_profit_sweeps(brand, status);
+CREATE INDEX IF NOT EXISTS idx_bpa_brand ON brand_payment_accounts(brand, account_type, status);
+CREATE INDEX IF NOT EXISTS idx_bpf_brand ON platform_fees(brand, provider);
 """;
 
 # Collection methods available to brands
@@ -400,6 +421,58 @@ class BrandPayments:
             params = (brand,)
         rows = self.db.execute(query, params)
         return rows[0]["total"] if rows else 0.0
+
+    # ── Platform Fee Tracking ─────────────────────────────────
+
+    # Standard platform fee rates — fee always in SAME currency as payment
+    PLATFORM_FEE_RATES = {
+        "stripe": {"rate": 0.029, "fixed": 0.30},
+        "gumroad": {"rate": 0.10, "fixed": 0.0},
+        "lemonsqueezy": {"rate": 0.05, "fixed": 0.50},
+        "paypal": {"rate": 0.029, "fixed": 0.30},
+    }
+
+    def record_platform_fee(self, brand: str, provider: str,
+                            payment_id: int, gross_amount: float,
+                            fee_amount: float | None = None,
+                            fee_currency: str = "EUR") -> int:
+        """Record a platform fee for a payment.
+
+        If fee_amount is not provided, calculates from standard rates.
+        Fee currency always matches the payment currency (fee_currency param).
+        """
+        if fee_amount is None:
+            rates = self.PLATFORM_FEE_RATES.get(provider)
+            if rates:
+                from decimal import Decimal
+                gross = Decimal(str(gross_amount))
+                fee_amount = float(gross * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"])))
+                # fee_currency stays as passed in — matches the payment currency
+            else:
+                fee_amount = 0.0
+
+        return self.db.execute_insert(
+            "INSERT INTO platform_fees "
+            "(brand, provider, payment_id, gross_amount, fee_amount, fee_currency) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (brand, provider, payment_id, gross_amount, fee_amount, fee_currency),
+        )
+
+    def get_total_fees(self, brand: str | None = None) -> float:
+        """Get total platform fees paid."""
+        query = "SELECT COALESCE(SUM(fee_amount), 0) as total FROM platform_fees"
+        params: tuple = ()
+        if brand:
+            query += " WHERE brand = ?"
+            params = (brand,)
+        rows = self.db.execute(query, params)
+        return rows[0]["total"] if rows else 0.0
+
+    def get_net_revenue(self, brand: str) -> float:
+        """Get net revenue (gross - fees) for a brand."""
+        gross = self.get_brand_revenue(brand).get("total_revenue", 0)
+        fees = self.get_total_fees(brand)
+        return max(0.0, gross - fees)
 
     def get_collection_methods(self) -> list[dict[str, str]]:
         """Available collection methods for brands."""
