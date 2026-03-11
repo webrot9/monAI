@@ -9,6 +9,8 @@ Webhooks: Gumroad sends POST to our webhook URL on each sale.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 from typing import Any
@@ -35,17 +37,22 @@ class GumroadProvider(PaymentProvider):
 
     provider_name = "gumroad"
 
-    def __init__(self, access_token: str, proxy_url: str = ""):
+    def __init__(self, access_token: str, webhook_secret: str = "",
+                 proxy_url: str = ""):
         self.access_token = access_token
+        self.webhook_secret = webhook_secret
         self.proxy_url = proxy_url
+        self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
-        from monai.payments.base import _resolve_proxy_url
-        kwargs: dict[str, Any] = {"timeout": 30.0}
-        proxy = _resolve_proxy_url(self.proxy_url)
-        if proxy:
-            kwargs["proxy"] = proxy
-        return httpx.AsyncClient(**kwargs)
+        if self._client is None or self._client.is_closed:
+            from monai.payments.base import _resolve_proxy_url
+            kwargs: dict[str, Any] = {"timeout": 30.0}
+            proxy = _resolve_proxy_url(self.proxy_url)
+            if proxy:
+                kwargs["proxy"] = proxy
+            self._client = httpx.AsyncClient(**kwargs)
+        return self._client
 
     async def _api_call(self, method: str, endpoint: str,
                         data: dict | None = None) -> dict:
@@ -54,16 +61,16 @@ class GumroadProvider(PaymentProvider):
         if data:
             params.update(data)
 
-        async with self._get_client() as client:
-            if method == "GET":
-                resp = await client.get(url, params=params)
-            else:
-                resp = await client.post(url, data=params)
+        client = self._get_client()
+        if method == "GET":
+            resp = await client.get(url, params=params)
+        else:
+            resp = await client.post(url, data=params)
 
-            result = resp.json()
-            if not result.get("success", False):
-                raise GumroadAPIError(result.get("message", f"HTTP {resp.status_code}"))
-            return result
+        result = resp.json()
+        if not result.get("success", False):
+            raise GumroadAPIError(result.get("message", f"HTTP {resp.status_code}"))
+        return result
 
     async def create_payment(self, intent: PaymentIntent) -> PaymentResult:
         """Create a Gumroad product (products are the "payment link" on Gumroad).
@@ -72,7 +79,7 @@ class GumroadProvider(PaymentProvider):
         """
         data = {
             "name": intent.product or "Digital Product",
-            "price": int(intent.amount * 100),  # cents
+            "price": intent.amount_cents,
         }
         if intent.metadata.get("description"):
             data["description"] = intent.metadata["description"]
@@ -139,12 +146,31 @@ class GumroadProvider(PaymentProvider):
         except GumroadAPIError:
             return ProviderBalance(provider=self.provider_name)
 
+    def _verify_signature(self, payload: bytes, sig_header: str) -> bool:
+        """Verify Gumroad webhook HMAC-SHA256 signature."""
+        if not sig_header or not self.webhook_secret:
+            return False
+        expected = hmac.new(
+            self.webhook_secret.encode(),
+            payload,
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, sig_header)
+
     async def handle_webhook(self, payload: bytes,
                              headers: dict[str, str]) -> WebhookEvent | None:
-        """Parse Gumroad webhook (ping).
+        """Parse and verify Gumroad webhook (ping).
 
         Gumroad sends form-encoded POST data on each sale.
+        Verifies HMAC-SHA256 signature if webhook_secret is configured.
         """
+        # Verify signature if configured
+        if self.webhook_secret:
+            sig = headers.get("x-gumroad-signature", "")
+            if not self._verify_signature(payload, sig):
+                logger.warning("Invalid Gumroad webhook signature")
+                return None
+
         try:
             # Gumroad sends form-encoded data
             from urllib.parse import parse_qs

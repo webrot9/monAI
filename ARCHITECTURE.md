@@ -187,6 +187,9 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `memory.py` | Shared knowledge base |
 | `collaboration.py` | Agent-to-agent help system |
 | `spawner.py` | Sub-agent creation |
+| `base.py` | Base agent class with lazy-loaded mixins (coder, executor, identity, provisioner) |
+| `captcha_solver.py` | Autonomous CAPTCHA solving for account registration |
+| `email_verifier.py` | Email verification and temporary email management |
 | `eng_team/` | Engineering team (tech lead + engineers) |
 | `research_team/` | Research team (market, trends, competitors) |
 | `marketing_team/` | Marketing team (content, growth, outreach) |
@@ -204,7 +207,7 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `projections.py` | Financial forecasting |
 | `strategy_lifecycle.py` | Strategy state machine (pending→active→paused→stopped) |
 | `invoicing.py` | Creator contractor invoices |
-| `payments.py` | Payment coordination (legacy) |
+| ~~`payments.py`~~ | **REMOVED** — superseded by `payments/manager.py` + `business/brand_payments.py` |
 | `brand_payments.py` | Per-brand payment accounts |
 | `comms.py` | Email engine (SMTP/IMAP) |
 | `email_marketing.py` | Email campaigns & subscriber lists |
@@ -240,6 +243,11 @@ All strategies use real browser automation and APIs — zero simulation:
 | `domain_flipping` | Browses real expired domain sites, checks real metrics, lists on Sedo/Dan.com |
 | `print_on_demand` | Researches real POD trends, generates designs, lists on Redbubble/TeeSpring |
 | `telegram_bots` | Researches real bot market, builds bots, deploys via BotFather |
+
+### Workflows (`src/monai/workflows/`)
+| Module | Purpose |
+|--------|---------|
+| `workflows/` | Task orchestration, pipeline definitions, and workflow engine |
 
 ### Integrations (`src/monai/integrations/`)
 | Module | Purpose |
@@ -281,7 +289,7 @@ All strategies use real browser automation and APIs — zero simulation:
 
 ## Test Suite
 
-- **928 tests** across 52 test files
+- **1088 tests** across 54 test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
@@ -312,6 +320,18 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 - **Strategy state machine**: Formal lifecycle (pending→active→paused→stopped) prevents invalid transitions
 - **Zero simulation**: All strategies use real browser/API actions, never LLM hallucination for market data
 - **Only OpenAI key provided**: Agents self-provision all other credentials via browser automation
+
+## Recent Changes
+
+- **Webhook idempotency**: `processed_webhooks` table prevents double-processing
+- **Decimal support**: Financial precision via `_to_decimal` and `amount_decimal` properties
+- **Gumroad webhook verification**: HMAC-SHA256 signature verification
+- **Platform fee tracking**: `platform_fees` table, auto-recorded on payment
+- **Database performance indexes**: Added on frequently-queried columns
+- **HTTP client pooling**: Connection pooling for all payment providers
+- **Executor timeout enforcement**: Configurable per-task, default 1h
+- **DB transaction helper**: `db.transaction()` context manager for atomic operations
+- **Expanded sensitive data filtering**: Regex-based filtering in agent identity
 
 ### Creator Preferences (Italian)
 - Currency: USD (with EUR conversion when needed)

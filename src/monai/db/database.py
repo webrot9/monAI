@@ -101,6 +101,15 @@ CREATE TABLE IF NOT EXISTS agent_log (
     result TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Performance indexes
+CREATE INDEX IF NOT EXISTS idx_agent_log_agent_name ON agent_log(agent_name);
+CREATE INDEX IF NOT EXISTS idx_strategies_status ON strategies(status);
+CREATE INDEX IF NOT EXISTS idx_contacts_platform ON contacts(platform, platform_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_strategy ON transactions(strategy_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type, category);
+CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);
+CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id, created_at);
 """
 
 
@@ -142,3 +151,27 @@ class Database:
     def execute_many(self, query: str, params_list: list[tuple]) -> None:
         with self.connect() as conn:
             conn.executemany(query, params_list)
+
+    @contextmanager
+    def transaction(self):
+        """Explicit transaction context for atomic multi-statement operations.
+
+        Usage:
+            with db.transaction() as conn:
+                conn.execute("INSERT INTO ...", (...))
+                conn.execute("UPDATE ...", (...))
+                # Both succeed or both roll back
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()

@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -56,11 +57,13 @@ class AutonomousExecutor:
     """Executes complex multi-step tasks autonomously using an LLM-driven action loop."""
 
     def __init__(self, config: Config, db: Database, llm: LLM,
-                 max_steps: int = 50, headless: bool = True):
+                 max_steps: int = 50, headless: bool = True,
+                 timeout_seconds: int = 3600):
         self.config = config
         self.db = db
         self.llm = llm
         self.max_steps = max_steps
+        self.timeout_seconds = timeout_seconds
         self.browser = Browser(config, headless=headless)
         self._anonymizer = get_anonymizer(config)
         # HTTP client routed through proxy — no direct connections
@@ -79,11 +82,22 @@ class AutonomousExecutor:
         """
         logger.info(f"Starting autonomous task: {task[:100]}")
         self.action_history = []
+        start_time = time.time()
 
         try:
             await self.browser.start()
 
             for step in range(self.max_steps):
+                # Enforce time limit
+                elapsed = time.time() - start_time
+                if elapsed > self.timeout_seconds:
+                    self._log_task(task, "timeout", f"Exceeded {self.timeout_seconds}s")
+                    return {
+                        "status": "timeout",
+                        "steps": step,
+                        "elapsed_seconds": int(elapsed),
+                        "history": self.action_history,
+                    }
                 # THINK: Decide next action
                 action = self._think(task, context, step)
 

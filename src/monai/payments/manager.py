@@ -76,6 +76,14 @@ class UnifiedPaymentManager:
                     error TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS processed_webhooks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(provider, event_id)
+                );
             """)
 
     def _register_monero(self, config: Config) -> None:
@@ -193,23 +201,48 @@ class UnifiedPaymentManager:
 
     # ── Webhook Event Processing ────────────────────────────────
 
+    def _is_duplicate_webhook(self, provider: str, event_id: str) -> bool:
+        """Check if this webhook event was already processed (idempotency)."""
+        if not event_id:
+            return False
+        try:
+            self.db.execute_insert(
+                "INSERT INTO processed_webhooks (provider, event_id) VALUES (?, ?)",
+                (provider, event_id),
+            )
+            return False  # Successfully inserted — first time seeing this event
+        except Exception:
+            return True  # UNIQUE constraint violated — duplicate
+
     async def _handle_webhook_event(self, event: WebhookEvent) -> None:
-        """Process a parsed webhook event — record payment in DB."""
-        # Log the event
-        self.db.execute_insert(
-            "INSERT INTO webhook_events "
-            "(provider, event_type, payment_ref, amount, currency, brand, raw_payload) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                event.provider,
-                event.event_type.value,
-                event.payment_ref,
-                event.amount,
-                event.currency,
-                event.metadata.get("brand", ""),
-                json.dumps(event.raw) if event.raw else None,
-            ),
-        )
+        """Process a parsed webhook event — record payment in DB.
+
+        Uses idempotency check to prevent double-processing of webhooks.
+        """
+        # Idempotency: derive a unique event ID from provider + payment_ref + event_type
+        event_id = f"{event.payment_ref}:{event.event_type.value}"
+        if self._is_duplicate_webhook(event.provider, event_id):
+            logger.info(
+                f"Duplicate webhook ignored: {event.provider}/{event_id}"
+            )
+            return
+
+        # Log the event atomically with processing
+        with self.db.connect() as conn:
+            conn.execute(
+                "INSERT INTO webhook_events "
+                "(provider, event_type, payment_ref, amount, currency, brand, raw_payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.provider,
+                    event.event_type.value,
+                    event.payment_ref,
+                    event.amount,
+                    event.currency,
+                    event.metadata.get("brand", ""),
+                    json.dumps(event.raw) if event.raw else None,
+                ),
+            )
 
         # Route to appropriate handler based on event type
         if event.event_type == WebhookEventType.PAYMENT_COMPLETED:
@@ -246,7 +279,7 @@ class UnifiedPaymentManager:
             except (ValueError, TypeError):
                 lead_id = None
 
-        self.brand_payments.record_payment(
+        pay_id = self.brand_payments.record_payment(
             brand=brand,
             account_id=account_id,
             amount=event.amount,
@@ -255,6 +288,15 @@ class UnifiedPaymentManager:
             payment_ref=event.payment_ref,
             lead_id=lead_id,
             currency=event.currency,
+        )
+
+        # Auto-record platform fees
+        self.brand_payments.record_platform_fee(
+            brand=brand,
+            provider=event.provider,
+            payment_id=pay_id,
+            gross_amount=event.amount,
+            fee_currency=event.currency,
         )
 
         logger.info(

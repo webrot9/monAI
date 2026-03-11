@@ -148,6 +148,7 @@ class TestWebhookEventProcessing:
             {"id": 1, "provider": "stripe"},
         ])
         manager.brand_payments.record_payment = MagicMock(return_value=42)
+        manager.brand_payments.record_platform_fee = MagicMock(return_value=1)
 
         event = WebhookEvent(
             event_type=WebhookEventType.PAYMENT_COMPLETED,
@@ -168,6 +169,37 @@ class TestWebhookEventProcessing:
         assert call_kwargs[1]["brand"] == "micro_saas"
         assert call_kwargs[1]["amount"] == 99.99
         assert call_kwargs[1]["lead_id"] == 7
+
+        # Verify platform fee was recorded
+        manager.brand_payments.record_platform_fee.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_webhook_ignored(self, manager, mock_db):
+        """Webhook idempotency: same event processed twice should only record once."""
+        manager.brand_payments.get_collection_accounts = MagicMock(return_value=[
+            {"id": 1, "provider": "stripe"},
+        ])
+        manager.brand_payments.record_payment = MagicMock(return_value=42)
+        manager.brand_payments.record_platform_fee = MagicMock(return_value=1)
+
+        event = WebhookEvent(
+            event_type=WebhookEventType.PAYMENT_COMPLETED,
+            provider="stripe",
+            payment_ref="cs_dedup_test",
+            amount=50.0,
+            metadata={"brand": "test_brand"},
+        )
+
+        # First call succeeds
+        await manager._handle_webhook_event(event)
+        assert manager.brand_payments.record_payment.call_count == 1
+
+        # Second call with same event — should be ignored due to idempotency
+        # The _is_duplicate_webhook will raise on UNIQUE constraint
+        mock_db.execute_insert.side_effect = Exception("UNIQUE constraint failed")
+        await manager._handle_webhook_event(event)
+        # record_payment should NOT be called a second time
+        assert manager.brand_payments.record_payment.call_count == 1
 
     @pytest.mark.asyncio
     async def test_payment_refunded_event(self, manager, mock_db):

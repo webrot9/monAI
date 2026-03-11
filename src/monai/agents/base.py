@@ -114,9 +114,16 @@ class BaseAgent(ABC):
 
         # Include identity info but NEVER include credentials/passwords/tokens
         identity = self.identity.get_identity()
+        import re
+        _SENSITIVE_PATTERN = re.compile(
+            r'(password|secret|token|api_key|api_secret|private_key|'
+            r'auth_token|bearer|refresh_token|access_token|credentials|'
+            r'webhook_secret|rpc_password|bot_token|pin|card_)',
+            re.IGNORECASE,
+        )
         safe_identity = {
             k: v for k, v in identity.items()
-            if k not in ("credentials", "password", "token", "api_key", "secret")
+            if not _SENSITIVE_PATTERN.search(k)
         }
         identity_info = json.dumps(safe_identity, default=str)
         full_context = f"Agent: {self.name}\nIdentity: {identity_info}"

@@ -58,17 +58,20 @@ class MoneroProvider(CryptoProvider):
         self.min_confirmations = min_confirmations
         self.proxy_url = proxy_url
         self._request_id = 0
+        self._client: httpx.AsyncClient | None = None
 
     def _get_client(self) -> httpx.AsyncClient:
-        """Create httpx client with optional proxy for Tor routing."""
-        kwargs: dict[str, Any] = {"timeout": 30.0}
-        from monai.payments.base import _resolve_proxy_url
-        proxy = _resolve_proxy_url(self.proxy_url)
-        if proxy:
-            kwargs["proxy"] = proxy
-        if self.rpc_user and self.rpc_password:
-            kwargs["auth"] = (self.rpc_user, self.rpc_password)
-        return httpx.AsyncClient(**kwargs)
+        """Get or create httpx client with optional proxy for Tor routing."""
+        if self._client is None or self._client.is_closed:
+            kwargs: dict[str, Any] = {"timeout": 30.0}
+            from monai.payments.base import _resolve_proxy_url
+            proxy = _resolve_proxy_url(self.proxy_url)
+            if proxy:
+                kwargs["proxy"] = proxy
+            if self.rpc_user and self.rpc_password:
+                kwargs["auth"] = (self.rpc_user, self.rpc_password)
+            self._client = httpx.AsyncClient(**kwargs)
+        return self._client
 
     async def _rpc_call(self, method: str, params: dict | None = None) -> dict:
         """Make a JSON-RPC 2.0 call to monero-wallet-rpc."""
@@ -81,13 +84,13 @@ class MoneroProvider(CryptoProvider):
         if params:
             payload["params"] = params
 
-        async with self._get_client() as client:
-            resp = await client.post(
-                f"{self.wallet_rpc_url}/json_rpc",
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        client = self._get_client()
+        resp = await client.post(
+            f"{self.wallet_rpc_url}/json_rpc",
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
         if "error" in data:
             err = data["error"]
