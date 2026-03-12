@@ -228,6 +228,83 @@ class ProductReviewer(BaseAgent):
         )
         return result
 
+    def revise_product(
+        self,
+        product_data: dict[str, Any],
+        review: dict[str, Any] | ReviewResult,
+        product_type: str = "digital_product",
+    ) -> dict[str, str]:
+        """Revise product content based on review feedback.
+
+        Takes the original product data and the review result, then rewrites
+        the content to fix all issues and incorporate suggestions.
+
+        Returns:
+            Dict of revised content keyed by section/field name.
+        """
+        if isinstance(review, ReviewResult):
+            review = review.to_dict()
+
+        content_text = self._extract_content(product_data, product_type)
+        issues = review.get("issues", [])
+        suggestions = review.get("suggestions", [])
+
+        if not issues and not suggestions:
+            return {}
+
+        feedback = "ISSUES TO FIX:\n"
+        for i, issue in enumerate(issues, 1):
+            feedback += f"  {i}. {issue}\n"
+        if suggestions:
+            feedback += "\nSUGGESTIONS TO INCORPORATE:\n"
+            for i, s in enumerate(suggestions, 1):
+                feedback += f"  {i}. {s}\n"
+
+        revised = self.think(
+            f"You are revising a {product_type} that failed quality review.\n\n"
+            f"ORIGINAL CONTENT:\n{content_text[:4000]}\n\n"
+            f"REVIEW FEEDBACK:\n{feedback}\n\n"
+            "Rewrite the content to address EVERY issue and incorporate all "
+            "suggestions. Maintain the same structure and topic but fix all "
+            "problems. The result must be premium quality — indistinguishable "
+            "from expert human work.\n\n"
+            "Return the revised content."
+        )
+
+        self.log_action("product_revised", f"Revised based on {len(issues)} issues, {len(suggestions)} suggestions")
+        return {"revised_content": revised}
+
+    @staticmethod
+    def format_feedback_for_prompt(review_data: dict[str, Any]) -> str:
+        """Format review feedback for injection into creation/design prompts.
+
+        Strategies call this when recreating a rejected product so the LLM
+        knows what went wrong and can avoid the same mistakes.
+        """
+        if not review_data:
+            return ""
+
+        issues = review_data.get("issues", [])
+        suggestions = review_data.get("suggestions", [])
+        score = review_data.get("quality_score", 0)
+
+        if not issues and not suggestions:
+            return ""
+
+        parts = [
+            f"\n\nIMPORTANT — PREVIOUS VERSION WAS REJECTED (score: {score:.2f}).",
+            "You MUST fix these problems in the new version:",
+        ]
+        for issue in issues:
+            parts.append(f"  - {issue}")
+        if suggestions:
+            parts.append("Also incorporate these improvements:")
+            for s in suggestions:
+                parts.append(f"  - {s}")
+        parts.append("Do NOT repeat the same mistakes.\n")
+
+        return "\n".join(parts)
+
     def _extract_content(self, product_data: dict, product_type: str) -> str:
         """Extract all textual content from a product for review."""
         parts = []

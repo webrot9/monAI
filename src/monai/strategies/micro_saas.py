@@ -180,6 +180,12 @@ class MicroSaaSAgent(BaseAgent):
                 continue
 
             research = data.get("research", {})
+            # Inject feedback from previous review rejection if available
+            review_feedback = ""
+            if data.get("review"):
+                from monai.agents.product_reviewer import ProductReviewer
+                review_feedback = ProductReviewer.format_feedback_for_prompt(data["review"])
+
             spec = self.think_json(
                 f"Design a micro-SaaS product based on this research:\n"
                 f"Name: {research.get('name', 'unknown')}\n"
@@ -193,7 +199,8 @@ class MicroSaaSAgent(BaseAgent):
                 "\"tech_stack\": {\"backend\": str, \"frontend\": str, \"database\": str}, "
                 "\"api_endpoints\": [{\"method\": str, \"path\": str, \"description\": str}], "
                 "\"pricing\": {\"free_tier\": str, \"paid_tier\": str, \"price\": float}, "
-                "\"deploy_target\": str}"
+                f"\"deploy_target\": str}}"
+                f"{review_feedback}"
             )
 
             data["design"] = spec
@@ -266,10 +273,13 @@ class MicroSaaSAgent(BaseAgent):
                 path.write_text(json.dumps(data, indent=2))
                 self.log_action("product_review_rejected", f"{name}: REJECTED — {'; '.join(result.issues[:3])}")
             else:
-                data["status"] = "reviewed"  # Proceed with notes
+                # needs_revision — actively revise content before proceeding
+                revised = self.reviewer.revise_product(data, result, "saas")
+                data["status"] = "reviewed"
                 data["review"] = result.to_dict()
+                data["revised_content"] = revised
                 path.write_text(json.dumps(data, indent=2))
-                self.log_action("product_reviewed", f"{name}: PASSED WITH NOTES (score={result.quality_score:.2f})")
+                self.log_action("product_revised", f"{name}: REVISED and proceeding (score={result.quality_score:.2f})")
 
             return result.to_dict()
 

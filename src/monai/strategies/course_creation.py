@@ -255,6 +255,23 @@ class CourseCreationAgent(BaseAgent):
         written = 0
         for lesson in lessons:
             l = dict(lesson)
+
+            # Check for review feedback from previous rejection
+            review_context = ""
+            prev_reviews = self.db.execute(
+                "SELECT issues, suggestions FROM product_reviews "
+                "WHERE strategy = ? AND product_name = ? ORDER BY id DESC LIMIT 1",
+                (self.name, l["course_title"]),
+            )
+            if prev_reviews:
+                from monai.agents.product_reviewer import ProductReviewer
+                review_data = {
+                    "issues": json.loads(prev_reviews[0].get("issues", "[]")),
+                    "suggestions": json.loads(prev_reviews[0].get("suggestions", "[]")),
+                    "quality_score": 0,
+                }
+                review_context = ProductReviewer.format_feedback_for_prompt(review_data)
+
             script = self.llm.chat(
                 [
                     {"role": "system", "content": (
@@ -269,7 +286,7 @@ class CourseCreationAgent(BaseAgent):
                         f"Lesson: {l['title']}\n"
                         f"Audience: {l.get('target_audience', 'beginners')}\n"
                         f"Duration: ~{l['duration_minutes']} minutes\n\n"
-                        "Write the full lesson script."
+                        f"Write the full lesson script.{review_context}"
                     )},
                 ],
                 model=self.config.llm.model,
@@ -330,12 +347,26 @@ class CourseCreationAgent(BaseAgent):
         )
 
         if result.verdict == "rejected":
+            # Reset lesson statuses so _write_lessons rewrites them with feedback
+            self.db.execute_insert(
+                "UPDATE course_lessons SET status = 'draft' WHERE course_id = ?",
+                (course["id"],),
+            )
             self.db.execute_insert(
                 "UPDATE courses SET status = 'scripting' WHERE id = ?",
                 (course["id"],),
             )
             self.log_action("course_review_rejected",
                             f"{course['title']}: {'; '.join(result.issues[:3])}")
+        elif result.verdict == "needs_revision":
+            # Actively revise content before proceeding
+            self.reviewer.revise_product(product_data, result, "course")
+            self.db.execute_insert(
+                "UPDATE courses SET status = 'reviewed' WHERE id = ?",
+                (course["id"],),
+            )
+            self.log_action("course_revised",
+                            f"{course['title']}: REVISED and proceeding (score={result.quality_score:.2f})")
         else:
             self.db.execute_insert(
                 "UPDATE courses SET status = 'reviewed' WHERE id = ?",

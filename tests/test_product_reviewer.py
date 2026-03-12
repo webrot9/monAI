@@ -360,6 +360,111 @@ class TestProductReviewer:
         assert result.verdict in ("approved", "needs_revision")
 
 
+class TestRevisionAndFeedback:
+    """Test that review feedback actually gets used."""
+
+    def test_revise_product_calls_llm(self, reviewer):
+        """revise_product should call LLM with issues and suggestions."""
+        product_data = {
+            "spec": {"title": "Bad Product", "description": "Needs work"},
+        }
+        review = {
+            "issues": ["Content reads like AI", "Missing examples"],
+            "suggestions": ["Add real case studies", "Use conversational tone"],
+            "quality_score": 0.4,
+        }
+
+        result = reviewer.revise_product(product_data, review, "digital_product")
+        assert "revised_content" in result
+        # LLM should have been called with the feedback
+        assert reviewer.llm.chat.called or reviewer.llm.quick.called
+
+    def test_revise_product_with_review_result_object(self, reviewer):
+        """revise_product should accept ReviewResult directly."""
+        product_data = {
+            "spec": {"title": "Test", "description": "Test product"},
+        }
+        review = ReviewResult(
+            issues=["Too generic"],
+            suggestions=["Add specifics"],
+            quality_score=0.5,
+        )
+
+        result = reviewer.revise_product(product_data, review, "digital_product")
+        assert "revised_content" in result
+
+    def test_revise_product_no_issues_returns_empty(self, reviewer):
+        """revise_product with no issues should return empty dict."""
+        product_data = {
+            "spec": {"title": "Good", "description": "Already good"},
+        }
+        review = {"issues": [], "suggestions": [], "quality_score": 0.9}
+
+        result = reviewer.revise_product(product_data, review, "digital_product")
+        assert result == {}
+
+    def test_format_feedback_for_prompt(self):
+        """format_feedback_for_prompt should produce injectable prompt text."""
+        review = {
+            "issues": ["False revenue claim", "AI-sounding language"],
+            "suggestions": ["Add real data sources"],
+            "quality_score": 0.35,
+        }
+
+        feedback = ProductReviewer.format_feedback_for_prompt(review)
+        assert "REJECTED" in feedback
+        assert "False revenue claim" in feedback
+        assert "AI-sounding language" in feedback
+        assert "Add real data sources" in feedback
+        assert "0.35" in feedback
+
+    def test_format_feedback_empty_review(self):
+        """format_feedback_for_prompt with no issues should return empty string."""
+        assert ProductReviewer.format_feedback_for_prompt({}) == ""
+        assert ProductReviewer.format_feedback_for_prompt({"issues": [], "suggestions": []}) == ""
+
+    def test_rejected_product_gets_feedback_in_recreation(self):
+        """When a product is rejected, creation step should see review feedback."""
+        from monai.strategies.digital_products import DigitalProductsAgent
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Config()
+            cfg.data_dir = Path(tmpdir)
+            fd, dbpath = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            db = Database(Path(dbpath))
+            llm = MagicMock()
+            llm.chat_json.return_value = {
+                "title": "Better Product", "type": "guide",
+                "description": "Improved", "target_audience": "devs",
+                "price": 19.99, "sections": ["Intro"],
+            }
+            llm.chat.return_value = "Great content here"
+
+            agent = DigitalProductsAgent(cfg, db, llm)
+            products_dir = Path(tmpdir) / "products"
+            products_dir.mkdir(parents=True, exist_ok=True)
+
+            # Simulate a rejected product with review feedback
+            (products_dir / "test.json").write_text(json.dumps({
+                "research": {"niche": "testing", "product_type": "guide",
+                             "estimated_price": 19.99, "reasoning": "good niche"},
+                "status": "researched",
+                "review": {
+                    "issues": ["Content was too generic", "No real examples"],
+                    "suggestions": ["Include case studies"],
+                    "quality_score": 0.3,
+                },
+            }))
+
+            agent._create_product()
+
+            # The LLM should have received the review feedback
+            call_args = str(llm.chat_json.call_args)
+            assert "REJECTED" in call_args or "generic" in call_args.lower()
+
+            os.unlink(dbpath)
+
+
 class TestStrategyPipelineIntegration:
     """Test that strategies correctly integrate the review step."""
 

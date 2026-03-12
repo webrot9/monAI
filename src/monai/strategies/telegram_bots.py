@@ -204,6 +204,12 @@ class TelegramBotAgent(BaseAgent):
                 continue
 
             research = data.get("research", {})
+            # Inject feedback from previous review rejection if available
+            review_feedback = ""
+            if data.get("review"):
+                from monai.agents.product_reviewer import ProductReviewer
+                review_feedback = ProductReviewer.format_feedback_for_prompt(data["review"])
+
             spec = self.think_json(
                 f"Design a Telegram bot based on this market research:\n"
                 f"Niche: {research.get('niche', 'unknown')}\n"
@@ -219,7 +225,8 @@ class TelegramBotAgent(BaseAgent):
                 "Return: {\"name\": str, \"tagline\": str, "
                 "\"commands\": [{\"command\": str, \"description\": str}], "
                 "\"features\": [str], \"data_stored\": [str], "
-                "\"monetization\": str, \"tech_requirements\": [str]}"
+                f"\"monetization\": str, \"tech_requirements\": [str]}}"
+                f"{review_feedback}"
             )
 
             data["design"] = spec
@@ -294,11 +301,13 @@ class TelegramBotAgent(BaseAgent):
                 path.write_text(json.dumps(data, indent=2))
                 self.log_action("bot_review_rejected", f"{name}: REJECTED — {'; '.join(result.issues[:3])}")
             else:
-                # needs_revision — keep as built, add review notes for next pass
+                # needs_revision — actively revise content before proceeding
+                revised = self.reviewer.revise_product(data, result, "bot")
                 data["review"] = result.to_dict()
-                data["status"] = "reviewed"  # Let it proceed but with notes
+                data["revised_content"] = revised
+                data["status"] = "reviewed"
                 path.write_text(json.dumps(data, indent=2))
-                self.log_action("bot_reviewed", f"{name}: PASSED WITH NOTES (score={result.quality_score:.2f})")
+                self.log_action("bot_revised", f"{name}: REVISED and proceeding (score={result.quality_score:.2f})")
 
             return result.to_dict()
 

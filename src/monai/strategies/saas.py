@@ -433,6 +433,22 @@ class SaaSAgent(BaseAgent):
         feature = dict(features[0])
         tech_stack = json.loads(product.get("tech_stack", "{}"))
 
+        # Check for review feedback from previous rejection
+        review_feedback = ""
+        prev_reviews = self.db.execute(
+            "SELECT issues, suggestions FROM product_reviews "
+            "WHERE strategy = ? AND product_name = ? ORDER BY id DESC LIMIT 1",
+            (self.name, product["name"]),
+        )
+        if prev_reviews:
+            from monai.agents.product_reviewer import ProductReviewer
+            review_data = {
+                "issues": json.loads(prev_reviews[0].get("issues", "[]")),
+                "suggestions": json.loads(prev_reviews[0].get("suggestions", "[]")),
+                "quality_score": 0,
+            }
+            review_feedback = ProductReviewer.format_feedback_for_prompt(review_data)
+
         spec = (
             f"Build feature for SaaS product: {product['name']}\n"
             f"Feature: {feature['feature_name']}\n"
@@ -443,6 +459,7 @@ class SaaSAgent(BaseAgent):
             f"- Input validation\n"
             f"- Error handling\n"
             f"- Unit tests\n"
+            f"{review_feedback}"
         )
 
         build_result = self.coder.generate_module(spec)
@@ -493,8 +510,18 @@ class SaaSAgent(BaseAgent):
                 "UPDATE saas_products SET status = 'building' WHERE id = ?",
                 (product["id"],),
             )
+            # Feedback is stored in product_reviews table by the reviewer
             self.log_action("product_review_rejected",
                             f"{product['name']}: {'; '.join(result.issues[:3])}")
+        elif result.verdict == "needs_revision":
+            # Actively revise content before proceeding
+            self.reviewer.revise_product(product_data, result, "saas")
+            self.db.execute_insert(
+                "UPDATE saas_products SET status = 'reviewed' WHERE id = ?",
+                (product["id"],),
+            )
+            self.log_action("product_revised",
+                            f"{product['name']}: REVISED and proceeding (score={result.quality_score:.2f})")
         else:
             self.db.execute_insert(
                 "UPDATE saas_products SET status = 'reviewed' WHERE id = ?",

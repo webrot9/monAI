@@ -191,11 +191,16 @@ class DigitalProductsAgent(BaseAgent):
         """Create a digital product from a researched niche."""
         # Find a researched niche to advance
         research_data = {}
+        review_feedback = ""
         product_path = None
         for path in self.products_dir.glob("*.json"):
             data = json.loads(path.read_text())
             if data.get("status") == "researched":
                 research_data = data.get("research", {})
+                # If this was previously rejected, grab the review feedback
+                if data.get("review"):
+                    from monai.agents.product_reviewer import ProductReviewer
+                    review_feedback = ProductReviewer.format_feedback_for_prompt(data["review"])
                 product_path = path
                 break
 
@@ -207,7 +212,8 @@ class DigitalProductsAgent(BaseAgent):
             f"Reasoning: {research_data.get('reasoning', '')}\n\n"
             "Create something I can generate with AI and sell immediately. "
             "Return: {\"title\": str, \"type\": str, \"description\": str, "
-            "\"target_audience\": str, \"price\": float, \"sections\": [str]}"
+            f"\"target_audience\": str, \"price\": float, \"sections\": [str]}}"
+            f"{review_feedback}"
         )
 
         title = product_spec.get("title", "Untitled Product")
@@ -275,22 +281,23 @@ class DigitalProductsAgent(BaseAgent):
             if result.verdict == "approved":
                 data["status"] = "reviewed"
                 data["review"] = result.to_dict()
-                # Apply humanized content if available
                 if result.improved_content.get("humanized"):
-                    # Replace content sections with humanized versions
                     data["humanized_listing"] = result.improved_content["humanized"]
                 path.write_text(json.dumps(data, indent=2))
                 self.log_action("product_reviewed", f"{name}: APPROVED (score={result.quality_score:.2f})")
             elif result.verdict == "rejected":
-                data["status"] = "researched"  # Send back to creation
+                data["status"] = "researched"  # Send back to creation with feedback
                 data["review"] = result.to_dict()
                 path.write_text(json.dumps(data, indent=2))
                 self.log_action("product_review_rejected", f"{name}: REJECTED — {'; '.join(result.issues[:3])}")
             else:
-                data["status"] = "reviewed"  # Proceed with notes
+                # needs_revision — actively revise content before proceeding
+                revised = self.reviewer.revise_product(data, result, "digital_product")
+                data["status"] = "reviewed"
                 data["review"] = result.to_dict()
+                data["revised_content"] = revised
                 path.write_text(json.dumps(data, indent=2))
-                self.log_action("product_reviewed", f"{name}: PASSED WITH NOTES (score={result.quality_score:.2f})")
+                self.log_action("product_revised", f"{name}: REVISED and proceeding (score={result.quality_score:.2f})")
 
             return result.to_dict()
 
