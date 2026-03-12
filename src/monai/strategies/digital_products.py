@@ -79,18 +79,35 @@ class DigitalProductsAgent(BaseAgent):
         self.log_action("gumroad_setup_failed", "Could not set up Gumroad API access")
         return False
 
+    def _get_product_statuses(self) -> dict[str, int]:
+        """Count products by status from JSON files."""
+        statuses: dict[str, int] = {}
+        for path in self.products_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                s = data.get("status", "unknown")
+                statuses[s] = statuses.get(s, 0) + 1
+            except (json.JSONDecodeError, OSError):
+                continue
+        return statuses
+
     def plan(self) -> list[str]:
-        """Plan product creation and listing cycle."""
-        existing = list(self.products_dir.glob("*.json"))
-        plan = self.think_json(
-            f"I have {len(existing)} digital products. Plan my next actions. "
-            "Return: {\"steps\": [str]}. "
-            "Possible: research_niches, create_product, list_product, check_sales, "
-            "optimize_listings, create_bundle.",
-        )
-        steps = plan.get("steps", ["research_niches"])
-        self.log_action("plan", f"Planned {len(steps)} steps")
-        return steps
+        """Deterministic product pipeline progression."""
+        statuses = self._get_product_statuses()
+
+        # Always advance the pipeline
+        if not statuses:
+            return ["research_niches"]
+        if statuses.get("researched", 0) > 0:
+            return ["create_product"]
+        if statuses.get("created", 0) > 0:
+            return ["list_product"]
+        if statuses.get("listed", 0) > 0:
+            return ["check_sales"]
+
+        # All products listed/sold — start new cycle
+        self.log_action("plan", "All products at final stage, researching new niches")
+        return ["research_niches"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting digital products cycle")
@@ -146,14 +163,45 @@ class DigitalProductsAgent(BaseAgent):
             "Return: {\"niches\": [{\"niche\": str, \"product_type\": str, "
             "\"estimated_price\": float, \"reasoning\": str}]}",
         )
-        self.log_action("research_niches", json.dumps(niches.get("niches", []))[:500])
+        # Persist top niche as actionable product file for pipeline progression
+        niche_list = niches.get("niches", [])
+        saved = 0
+        for niche in niche_list[:2]:
+            name = niche.get("niche", niche.get("product_type", "untitled"))
+            safe_name = "".join(c if c.isalnum() or c in " -_" else "" for c in name).strip()
+            if not safe_name:
+                continue
+            path = self.products_dir / f"{safe_name}.json"
+            if not path.exists():
+                path.write_text(json.dumps({
+                    "research": niche,
+                    "status": "researched",
+                }, indent=2))
+                saved += 1
+
+        self.log_action("research_niches",
+                        f"Found {len(niche_list)} niches, saved {saved} for creation")
         return niches
 
     def _create_product(self) -> dict[str, Any]:
-        """Create a digital product based on research."""
+        """Create a digital product from a researched niche."""
+        # Find a researched niche to advance
+        research_data = {}
+        product_path = None
+        for path in self.products_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") == "researched":
+                research_data = data.get("research", {})
+                product_path = path
+                break
+
         product_spec = self.think_json(
-            "Design a specific digital product to create right now. "
-            "It should be something I can generate with AI and sell immediately. "
+            f"Design a specific digital product based on this research:\n"
+            f"Niche: {research_data.get('niche', 'unknown')}\n"
+            f"Product type: {research_data.get('product_type', 'ebook')}\n"
+            f"Estimated price: ${research_data.get('estimated_price', 9.99)}\n"
+            f"Reasoning: {research_data.get('reasoning', '')}\n\n"
+            "Create something I can generate with AI and sell immediately. "
             "Return: {\"title\": str, \"type\": str, \"description\": str, "
             "\"target_audience\": str, \"price\": float, \"sections\": [str]}"
         )
@@ -180,15 +228,22 @@ class DigitalProductsAgent(BaseAgent):
             )
             content_parts.append({"section": section, "content": part})
 
-        # Save product locally
-        safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title).strip()
-        product_path = self.products_dir / f"{safe_title}.json"
-        product_data = {
-            "spec": product_spec,
-            "content": content_parts,
-            "status": "created",
-        }
-        product_path.write_text(json.dumps(product_data, indent=2))
+        # Save product — update existing research file or create new
+        if product_path and product_path.exists():
+            existing_data = json.loads(product_path.read_text())
+            existing_data["spec"] = product_spec
+            existing_data["content"] = content_parts
+            existing_data["status"] = "created"
+            product_path.write_text(json.dumps(existing_data, indent=2))
+        else:
+            safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title).strip()
+            product_path = self.products_dir / f"{safe_title}.json"
+            product_data = {
+                "spec": product_spec,
+                "content": content_parts,
+                "status": "created",
+            }
+            product_path.write_text(json.dumps(product_data, indent=2))
 
         self.record_expense(
             0.10, "api_cost", f"Created product: {title}",

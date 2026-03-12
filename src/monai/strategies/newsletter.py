@@ -91,14 +91,25 @@ class NewsletterAgent(BaseAgent):
 
     def plan(self) -> list[str]:
         newsletters = self.db.execute("SELECT * FROM newsletters WHERE status != 'paused'")
-        count = len(newsletters)
-        plan = self.think_json(
-            f"I run {count} newsletters. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: research_niches, plan_newsletter, write_issue, "
-            "grow_subscribers, find_sponsors, analyze_performance.",
-        )
-        return plan.get("steps", ["research_niches"])
+        statuses: dict[str, int] = {}
+        for nl in newsletters:
+            s = nl.get("status", "unknown")
+            statuses[s] = statuses.get(s, 0) + 1
+
+        # Deterministic progression
+        if not statuses:
+            return ["research_niches"]
+        if statuses.get("planning", 0) > 0:
+            return ["plan_newsletter"]
+        if statuses.get("launched", 0) > 0:
+            return ["write_issue"]
+        if statuses.get("growing", 0) > 0:
+            return ["grow_subscribers"]
+        if statuses.get("monetizing", 0) > 0:
+            return ["find_sponsors"]
+
+        # All newsletters at final stage — start new one
+        return ["research_niches"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting newsletter cycle")

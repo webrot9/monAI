@@ -57,20 +57,26 @@ class FreelanceWritingAgent(BaseAgent):
         self.invoicing = Invoicing(config, db)
 
     def plan(self) -> list[str]:
-        """Plan the next actions for this strategy."""
+        """Deterministic progression based on CRM pipeline state."""
         pipeline = self.crm.get_pipeline_summary()
-        context = json.dumps(pipeline)
 
-        plan = self.think_json(
-            "Given the current client pipeline, plan my next actions. "
-            "Return: {\"steps\": [str]}. "
-            "Possible actions: prospect_platforms, send_proposals, "
-            "write_content, deliver_work, send_invoice, follow_up.",
-            context=context,
-        )
-        steps = plan.get("steps", ["prospect_platforms"])
-        self.log_action("plan", f"Planned {len(steps)} steps", json.dumps(steps))
-        return steps
+        # Deterministic progression based on pipeline
+        leads = pipeline.get("leads", 0)
+        proposals = pipeline.get("proposals_sent", 0)
+        active_jobs = pipeline.get("active_jobs", 0)
+        completed = pipeline.get("completed_unpaid", 0)
+
+        if completed > 0:
+            return ["send_invoice"]
+        if active_jobs > 0:
+            return ["write_content"]
+        if proposals > 0:
+            return ["follow_up"]
+        if leads > 0:
+            return ["send_proposals"]
+
+        # No pipeline — prospect for new clients
+        return ["prospect_platforms"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         """Execute one cycle of the freelance writing strategy."""

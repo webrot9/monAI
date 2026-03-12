@@ -50,15 +50,37 @@ class MicroSaaSAgent(BaseAgent):
         self.products_dir = config.data_dir / "micro_saas"
         self.products_dir.mkdir(parents=True, exist_ok=True)
 
+    def _get_product_statuses(self) -> dict[str, int]:
+        """Count products by status from JSON files."""
+        statuses: dict[str, int] = {}
+        for path in self.products_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                s = data.get("status", "unknown")
+                statuses[s] = statuses.get(s, 0) + 1
+            except (json.JSONDecodeError, OSError):
+                continue
+        return statuses
+
     def plan(self) -> list[str]:
-        existing = list(self.products_dir.glob("*.json"))
-        plan = self.think_json(
-            f"I have {len(existing)} micro-SaaS products. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: research_opportunities, design_product, build_mvp, "
-            "deploy, create_landing_page, check_usage.",
-        )
-        return plan.get("steps", ["research_opportunities"])
+        statuses = self._get_product_statuses()
+
+        # Deterministic progression — always advance the pipeline
+        if not statuses:
+            return ["research_opportunities"]
+        if statuses.get("researched", 0) > 0:
+            return ["design_product"]
+        if statuses.get("designed", 0) > 0:
+            return ["build_mvp"]
+        if statuses.get("built", 0) > 0:
+            return ["deploy"]
+        if statuses.get("deployed", 0) > 0:
+            return ["create_landing_page"]
+        if statuses.get("build_failed", 0) > 0:
+            return ["design_product"]  # Redesign failed builds
+
+        # All products at final stage — start new cycle
+        return ["research_opportunities"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting micro-SaaS cycle")
@@ -122,33 +144,63 @@ class MicroSaaSAgent(BaseAgent):
             "\"solution\": str, \"tech_stack\": str, \"pricing_model\": str, "
             "\"deploy_platform\": str}]}",
         )
+        # Persist top idea as actionable product file for pipeline progression
+        ideas = opportunities.get("ideas", [])
+        saved = 0
+        for idea in ideas[:2]:
+            name = idea.get("name", "untitled")
+            safe_name = "".join(c if c.isalnum() or c in " -_" else "" for c in name).strip()
+            if not safe_name:
+                continue
+            path = self.products_dir / f"{safe_name}.json"
+            if not path.exists():
+                path.write_text(json.dumps({
+                    "research": idea,
+                    "status": "researched",
+                }, indent=2))
+                saved += 1
+
         self.share_knowledge(
             "opportunity", "micro_saas_ideas",
-            json.dumps(opportunities.get("ideas", []))[:1000],
+            json.dumps(ideas)[:1000],
             tags=["micro_saas", "product"],
         )
+        self.log_action("research_complete", f"Found {len(ideas)} ideas, saved {saved} for design")
         return opportunities
 
     def _design_product(self) -> dict[str, Any]:
-        """Design a specific micro-SaaS product."""
-        spec = self.think_json(
-            "Design a micro-SaaS product to build right now. "
-            "Create a detailed specification.\n\n"
-            "Return: {\"name\": str, \"tagline\": str, \"problem\": str, "
-            "\"features\": [{\"name\": str, \"description\": str}], "
-            "\"tech_stack\": {\"backend\": str, \"frontend\": str, \"database\": str}, "
-            "\"api_endpoints\": [{\"method\": str, \"path\": str, \"description\": str}], "
-            "\"pricing\": {\"free_tier\": str, \"paid_tier\": str, \"price\": float}, "
-            "\"deploy_target\": str}"
-        )
+        """Design a product from a researched opportunity."""
+        for path in self.products_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "researched":
+                continue
 
-        name = spec.get("name", "untitled")
-        safe_name = "".join(c if c.isalnum() or c in " -_" else "" for c in name).strip()
-        design_path = self.products_dir / f"{safe_name}.json"
-        design_path.write_text(json.dumps({"design": spec, "status": "designed"}, indent=2))
+            research = data.get("research", {})
+            spec = self.think_json(
+                f"Design a micro-SaaS product based on this research:\n"
+                f"Name: {research.get('name', 'unknown')}\n"
+                f"Problem: {research.get('problem', 'unknown')}\n"
+                f"Solution: {research.get('solution', 'unknown')}\n"
+                f"Tech stack: {research.get('tech_stack', 'Python')}\n"
+                f"Pricing model: {research.get('pricing_model', 'freemium')}\n\n"
+                "Create a detailed specification.\n\n"
+                "Return: {\"name\": str, \"tagline\": str, \"problem\": str, "
+                "\"features\": [{\"name\": str, \"description\": str}], "
+                "\"tech_stack\": {\"backend\": str, \"frontend\": str, \"database\": str}, "
+                "\"api_endpoints\": [{\"method\": str, \"path\": str, \"description\": str}], "
+                "\"pricing\": {\"free_tier\": str, \"paid_tier\": str, \"price\": float}, "
+                "\"deploy_target\": str}"
+            )
 
-        self.log_action("product_designed", name)
-        return spec
+            data["design"] = spec
+            data["status"] = "designed"
+            path.write_text(json.dumps(data, indent=2))
+
+            name = spec.get("name", path.stem)
+            self.log_action("product_designed", name)
+            return spec
+
+        return {"status": "no_products_to_design"}
 
     def _build_mvp(self) -> dict[str, Any]:
         """Build an MVP using the Coder agent."""

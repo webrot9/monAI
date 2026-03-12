@@ -79,14 +79,23 @@ class SaaSAgent(BaseAgent):
     def plan(self) -> list[str]:
         products = self.db.execute("SELECT status, COUNT(*) as c FROM saas_products GROUP BY status")
         stats = {r["status"]: r["c"] for r in products}
-        plan = self.think_json(
-            f"SaaS portfolio: {json.dumps(stats)}. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: discover_opportunities, validate_idea, competitor_analysis, "
-            "design_architecture, build_mvp, create_landing_page, plan_launch, "
-            "analyze_metrics, plan_growth.",
-        )
-        return plan.get("steps", ["discover_opportunities"])
+
+        # Deterministic progression — always advance the pipeline
+        if not stats:
+            return ["discover_opportunities"]
+        if stats.get("researching", 0) > 0:
+            return ["validate_idea"]
+        if stats.get("validated", 0) > 0:
+            return ["design_architecture"]
+        if stats.get("building", 0) > 0:
+            return ["build_mvp"]
+        if stats.get("beta", 0) > 0:
+            return ["create_landing_page"]
+        if stats.get("launched", 0) > 0:
+            return ["plan_growth"]
+
+        # All products at final stage — discover new ones
+        return ["discover_opportunities"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting SaaS cycle")

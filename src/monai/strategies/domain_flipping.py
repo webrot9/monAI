@@ -54,13 +54,19 @@ class DomainFlippingAgent(BaseAgent):
     def plan(self) -> list[str]:
         domains = self.db.execute("SELECT status, COUNT(*) as c FROM domains GROUP BY status")
         stats = {r["status"]: r["c"] for r in domains}
-        plan = self.think_json(
-            f"Domain portfolio: {json.dumps(stats)}. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: research_expired, evaluate_domains, acquire_domain, "
-            "list_for_sale, optimize_listings, analyze_market.",
-        )
-        return plan.get("steps", ["research_expired"])
+
+        # Deterministic progression
+        if not stats:
+            return ["research_expired"]
+        if stats.get("prospect", 0) > 0:
+            return ["evaluate_domains"]
+        if stats.get("acquired", 0) > 0:
+            return ["list_for_sale"]
+        if stats.get("listed", 0) > 0:
+            return ["optimize_listings"]
+
+        # All domains sold — research new expired ones
+        return ["research_expired"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting domain flipping cycle")

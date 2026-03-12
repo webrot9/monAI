@@ -67,13 +67,19 @@ class SocialMediaAgent(BaseAgent):
     def plan(self) -> list[str]:
         clients = self.db.execute("SELECT status, COUNT(*) as c FROM smm_clients GROUP BY status")
         stats = {r["status"]: r["c"] for r in clients}
-        plan = self.think_json(
-            f"SMM client stats: {json.dumps(stats)}. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: find_clients, create_content_batch, schedule_posts, "
-            "analyze_engagement, report_to_clients, optimize_strategy.",
-        )
-        return plan.get("steps", ["find_clients"])
+
+        # Deterministic progression
+        if not stats:
+            return ["find_clients"]
+        if stats.get("prospect", 0) > 0:
+            return ["find_clients"]  # Keep prospecting until onboarding
+        if stats.get("onboarding", 0) > 0:
+            return ["create_content_batch"]
+        if stats.get("active", 0) > 0:
+            return ["create_content_batch"]
+
+        # All clients churned — find new ones
+        return ["find_clients"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting social media cycle")

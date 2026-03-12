@@ -67,13 +67,21 @@ class CourseCreationAgent(BaseAgent):
     def plan(self) -> list[str]:
         courses = self.db.execute("SELECT status, COUNT(*) as c FROM courses GROUP BY status")
         stats = {r["status"]: r["c"] for r in courses}
-        plan = self.think_json(
-            f"Course stats: {json.dumps(stats)}. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: research_topics, design_curriculum, write_lessons, "
-            "list_course, review_content, plan_marketing, analyze_performance.",
-        )
-        return plan.get("steps", ["research_topics"])
+
+        # Deterministic progression
+        if not stats:
+            return ["research_topics"]
+        if stats.get("planning", 0) > 0:
+            return ["design_curriculum"]
+        if stats.get("scripting", 0) > 0:
+            return ["write_lessons"]
+        if stats.get("producing", 0) > 0:
+            return ["list_course"]
+        if stats.get("published", 0) > 0:
+            return ["plan_marketing"]
+
+        # All courses at final stage — research new topics
+        return ["research_topics"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting course creation cycle")
