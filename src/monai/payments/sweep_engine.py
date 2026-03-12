@@ -115,18 +115,17 @@ class SweepEngine:
                     preferred_payment_method=self.config.retoswap.preferred_payment_method,
                     preferred_currency=self.config.retoswap.preferred_currency,
                     price_margin_pct=self.config.retoswap.price_margin_pct,
+                    fallback_payment_methods=self.config.retoswap.fallback_payment_methods,
                 )
         return self._retoswap
 
     def get_active_flow(self) -> str:
-        """Determine which payout flow is active."""
-        # LLC mode is primary if configured
-        entities = self.corporate.get_all_entities()
-        for entity in entities:
-            contractor = self.corporate.get_active_contractor(entity["id"])
-            if contractor:
-                return "llc_contractor"
+        """Determine which payout flow is active.
 
+        Priority: RetoSwap (P2P, no KYC) > direct XMR > LLC (requires bank).
+        RetoSwap is preferred because it converts XMR → PayPal F&F or cash
+        without needing a bank account or LLC setup.
+        """
         # RetoSwap: XMR → fiat via P2P exchange (no KYC, anonymous cash-out)
         if getattr(self.config, "retoswap", None) and self.config.retoswap.enabled:
             return "crypto_retoswap"
@@ -134,6 +133,13 @@ class SweepEngine:
         # Direct XMR transfer to creator wallet
         if self.config.creator_wallet.xmr_address:
             return "crypto_xmr"
+
+        # LLC mode — requires bank account, most bureaucracy
+        entities = self.corporate.get_all_entities()
+        for entity in entities:
+            contractor = self.corporate.get_active_contractor(entity["id"])
+            if contractor:
+                return "llc_contractor"
 
         return "none"
 

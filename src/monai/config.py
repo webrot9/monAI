@@ -128,7 +128,9 @@ class RetoSwapConfig:
     daemon_host: str = "127.0.0.1"
     daemon_port: int = 9999
     daemon_password: str = ""
-    preferred_payment_method: str = "SEPA"  # SEPA, REVOLUT, WISE, CASH_BY_MAIL
+    preferred_payment_method: str = "PAYPAL"  # PAYPAL (F&F), CASH_BY_MAIL, SEPA, REVOLUT
+    paypal_type: str = "friends_family"  # friends_family (no fees, no invoice) or goods_services
+    fallback_payment_methods: list[str] = field(default_factory=lambda: ["CASH_BY_MAIL", "REVOLUT"])
     preferred_currency: str = "EUR"
     price_margin_pct: float = -1.0  # Sell 1% below market for faster fills
     auto_confirm_fiat: bool = False  # Auto-confirm fiat receipt (risky, verify manually)
@@ -386,6 +388,8 @@ class Config:
                 "daemon_host": self.retoswap.daemon_host,
                 "daemon_port": self.retoswap.daemon_port,
                 "preferred_payment_method": self.retoswap.preferred_payment_method,
+                "paypal_type": self.retoswap.paypal_type,
+                "fallback_payment_methods": self.retoswap.fallback_payment_methods,
                 "preferred_currency": self.retoswap.preferred_currency,
                 "price_margin_pct": self.retoswap.price_margin_pct,
                 "auto_confirm_fiat": self.retoswap.auto_confirm_fiat,

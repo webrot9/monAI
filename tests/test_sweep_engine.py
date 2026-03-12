@@ -48,13 +48,24 @@ class TestFlowDetection:
         engine._corporate.get_all_entities.return_value = []
         assert engine.get_active_flow() == "crypto_xmr"
 
-    def test_llc_flow_takes_priority(self, mock_config, mock_db):
+    def test_crypto_xmr_takes_priority_over_llc(self, mock_config, mock_db):
+        """XMR direct transfer beats LLC (no bank needed)."""
         mock_config.creator_wallet.xmr_address = "4" + "A" * 94  # Both configured
         engine = SweepEngine(mock_config, mock_db)
         engine._corporate = MagicMock()
         engine._corporate.get_all_entities.return_value = [{"id": 1, "name": "LLC"}]
         engine._corporate.get_active_contractor.return_value = {"id": 1, "alias": "Creator"}
-        assert engine.get_active_flow() == "llc_contractor"
+        assert engine.get_active_flow() == "crypto_xmr"
+
+    def test_retoswap_takes_highest_priority(self, mock_config, mock_db):
+        """RetoSwap (P2P, PayPal F&F) beats everything else."""
+        mock_config.creator_wallet.xmr_address = "4" + "A" * 94
+        mock_config.retoswap.enabled = True
+        engine = SweepEngine(mock_config, mock_db)
+        engine._corporate = MagicMock()
+        engine._corporate.get_all_entities.return_value = [{"id": 1, "name": "LLC"}]
+        engine._corporate.get_active_contractor.return_value = {"id": 1, "alias": "Creator"}
+        assert engine.get_active_flow() == "crypto_retoswap"
 
     def test_llc_without_contractor_falls_to_crypto(self, mock_config, mock_db):
         mock_config.creator_wallet.xmr_address = "4" + "A" * 94
