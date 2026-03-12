@@ -29,6 +29,7 @@ class BudgetExceededError(Exception):
 
 # Pricing per 1M tokens (EUR, approximate — updated March 2026)
 # Source: OpenAI pricing page. Adjust if prices change.
+# Local models (Ollama) are free — zero cost per token.
 MODEL_PRICING = {
     "gpt-4o": {"input": 2.50, "output": 10.00},
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -37,6 +38,20 @@ MODEL_PRICING = {
     "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
     "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
 }
+
+# Local models — free inference
+_LOCAL_MODEL_PREFIXES = ("llama", "mistral", "gemma", "phi", "qwen", "codellama", "deepseek")
+
+
+def _get_model_pricing(model: str) -> dict[str, float]:
+    """Get pricing for a model, returning zero for local/Ollama models."""
+    if model in MODEL_PRICING:
+        return MODEL_PRICING[model]
+    # Local models are free
+    if any(model.lower().startswith(p) for p in _LOCAL_MODEL_PREFIXES):
+        return {"input": 0.0, "output": 0.0}
+    # Unknown model — assume mini pricing as safe default
+    return MODEL_PRICING.get("gpt-4o-mini", {"input": 0.15, "output": 0.60})
 
 
 class CostTracker:
@@ -59,7 +74,7 @@ class CostTracker:
     def record(self, model: str, input_tokens: int, output_tokens: int,
                caller: str = "unknown") -> float:
         """Record a call and return its cost in EUR."""
-        pricing = MODEL_PRICING.get(model, MODEL_PRICING.get("gpt-4o-mini"))
+        pricing = _get_model_pricing(model)
         cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
 
         with self._lock:
@@ -197,11 +212,25 @@ class LLM:
         self.config = config or Config.load()
         # Route OpenAI API calls through proxy to protect creator's IP
         client_kwargs: dict[str, Any] = {"api_key": self.config.llm.api_key}
-        if self.config.privacy.proxy_type != "none":
+
+        # Support alternative backends (Ollama, Anthropic) via OpenAI-compatible API
+        llm_cfg = self.config.llm
+        api_base = getattr(llm_cfg, "api_base", "")
+        provider = getattr(llm_cfg, "provider", "")
+
+        if provider == "ollama" or (api_base and "11434" in api_base):
+            # Ollama exposes OpenAI-compatible API at /v1
+            base = api_base.rstrip("/") if api_base else "http://127.0.0.1:11434"
+            client_kwargs["base_url"] = f"{base}/v1"
+            # Ollama doesn't need a real API key but OpenAI client requires one
+            if not client_kwargs["api_key"] or client_kwargs["api_key"] == "ollama-local":
+                client_kwargs["api_key"] = "ollama"
+        elif self.config.privacy.proxy_type != "none":
             proxy_url = self._get_proxy_url()
             if proxy_url:
                 import httpx as _httpx
                 client_kwargs["http_client"] = _httpx.Client(proxy=proxy_url, timeout=120)
+
         self.client = OpenAI(**client_kwargs)
         self.caller = caller  # Which agent/module is making the call
         self.tracker = _global_tracker

@@ -125,3 +125,33 @@
 - **Mistake**: Used `row.get("column")` on `sqlite3.Row` objects returned by `db.execute()`, which raises `AttributeError`
 - **Root cause**: Treating `sqlite3.Row` as `dict` — it supports bracket access (`row["col"]`) but NOT `.get()`
 - **Rule**: Always use `row["column"]` for `sqlite3.Row` objects. If you need `.get()` behavior, convert to `dict(row)` first. When checking for NULL, use `row["col"]` in a truthiness check, not `.get()`. Found 3 instances in `api_provisioner.py`.
+
+### 2026-03-12 - Webhook handlers must NEVER return 200 on failure
+- **Mistake**: Webhook event handler errors were caught silently — server returned 200 OK, so the payment provider never retried
+- **Root cause**: Defensive `try/except` swallowed exceptions in the event dispatch loop
+- **Rule**: If any webhook handler fails, return 500 so the provider retries. Save the failed webhook to a dead letter queue (webhook_dead_letter table) for manual replay. Invalid amounts (NaN, negative, >€1M) must raise ValueError, not silently return.
+
+### 2026-03-12 - Sweep and refund must share a per-brand lock
+- **Mistake**: Concurrent sweep + refund webhook for the same brand could race — sweep uses balance that includes already-refunded amount
+- **Root cause**: No synchronization between sweep engine and webhook handler
+- **Rule**: Use a per-brand asyncio.Lock shared between sweep_engine._crypto_sweep_brand() and manager._handle_payment_refunded(). Lock creation is thread-safe via threading.Lock.
+
+### 2026-03-12 - Validate crypto addresses before irreversible sends
+- **Mistake**: Monero send_payout() and BTCPay send_payout() accepted any string as destination address
+- **Root cause**: Trusted caller to always pass valid addresses
+- **Rule**: Validate address format (length, character set, prefix) BEFORE calling the transfer RPC. XMR: 95 or 106 chars, base58, starts with 4 or 8. BTC: legacy (1/3 prefix, 25-34 chars) or bech32 (bc1 prefix, 42-62 chars).
+
+### 2026-03-12 - Agents are autonomous — notify, don't ask permission
+- **Mistake**: Implemented Telegram `ask_creator()` confirmation gate before sweep execution
+- **Root cause**: Security instinct overrode the core design principle of full autonomy
+- **Rule**: monAI agents NEVER ask permission to operate. They notify the creator AFTER actions (Telegram notification on sweep > €50). The spending guard and ethics tests are the safety gates — not human confirmation loops. If it passes the guard + ethics + legal advisor, it executes.
+
+### 2026-03-12 - Zero-touch means ZERO TOUCH — the creator does nothing
+- **Mistake**: Listed "Set API keys", "Configure Monero wallet", "Install Tor" as manual launch prerequisites
+- **Root cause**: Assumed operational setup is the creator's job. It's not. monAI is autonomous.
+- **Rule**: monAI must auto-provision ALL infrastructure on first run: Tor (install + start), Monero wallet RPC (download + start + create wallet), LLM access (detect API keys OR auto-install Ollama), config (create with sane defaults). The creator runs ONE command. If something can't be auto-provisioned, monAI operates with reduced capabilities — it never blocks waiting for human setup.
+
+### 2026-03-12 - Support free LLM fallback — don't depend on paid APIs
+- **Mistake**: Hard-exited with error if OPENAI_API_KEY was not set
+- **Root cause**: Assumed paid API is the only option
+- **Rule**: monAI must support local LLM via Ollama as a zero-cost fallback. Auto-install Ollama + pull model if no API key found. This extends runway from ~2.8 months to 8+ months. Track local model costs as €0.00.

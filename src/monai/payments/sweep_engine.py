@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -47,6 +48,18 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 5  # seconds
 
+# Per-brand locks to prevent concurrent sweeps/refunds from racing
+_brand_locks: dict[str, asyncio.Lock] = {}
+_brand_locks_mutex = threading.Lock()
+
+
+def _get_brand_lock(brand: str) -> asyncio.Lock:
+    """Get or create an asyncio.Lock for a brand (thread-safe creation)."""
+    with _brand_locks_mutex:
+        if brand not in _brand_locks:
+            _brand_locks[brand] = asyncio.Lock()
+        return _brand_locks[brand]
+
 
 class SweepEngine:
     """Orchestrates profit sweeps from brand accounts to creator.
@@ -56,10 +69,14 @@ class SweepEngine:
     - Crypto mode: sends XMR from brand wallet to creator wallet
     """
 
-    def __init__(self, config: Config, db: Database):
+    # Sweeps above this EUR threshold trigger a Telegram notification to creator
+    CONFIRMATION_THRESHOLD_EUR = 50.0
+
+    def __init__(self, config: Config, db: Database, telegram_bot=None):
         self.config = config
         self.db = db
         self.brand_payments = BrandPayments(db)
+        self.telegram_bot = telegram_bot  # TelegramBot for sweep confirmations
         self._monero = None  # Lazy-loaded only if crypto is configured
 
         # Lazy import corporate module
@@ -85,6 +102,22 @@ class SweepEngine:
             )
         return self._monero
 
+    @property
+    def retoswap(self):
+        if not hasattr(self, "_retoswap") or self._retoswap is None:
+            self._retoswap = None
+            if getattr(self.config, "retoswap", None) and self.config.retoswap.enabled:
+                from monai.payments.retoswap_provider import RetoSwapClient
+                self._retoswap = RetoSwapClient(
+                    daemon_host=self.config.retoswap.daemon_host,
+                    daemon_port=self.config.retoswap.daemon_port,
+                    daemon_password=self.config.retoswap.daemon_password,
+                    preferred_payment_method=self.config.retoswap.preferred_payment_method,
+                    preferred_currency=self.config.retoswap.preferred_currency,
+                    price_margin_pct=self.config.retoswap.price_margin_pct,
+                )
+        return self._retoswap
+
     def get_active_flow(self) -> str:
         """Determine which payout flow is active."""
         # LLC mode is primary if configured
@@ -94,7 +127,11 @@ class SweepEngine:
             if contractor:
                 return "llc_contractor"
 
-        # Crypto fallback
+        # RetoSwap: XMR → fiat via P2P exchange (no KYC, anonymous cash-out)
+        if getattr(self.config, "retoswap", None) and self.config.retoswap.enabled:
+            return "crypto_retoswap"
+
+        # Direct XMR transfer to creator wallet
         if self.config.creator_wallet.xmr_address:
             return "crypto_xmr"
 
@@ -144,13 +181,15 @@ class SweepEngine:
 
         if flow == "llc_contractor":
             return await self._run_llc_sweep_cycle()
+        elif flow == "crypto_retoswap":
+            return await self._run_retoswap_sweep_cycle()
         elif flow == "crypto_xmr":
             return await self._run_crypto_sweep_cycle()
         else:
             return {
                 "status": "skipped",
                 "reason": "no_payout_method_configured",
-                "hint": "Configure LLC entity + contractor, or set creator_wallet.xmr_address",
+                "hint": "Configure LLC, RetoSwap, or set creator_wallet.xmr_address",
             }
 
     async def _run_llc_sweep_cycle(self) -> dict[str, Any]:
@@ -325,6 +364,83 @@ class SweepEngine:
 
     # ── Crypto Flow (Monero) ───────────────────────────────────
 
+    async def _run_retoswap_sweep_cycle(self) -> dict[str, Any]:
+        """RetoSwap flow: sell XMR on P2P exchange for fiat (EUR/cash).
+
+        Flow: Brand XMR wallet → RetoSwap P2P trade → fiat to creator's bank/PayPal.
+        No KYC. Fully decentralized via Haveno protocol.
+        """
+        if not self.monero:
+            return {"status": "error", "reason": "monero_not_configured"}
+        if not self.retoswap:
+            return {"status": "error", "reason": "retoswap_not_configured"}
+
+        if not await self.monero.health_check():
+            return {"status": "error", "reason": "monero_offline"}
+        if not await self.retoswap.health_check():
+            logger.warning("RetoSwap daemon unreachable — skipping conversion cycle")
+            return {"status": "error", "reason": "retoswap_offline"}
+
+        threshold = self.config.creator_wallet.sweep_threshold_eur
+        results = []
+        all_revenue = self.brand_payments.get_all_brands_revenue()
+
+        for brand_data in all_revenue:
+            brand = brand_data["brand"]
+            sweepable = self.brand_payments.get_sweepable_balance(brand)
+            if sweepable < threshold:
+                continue
+
+            lock = _get_brand_lock(brand)
+            async with lock:
+                # Get brand wallet balance in XMR
+                balance = await self.monero.get_balance(brand)
+                xmr_available = balance.available
+                if xmr_available < 0.01:
+                    continue
+
+                # Sell XMR for fiat via P2P exchange
+                logger.info(
+                    f"RetoSwap: selling {xmr_available:.4f} XMR from brand '{brand}' "
+                    f"(~€{sweepable:.2f})"
+                )
+                trade_result = await self.retoswap.auto_sell_xmr(
+                    amount_xmr=xmr_available,
+                )
+
+                results.append({
+                    "brand": brand,
+                    "amount_xmr": xmr_available,
+                    "trade_id": trade_result.trade_id,
+                    "status": trade_result.status.value,
+                    "amount_fiat": trade_result.amount_fiat,
+                    "error": trade_result.error,
+                })
+
+                # Notify creator
+                if self.telegram_bot and trade_result.trade_id:
+                    try:
+                        self.telegram_bot.notify_creator(
+                            f"💱 *RetoSwap trade initiated*\n\n"
+                            f"Brand: `{brand}`\n"
+                            f"Selling: {xmr_available:.4f} XMR\n"
+                            f"Expected: ~€{trade_result.amount_fiat:.2f}\n"
+                            f"Method: {self.config.retoswap.preferred_payment_method}\n"
+                            f"Trade: `{trade_result.trade_id[:16]}...`\n\n"
+                            f"Fiat will arrive in your account when trade completes."
+                        )
+                    except Exception:
+                        pass
+
+        successful = sum(1 for r in results if r.get("trade_id"))
+        return {
+            "flow": "crypto_retoswap",
+            "trades_initiated": len(results),
+            "trades_successful": successful,
+            "results": results,
+            "status": "ok",
+        }
+
     async def _run_crypto_sweep_cycle(self) -> dict[str, Any]:
         """Crypto flow: send XMR from brand wallets to creator."""
         if not self.monero:
@@ -336,7 +452,18 @@ class SweepEngine:
 
         creator_address = self.config.creator_wallet.xmr_address
         if not creator_address:
-            return {"status": "error", "reason": "no_creator_xmr_address"}
+            # No creator address yet — notify via Telegram and hold funds
+            if self.telegram_bot:
+                try:
+                    self.telegram_bot.notify_creator(
+                        "💰 *Funds ready for sweep* but no XMR address configured.\n\n"
+                        "Send me your Monero address to start receiving payouts.\n"
+                        "Use: `/set_wallet <your_xmr_address>`"
+                    )
+                except Exception:
+                    pass
+            logger.info("No creator XMR address — holding funds until configured")
+            return {"status": "holding", "reason": "awaiting_creator_xmr_address"}
 
         threshold = self.config.creator_wallet.sweep_threshold_eur
         results: list[SweepResult] = []
@@ -369,7 +496,18 @@ class SweepEngine:
 
     async def _crypto_sweep_brand(self, brand: str,
                                   amount: float | None = None) -> SweepResult:
-        """Execute a crypto sweep for a single brand."""
+        """Execute a crypto sweep for a single brand.
+
+        Acquires a per-brand lock to prevent race conditions with concurrent
+        refund webhooks modifying the same brand's balance mid-sweep.
+        """
+        lock = _get_brand_lock(brand)
+        async with lock:
+            return await self._crypto_sweep_brand_locked(brand, amount)
+
+    async def _crypto_sweep_brand_locked(self, brand: str,
+                                         amount: float | None = None) -> SweepResult:
+        """Actual sweep logic — must be called under brand lock."""
         from monai.payments.monero_provider import MoneroRPCError
 
         creator_address = self.config.creator_wallet.xmr_address
@@ -468,6 +606,19 @@ class SweepEngine:
                     tx_hash = result.payment_ref
                     fee = result.raw.get("fee", 0)
                     self.brand_payments.complete_sweep(sweep_id, tx_reference=tx_hash)
+
+                    # Notify creator (non-blocking — sweep already done)
+                    if self.telegram_bot and sweepable >= self.CONFIRMATION_THRESHOLD_EUR:
+                        try:
+                            self.telegram_bot.notify_creator(
+                                f"💰 *Sweep completed*\n\n"
+                                f"Brand: `{brand}`\n"
+                                f"Amount: {xmr_to_send:.8f} XMR (~€{sweepable:.2f})\n"
+                                f"Fee: {fee:.8f} XMR\n"
+                                f"TX: `{tx_hash[:16]}...`"
+                            )
+                        except Exception:
+                            pass  # Notification failure must never block sweep result
 
                     return SweepResult(
                         success=True,

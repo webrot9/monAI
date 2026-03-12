@@ -104,7 +104,7 @@ class TestPaymentIntentValidation:
 class TestWebhookAmountValidation:
     @pytest.mark.asyncio
     async def test_rejects_zero_amount_completed(self, manager, db):
-        """Zero-amount payment.completed should be rejected."""
+        """Zero-amount payment.completed raises ValueError (DLQ in production)."""
         _ensure_payment_tables(db)
         event = WebhookEvent(
             event_type=WebhookEventType.PAYMENT_COMPLETED,
@@ -115,7 +115,8 @@ class TestWebhookAmountValidation:
             metadata={"brand": "test"},
             raw={},
         )
-        await manager._handle_webhook_event(event)
+        with pytest.raises(ValueError, match="zero amount"):
+            await manager._handle_webhook_event(event)
 
         # Should not be recorded
         rows = db.execute(
@@ -145,7 +146,7 @@ class TestWebhookAmountValidation:
 
     @pytest.mark.asyncio
     async def test_rejects_nan_amount(self, manager, db):
-        """NaN amounts should be rejected."""
+        """NaN amounts raise ValueError (DLQ in production)."""
         _ensure_payment_tables(db)
         event = WebhookEvent(
             event_type=WebhookEventType.PAYMENT_COMPLETED,
@@ -156,7 +157,8 @@ class TestWebhookAmountValidation:
             metadata={"brand": "test"},
             raw={},
         )
-        await manager._handle_webhook_event(event)
+        with pytest.raises(ValueError, match="NaN"):
+            await manager._handle_webhook_event(event)
 
         rows = db.execute(
             "SELECT * FROM webhook_events WHERE payment_ref = 'pi_nan_001'"
@@ -175,7 +177,8 @@ class TestWebhookAmountValidation:
             metadata={"brand": "test"},
             raw={},
         )
-        await manager._handle_webhook_event(event)
+        with pytest.raises(ValueError, match="negative amount"):
+            await manager._handle_webhook_event(event)
 
         rows = db.execute(
             "SELECT * FROM webhook_events WHERE payment_ref = 'pi_neg_002'"
@@ -194,7 +197,8 @@ class TestWebhookAmountValidation:
             metadata={"brand": "test"},
             raw={},
         )
-        await manager._handle_webhook_event(event)
+        with pytest.raises(ValueError, match="suspicious amount"):
+            await manager._handle_webhook_event(event)
 
         rows = db.execute(
             "SELECT * FROM webhook_events WHERE payment_ref = 'pi_big_002'"

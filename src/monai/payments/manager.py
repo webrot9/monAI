@@ -48,7 +48,7 @@ class UnifiedPaymentManager:
         self.ledger = ledger  # GeneralLedger for double-entry bookkeeping
         self.brand_payments = BrandPayments(db)
         self.sweep_engine = SweepEngine(config, db)
-        self.webhook_server = WebhookServer()
+        self.webhook_server = WebhookServer(db=db)
 
         self._providers: dict[str, PaymentProvider] = {}
         self._brand_providers: dict[str, dict[str, PaymentProvider]] = {}
@@ -107,6 +107,18 @@ class UnifiedPaymentManager:
                     event_id TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(provider, event_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS webhook_dead_letter (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL,
+                    raw_payload TEXT NOT NULL,
+                    headers TEXT,
+                    error TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_retry_at TIMESTAMP
                 );
             """)
 
@@ -303,20 +315,16 @@ class UnifiedPaymentManager:
             logger.warning("Webhook missing payment_ref — ignoring")
             return
 
-        # Validate webhook amount (reject obviously wrong values)
+        # Validate webhook amount — raise so webhook server returns 500 and saves to DLQ
         if event.amount < 0:
-            logger.error(f"Webhook with negative amount rejected: {event.amount}")
-            return
+            raise ValueError(f"Webhook with negative amount rejected: {event.amount}")
         if event.amount == 0 and event.event_type == WebhookEventType.PAYMENT_COMPLETED:
-            logger.error("Webhook with zero amount rejected for payment.completed")
-            return
+            raise ValueError("Webhook with zero amount rejected for payment.completed")
         if event.amount > 1_000_000:  # €1M safety cap per single webhook
-            logger.error(f"Webhook with suspicious amount rejected: {event.amount}")
-            return
+            raise ValueError(f"Webhook with suspicious amount rejected: {event.amount}")
         # NaN check
         if event.amount != event.amount:
-            logger.error("Webhook with NaN amount rejected")
-            return
+            raise ValueError("Webhook with NaN amount rejected")
 
         # ATOMIC: idempotency check + event log in single transaction
         with self.db.transaction() as conn:
@@ -476,7 +484,28 @@ class UnifiedPaymentManager:
             logger.error(f"Failed to record GL entry for payment {event.payment_ref}: {e}")
 
     async def _handle_payment_refunded(self, event: WebhookEvent) -> None:
-        """Handle a refund — mark payment and check if sweep already occurred."""
+        """Handle a refund — mark payment and check if sweep already occurred.
+
+        Acquires the per-brand lock so refunds cannot race with an in-progress sweep.
+        """
+        from monai.payments.sweep_engine import _get_brand_lock
+
+        # Determine brand from the original payment
+        pre_payments = self.db.execute(
+            "SELECT brand FROM brand_payments_received WHERE payment_ref = ? LIMIT 1",
+            (event.payment_ref,),
+        )
+        brand_for_lock = dict(pre_payments[0])["brand"] if pre_payments else ""
+        lock = _get_brand_lock(brand_for_lock) if brand_for_lock else None
+
+        if lock:
+            async with lock:
+                await self._handle_refund_inner(event)
+        else:
+            await self._handle_refund_inner(event)
+
+    async def _handle_refund_inner(self, event: WebhookEvent) -> None:
+        """Refund logic — must be called under brand lock when brand is known."""
         payments = self.db.execute(
             "SELECT id, brand, amount, currency FROM brand_payments_received "
             "WHERE payment_ref = ? LIMIT 1",

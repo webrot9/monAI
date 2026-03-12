@@ -357,6 +357,31 @@ def _print_cycle_summary(result: dict, db: Database):
     print(f"{'='*60}\n")
 
 
+def _auto_setup() -> dict:
+    """Run zero-touch infrastructure setup before anything else.
+
+    Ensures Tor, Monero wallet RPC, LLM access, and config are all
+    provisioned automatically. The creator never touches a config file.
+    """
+    from monai.infra.auto_setup import InfraSetup
+    setup = InfraSetup()
+    results = setup.run_all()
+
+    if not results.get("ready"):
+        # Log what failed but DON'T exit — let the system try to operate
+        failed = [k for k, v in results.items()
+                  if isinstance(v, dict) and v.get("status") == "failed"]
+        if failed:
+            logger.warning(
+                f"Auto-setup: some components failed: {failed}. "
+                f"monAI will continue with reduced capabilities."
+            )
+    else:
+        logger.info("Auto-setup: all infrastructure ready")
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="monAI — Autonomous money-making AI")
     parser.add_argument("command", nargs="?", default="daemon",
@@ -366,15 +391,32 @@ def main():
                         help="Seconds between daemon cycles (default: 300)")
     parser.add_argument("--port", type=int, default=8421,
                         help="Dashboard server port (default: 8421)")
+    parser.add_argument("--skip-setup", action="store_true",
+                        help="Skip auto-setup (for testing)")
     args = parser.parse_args()
+
+    # Zero-touch infrastructure setup — runs BEFORE config load
+    if not args.skip_setup and args.command in ("daemon", "run", "init"):
+        _auto_setup()
 
     config = Config.load()
 
     if not config.llm.api_key:
-        print("Error: OPENAI_API_KEY not set.")
-        print("Set it via: export OPENAI_API_KEY=sk-...")
-        print("Or add it to ~/.monai/config.json")
-        sys.exit(1)
+        # Don't hard-fail — auto-setup may have configured Ollama
+        logger.warning(
+            "No LLM API key found. If Ollama is running locally, monAI will "
+            "use it. Otherwise, set OPENAI_API_KEY or ANTHROPIC_API_KEY."
+        )
+        if args.command in ("daemon", "run"):
+            # One more check — did auto-setup configure a local key?
+            config = Config.load()  # Reload after auto-setup
+            if not config.llm.api_key:
+                print("Error: No LLM access available.")
+                print("Options:")
+                print("  1. export OPENAI_API_KEY=sk-...")
+                print("  2. export ANTHROPIC_API_KEY=sk-ant-...")
+                print("  3. Install Ollama: curl -fsSL https://ollama.ai/install.sh | sh")
+                sys.exit(1)
 
     if args.command == "dashboard":
         import asyncio

@@ -105,7 +105,10 @@ class TestBTCPayProvider:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_cls.return_value = mock_client
 
-            result = await provider.send_payout("bc1q...", 0.01, "BTC")
+            # Use a realistic-length bech32 address for validation
+            result = await provider.send_payout(
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", 0.01, "BTC"
+            )
 
         assert result.success is True
         assert result.payment_ref == "abc123def456"

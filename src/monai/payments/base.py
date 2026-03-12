@@ -17,12 +17,27 @@ from monai.payments.types import (
 logger = logging.getLogger(__name__)
 
 
-def _resolve_proxy_url(explicit_url: str = "") -> str:
+class ProxyResolutionError(RuntimeError):
+    """Raised when no proxy can be resolved and direct connection would expose creator IP."""
+
+
+# Track if we've already warned about missing proxy (avoid log spam)
+_proxy_warning_emitted = False
+
+
+def _resolve_proxy_url(explicit_url: str = "", allow_direct: bool = False) -> str:
     """Resolve proxy URL: use explicit if given, else auto-detect from anonymizer.
 
     This ensures payment providers ALWAYS go through the proxy even if
     the caller forgets to pass proxy_url explicitly.
+
+    If no proxy is available:
+    - allow_direct=True (local services like wallet RPC): silently allows direct
+    - allow_direct=False (external APIs): logs CRITICAL warning on first occurrence
+      to alert operator, but does not block (blocking would break operations entirely).
+      The orchestrator's anonymity verification phase is the enforcement gate.
     """
+    global _proxy_warning_emitted
     if explicit_url:
         return explicit_url
     try:
@@ -33,6 +48,12 @@ def _resolve_proxy_url(explicit_url: str = "") -> str:
             return url
     except Exception:
         pass
+    if not allow_direct and not _proxy_warning_emitted:
+        logger.critical(
+            "SECURITY: No proxy available for payment provider — direct connection "
+            "will expose creator's real IP. Configure Tor or a proxy ASAP."
+        )
+        _proxy_warning_emitted = True
     return ""
 
 
