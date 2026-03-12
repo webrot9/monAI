@@ -362,6 +362,14 @@ class SelfImprover:
                     )
             except Exception as e:
                 logger.error("Failed to deploy improvement %s: %s", prop["id"], e)
+                # Mark as failed to prevent infinite retry loops
+                try:
+                    self.db.execute(
+                        "UPDATE agent_improvements SET status = 'reverted' WHERE id = ?",
+                        (prop["id"],),
+                    )
+                except Exception:
+                    pass
 
         return deployed
 
@@ -417,6 +425,26 @@ class SelfImprover:
         verdict, details = self._compare_snapshots(before, after)
 
         now = datetime.now().isoformat()
+        if verdict == "insufficient_data":
+            # Not enough metrics yet — extend experiment
+            extra_cycles = experiment.get("eval_after_cycles") or DEFAULT_EVAL_CYCLES
+            self.db.execute(
+                "UPDATE agent_improvements SET eval_after_cycles = ?, eval_cycles = 0 "
+                "WHERE id = ?",
+                (extra_cycles + DEFAULT_EVAL_CYCLES, exp_id),
+            )
+            logger.info(
+                "Experiment %s EXTENDED (insufficient data): %s",
+                exp_id, experiment["description"][:80],
+            )
+            return {
+                "id": exp_id,
+                "agent": agent_name,
+                "action": "extended",
+                "verdict": verdict,
+                "details": details,
+            }
+
         if verdict == "improved" or verdict == "stable":
             # Promote: experiment succeeded
             self.db.execute(
@@ -456,7 +484,7 @@ class SelfImprover:
             }
 
     def _snapshot_metrics(self, agent_name: str) -> dict[str, float]:
-        """Capture current metric averages for an agent (last 10 per metric)."""
+        """Capture current metric averages for an agent (last 50 entries)."""
         rows = self.db.execute(
             "SELECT metric_name, AVG(metric_value) as avg_val "
             "FROM ("
@@ -480,7 +508,7 @@ class SelfImprover:
         - 'declined': at least one metric declined > MAX_DECLINE_PCT
         """
         if not before or not after:
-            return "stable", {"reason": "insufficient_data"}
+            return "insufficient_data", {"reason": "no_metrics"}
 
         changes: dict[str, float] = {}
         improved_count = 0
@@ -568,7 +596,7 @@ class SelfImprover:
         if any(kw in desc_lower for kw in high_risk):
             return "high"
 
-        medium_risk = ["cost", "budget", "external", "third.party", "deploy"]
+        medium_risk = ["cost", "budget", "external", "third-party", "third_party", "deploy"]
         if any(kw in desc_lower for kw in medium_risk):
             return "medium"
 
