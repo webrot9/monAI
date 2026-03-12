@@ -109,7 +109,9 @@ class Orchestrator(BaseAgent):
         self.kofi_manager = KofiCampaignManager(
             config, db, llm, bootstrap_wallet=self.bootstrap_wallet,
         )
-        self.exchange_rates = ExchangeRateService(db)
+        self.exchange_rates = ExchangeRateService(
+            db, anonymizer=get_anonymizer(config),
+        )
         self.reporter = FinancialReporter(
             db, self.ledger, self.finance, bootstrap=self.bootstrap_wallet,
         )
