@@ -315,6 +315,9 @@ class TelegramBotAgent(BaseAgent):
 
     def _deploy_bot(self) -> dict[str, Any]:
         """Deploy a built Telegram bot by registering with BotFather and hosting it."""
+        # Ensure Stripe is set up for in-bot payments (e.g. /subscribe, /buy)
+        self.ensure_platform_account("stripe")
+
         deployed = 0
 
         for path in self.bots_dir.glob("*.json"):

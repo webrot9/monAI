@@ -743,15 +743,80 @@ class Orchestrator(BaseAgent):
                     f"Will continue next cycle."
                 )
 
-        # API key provisioning — ensure brands have payment provider keys
-        api_prov_result = self._run_api_provisioning()
+        # API key provisioning — ensure brands have payment provider keys.
+        # Force on first cycle so payment providers are set up at startup.
+        api_prov_result = self._run_api_provisioning(force=(self._cycle <= 1))
         if api_prov_result.get("provisioned"):
             result["api_keys"] = api_prov_result
+
+        # Proactively provision payment providers for active strategies.
+        # Each strategy needs at least one payment provider to sell products.
+        self._ensure_strategy_payment_providers(result)
 
         if not needs and "llc" not in result and "api_keys" not in result:
             return {"status": "infrastructure_ok", "accounts": len(accounts)}
 
         return {"provisioned": needs, "result": result}
+
+    # Map strategy types to the payment providers they need
+    STRATEGY_PAYMENT_PROVIDERS: dict[str, list[str]] = {
+        "digital_products": ["gumroad"],
+        "telegram_bots": ["stripe"],
+        "micro_saas": ["stripe", "lemonsqueezy"],
+        "saas": ["stripe"],
+        "course_creation": ["gumroad", "stripe"],
+        "print_on_demand": ["stripe"],
+        "freelance_writing": [],  # Paid via platform (Upwork, etc.)
+        "domain_flipping": [],  # Paid via marketplace (Sedo, etc.)
+    }
+
+    def _ensure_strategy_payment_providers(self, result: dict[str, Any]) -> None:
+        """Proactively provision payment providers for active strategies.
+
+        Each selling strategy needs at least one payment provider to collect
+        money. This checks active strategies and ensures their required
+        providers are set up BEFORE the strategy tries to list/deploy.
+        """
+        try:
+            active_strategies = self.db.execute(
+                "SELECT DISTINCT strategy FROM strategy_lifecycle WHERE status = 'active'"
+            )
+            if not active_strategies:
+                return
+
+            provisioned = []
+            for row in active_strategies:
+                strategy_name = row["strategy"]
+                needed_providers = self.STRATEGY_PAYMENT_PROVIDERS.get(strategy_name, [])
+                for provider in needed_providers:
+                    # Check if this provider is already set up for any brand
+                    existing = self.db.execute(
+                        "SELECT 1 FROM brand_api_keys WHERE provider = ? AND status = 'active' LIMIT 1",
+                        (provider,),
+                    )
+                    if not existing:
+                        self.log_action(
+                            "auto_provision_payment",
+                            f"Strategy '{strategy_name}' needs {provider} — provisioning now",
+                        )
+                        try:
+                            prov_result = self.api_provisioner._dispatch_provision(
+                                provider, strategy_name,
+                            )
+                            provisioned.append(f"{provider}:{strategy_name}")
+                            self.log_action(
+                                "auto_provision_result",
+                                f"{provider} for {strategy_name}: {prov_result.get('status')}",
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Auto-provision {provider} for {strategy_name} failed: {e}"
+                            )
+
+            if provisioned:
+                result["auto_provisioned_providers"] = provisioned
+        except Exception as e:
+            logger.warning(f"Strategy payment provider check failed: {e}")
 
     def _setup_kofi_campaign(self) -> dict[str, Any]:
         """Set up Ko-fi crowdfunding campaign for bootstrap funding."""
@@ -936,14 +1001,15 @@ class Orchestrator(BaseAgent):
         except Exception as e:
             logger.error(f"Financial reporting failed: {e}")
 
-    def _run_api_provisioning(self) -> dict[str, Any]:
+    def _run_api_provisioning(self, force: bool = False) -> dict[str, Any]:
         """Run API key provisioning for brands that need payment provider keys.
 
         Checks all active brands and provisions missing API keys
         (Stripe, Gumroad, LemonSqueezy, BTCPay) via the APIProvisioner agent.
-        Runs every 5 cycles to avoid excessive provisioning attempts.
+        Always runs on first cycle; then every 5 cycles to avoid excess attempts.
+        Pass force=True to skip the cycle gate (e.g. during bootstrap).
         """
-        if self._cycle % 5 != 1:
+        if not force and self._cycle > 1 and self._cycle % 5 != 1:
             return {"status": "skipped", "reason": "not_provisioning_cycle"}
 
         try:

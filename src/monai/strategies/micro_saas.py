@@ -287,6 +287,9 @@ class MicroSaaSAgent(BaseAgent):
 
     def _deploy(self) -> dict[str, Any]:
         """Deploy reviewed products to REAL hosting platforms."""
+        # Ensure Stripe is set up for payments before deploying
+        self.ensure_platform_account("stripe")
+
         deployed = 0
 
         for path in self.products_dir.glob("*.json"):

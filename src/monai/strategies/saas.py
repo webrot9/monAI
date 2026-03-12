@@ -534,6 +534,9 @@ class SaaSAgent(BaseAgent):
 
     def _create_landing_page(self) -> dict[str, Any]:
         """Create and deploy a REAL landing page for a SaaS product."""
+        # Ensure Stripe is set up for subscription payments
+        self.ensure_platform_account("stripe")
+
         products = self.db.execute(
             "SELECT * FROM saas_products WHERE status IN ('building', 'beta', 'reviewed') LIMIT 1"
         )

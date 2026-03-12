@@ -48,6 +48,7 @@ class BaseAgent(ABC):
         self._identity = None  # Lazy-loaded
         self._provisioner = None  # Lazy-loaded
         self._reviewer = None  # Lazy-loaded
+        self._api_provisioner = None  # Lazy-loaded
 
     @property
     def coder(self):
@@ -104,6 +105,18 @@ class BaseAgent(ABC):
     @reviewer.setter
     def reviewer(self, value):
         self._reviewer = value
+
+    @property
+    def api_provisioner(self):
+        """Lazy-load API provisioner — payment provider account setup."""
+        if self._api_provisioner is None:
+            from monai.agents.api_provisioner import APIProvisioner
+            self._api_provisioner = APIProvisioner(self.config, self.db, self.llm)
+        return self._api_provisioner
+
+    @api_provisioner.setter
+    def api_provisioner(self, value):
+        self._api_provisioner = value
 
     def write_code(self, spec: str, project_dir: str | None = None,
                    language: str = "python") -> dict:
@@ -216,11 +229,18 @@ class BaseAgent(ABC):
         )
         return self.execute_task(task)
 
+    # Payment providers that need special handling (API keys, webhooks, etc.)
+    PAYMENT_PROVIDERS = {"stripe", "gumroad", "lemonsqueezy", "btcpay"}
+
     def ensure_platform_account(self, platform: str) -> dict[str, Any]:
         """Ensure we have an account on a platform, registering if needed.
 
+        Payment providers (Stripe, Gumroad, LemonSqueezy, BTCPay) are routed
+        through APIProvisioner which handles API key extraction, webhook setup,
+        and payment manager registration — not just account creation.
+
         Args:
-            platform: Platform name (e.g., 'upwork', 'gumroad', 'fiverr')
+            platform: Platform name (e.g., 'upwork', 'gumroad', 'stripe')
 
         Returns:
             Account info dict, or registration result
@@ -230,8 +250,35 @@ class BaseAgent(ABC):
             self.log_action("account_check", f"Already have {platform} account")
             return {"status": "exists", "account": existing}
 
+        # Payment providers need full provisioning (keys, webhooks, payment manager)
+        if platform.lower() in self.PAYMENT_PROVIDERS:
+            return self._provision_payment_provider(platform)
+
         self.log_action("account_provision", f"Registering on {platform}")
         return self._run_async(self.provisioner.register_on_platform(platform))
+
+    def _provision_payment_provider(self, provider: str) -> dict[str, Any]:
+        """Provision a payment provider account with full API key + webhook setup.
+
+        Uses APIProvisioner instead of generic Provisioner to ensure proper
+        API key extraction, webhook configuration, and payment manager registration.
+        """
+        self.log_action("payment_provider_provision", f"Setting up {provider} via APIProvisioner")
+
+        # Get brand identity for the provisioning
+        brand = self.name  # Use agent/strategy name as brand identifier
+        identity_data = self.api_provisioner._get_brand_identity(brand)
+
+        try:
+            result = self.api_provisioner._dispatch_provision(provider.lower(), brand)
+            if result.get("status") in ("provisioned", "already_provisioned"):
+                self.log_action("payment_provider_ready", f"{provider} is set up for {brand}")
+            else:
+                self.log_action("payment_provider_issue", f"{provider}: {result}")
+            return result
+        except Exception as e:
+            self.log_action("payment_provider_error", f"{provider} setup failed: {e}")
+            return {"status": "error", "provider": provider, "error": str(e)}
 
     def get_platform_credentials(self, platform: str) -> dict[str, str]:
         """Get stored credentials for a platform.
