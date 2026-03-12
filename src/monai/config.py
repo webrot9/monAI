@@ -60,15 +60,19 @@ class BudgetConfig:
 
 @dataclass
 class LLMConfig:
+    provider: str = "openai"  # openai, anthropic, ollama
     model: str = "gpt-4o"
     model_mini: str = "gpt-4o-mini"
     api_key: str = ""
+    api_base: str = ""  # Custom API base URL (for Ollama, etc.)
     max_tokens: int = 4096
     temperature: float = 0.7
 
     def __post_init__(self):
         if not self.api_key:
             self.api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not self.api_key:
+            self.api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
 
 @dataclass
@@ -277,8 +281,10 @@ class Config:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         data = {
             "llm": {
+                "provider": self.llm.provider,
                 "model": self.llm.model,
                 "model_mini": self.llm.model_mini,
+                "api_base": self.llm.api_base,
                 "max_tokens": self.llm.max_tokens,
                 "temperature": self.llm.temperature,
             },

@@ -353,7 +353,18 @@ class SweepEngine:
 
         creator_address = self.config.creator_wallet.xmr_address
         if not creator_address:
-            return {"status": "error", "reason": "no_creator_xmr_address"}
+            # No creator address yet — notify via Telegram and hold funds
+            if self.telegram_bot:
+                try:
+                    self.telegram_bot.notify_creator(
+                        "💰 *Funds ready for sweep* but no XMR address configured.\n\n"
+                        "Send me your Monero address to start receiving payouts.\n"
+                        "Use: `/set_wallet <your_xmr_address>`"
+                    )
+                except Exception:
+                    pass
+            logger.info("No creator XMR address — holding funds until configured")
+            return {"status": "holding", "reason": "awaiting_creator_xmr_address"}
 
         threshold = self.config.creator_wallet.sweep_threshold_eur
         results: list[SweepResult] = []

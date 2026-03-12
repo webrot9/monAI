@@ -145,3 +145,13 @@
 - **Mistake**: Implemented Telegram `ask_creator()` confirmation gate before sweep execution
 - **Root cause**: Security instinct overrode the core design principle of full autonomy
 - **Rule**: monAI agents NEVER ask permission to operate. They notify the creator AFTER actions (Telegram notification on sweep > €50). The spending guard and ethics tests are the safety gates — not human confirmation loops. If it passes the guard + ethics + legal advisor, it executes.
+
+### 2026-03-12 - Zero-touch means ZERO TOUCH — the creator does nothing
+- **Mistake**: Listed "Set API keys", "Configure Monero wallet", "Install Tor" as manual launch prerequisites
+- **Root cause**: Assumed operational setup is the creator's job. It's not. monAI is autonomous.
+- **Rule**: monAI must auto-provision ALL infrastructure on first run: Tor (install + start), Monero wallet RPC (download + start + create wallet), LLM access (detect API keys OR auto-install Ollama), config (create with sane defaults). The creator runs ONE command. If something can't be auto-provisioned, monAI operates with reduced capabilities — it never blocks waiting for human setup.
+
+### 2026-03-12 - Support free LLM fallback — don't depend on paid APIs
+- **Mistake**: Hard-exited with error if OPENAI_API_KEY was not set
+- **Root cause**: Assumed paid API is the only option
+- **Rule**: monAI must support local LLM via Ollama as a zero-cost fallback. Auto-install Ollama + pull model if no API key found. This extends runway from ~2.8 months to 8+ months. Track local model costs as €0.00.
