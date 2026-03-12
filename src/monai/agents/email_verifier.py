@@ -152,10 +152,35 @@ class EmailVerifier:
 
     def _check_imap(self, host: str, port: int, user: str, password: str,
                     platform: str, target_email: str) -> dict[str, str] | None:
-        """Connect to IMAP and search for verification emails."""
+        """Connect to IMAP and search for verification emails.
+
+        Routes connection through SOCKS5 proxy to prevent real IP leaks.
+        """
         conn = None
         try:
-            conn = imaplib.IMAP4_SSL(host, port)
+            # Route IMAP through SOCKS5 proxy to prevent IP leak
+            proxy_url = self._anonymizer.get_proxy_url()
+            if proxy_url:
+                import socks
+                import socket
+                from urllib.parse import urlparse as _urlparse
+                parsed = _urlparse(proxy_url)
+                proxy_type = socks.SOCKS5 if "socks5" in parsed.scheme else socks.SOCKS4
+                socks.set_default_proxy(
+                    proxy_type, parsed.hostname, parsed.port or 1080,
+                )
+                orig_socket = socket.socket
+                socket.socket = socks.socksocket
+                try:
+                    conn = imaplib.IMAP4_SSL(host, port)
+                finally:
+                    socket.socket = orig_socket
+            else:
+                logger.warning(
+                    "PRIVACY: No proxy available for IMAP — skipping direct connection "
+                    "to prevent IP leak"
+                )
+                return None
             conn.login(user, password)
             conn.select("INBOX")
 

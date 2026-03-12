@@ -213,20 +213,17 @@ class TestAnonymityVerification:
         assert result["proxy_active"] is False
 
     def test_startup_check_no_proxy_blocked(self, no_proxy_config):
-        """proxy_type=none must raise unless MONAI_ALLOW_NO_PROXY is set."""
+        """proxy_type=none must ALWAYS raise — no override allowed."""
         anon = NetworkAnonymizer(no_proxy_config)
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("MONAI_ALLOW_NO_PROXY", None)
-            with pytest.raises(AnonymityError, match="proxy_type=none is dangerous"):
-                anon.startup_check()
+        with pytest.raises(AnonymityError, match="proxy_type=none is BLOCKED"):
+            anon.startup_check()
 
-    def test_startup_check_no_proxy_allowed(self, no_proxy_config):
-        """proxy_type=none allowed with explicit MONAI_ALLOW_NO_PROXY=1."""
+    def test_startup_check_no_proxy_blocked_even_with_env(self, no_proxy_config):
+        """proxy_type=none must raise even if MONAI_ALLOW_NO_PROXY is set."""
         anon = NetworkAnonymizer(no_proxy_config)
         with patch.dict(os.environ, {"MONAI_ALLOW_NO_PROXY": "1"}):
-            result = anon.startup_check()
-            assert result["anonymous"] is False
-            assert "explicit override" in result["reason"]
+            with pytest.raises(AnonymityError, match="proxy_type=none is BLOCKED"):
+                anon.startup_check()
 
 
 class TestMetadataStripping:

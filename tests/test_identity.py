@@ -77,4 +77,5 @@ class TestIdentityManager:
     def test_generate_email_alias(self, identity):
         alias = identity.generate_email_alias("example.com")
         assert "@example.com" in alias
-        assert "testcorp" in alias
+        # Username is randomized for anti-correlation — just check it's non-empty
+        assert len(alias.split("@")[0]) > 0

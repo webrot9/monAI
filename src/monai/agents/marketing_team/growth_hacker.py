@@ -397,6 +397,8 @@ class GrowthHacker(BaseAgent):
     def record_variant_data(self, experiment_id: int, variant: str,
                             views: int = 0, conversions: int = 0):
         """Record real data for an experiment variant (called by other systems)."""
+        if variant not in ("a", "b"):
+            raise ValueError(f"variant must be 'a' or 'b', got '{variant}'")
         col_views = f"variant_{variant}_views"
         col_conv = f"variant_{variant}_conversions"
         self.db.execute(

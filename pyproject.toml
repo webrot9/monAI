@@ -21,6 +21,7 @@ dependencies = [
     "stripe>=8.0.0",
     "cryptography>=42.0.0",
     "playwright>=1.40.0",
+    "pytest-asyncio>=0.23.0",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +35,9 @@ monai = "monai.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.ruff]
 target-version = "py311"

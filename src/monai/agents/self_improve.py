@@ -1,17 +1,17 @@
-"""Agent self-improvement framework.
+"""Agent self-improvement framework with A/B experiment validation.
 
 Agents can improve themselves by:
 1. Analyzing their own performance metrics
 2. Identifying weaknesses and failure patterns
 3. Generating improved strategies/prompts
-4. Testing improvements against ethics and quality checks
-5. Deploying improvements only if they pass all checks
+4. Deploying improvements as A/B experiments (status='testing')
+5. Evaluating experiments after N cycles — auto-deploy or auto-revert
 
 Constraints:
 - Ethics are NEVER relaxed — improvements must pass ethics tests
 - Cost must stay within budget
 - Changes are logged and reversible
-- The orchestrator must approve major changes
+- The orchestrator must approve major changes (high-risk only)
 """
 
 from __future__ import annotations
@@ -32,13 +32,16 @@ SELF_IMPROVE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_improvements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_name TEXT NOT NULL,
-    improvement_type TEXT NOT NULL,   -- prompt, strategy, tool, workflow
+    improvement_type TEXT NOT NULL,   -- prompt, strategy, tool, workflow, parameter
     description TEXT NOT NULL,
     old_value TEXT,
     new_value TEXT,
-    performance_before TEXT,         -- JSON metrics
-    performance_after TEXT,          -- JSON metrics (null until verified)
-    status TEXT NOT NULL DEFAULT 'proposed',  -- proposed, testing, approved, deployed, reverted
+    performance_before TEXT,         -- JSON metrics snapshot
+    performance_after TEXT,          -- JSON metrics snapshot (filled after eval)
+    status TEXT NOT NULL DEFAULT 'proposed',  -- proposed, testing, deployed, reverted
+    risk TEXT DEFAULT 'low',         -- low, medium, high
+    eval_cycles INTEGER DEFAULT 0,   -- how many cycles since deployed as experiment
+    eval_after_cycles INTEGER DEFAULT 5, -- evaluate after this many cycles
     ethics_passed INTEGER,           -- null until tested
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     deployed_at TIMESTAMP
@@ -64,9 +67,14 @@ CREATE TABLE IF NOT EXISTS agent_metrics (
 );
 """
 
+# A/B evaluation thresholds
+MIN_IMPROVEMENT_PCT = 5.0    # Must improve by at least 5% to keep
+MAX_DECLINE_PCT = -10.0      # Revert if any metric declines more than 10%
+DEFAULT_EVAL_CYCLES = 5      # Evaluate after 5 orchestration cycles
+
 
 class SelfImprover:
-    """Manages agent self-improvement within ethical and budgetary constraints."""
+    """Manages agent self-improvement with A/B experiment validation."""
 
     def __init__(self, config: Config, db: Database, llm: LLM,
                  memory: SharedMemory | None = None):
@@ -77,6 +85,21 @@ class SelfImprover:
 
         with db.connect() as conn:
             conn.executescript(SELF_IMPROVE_SCHEMA)
+        self._ensure_columns()
+
+    def _ensure_columns(self) -> None:
+        """Add columns that may not exist in older databases."""
+        for col, coldef in [
+            ("risk", "TEXT DEFAULT 'low'"),
+            ("eval_cycles", "INTEGER DEFAULT 0"),
+            ("eval_after_cycles", f"INTEGER DEFAULT {DEFAULT_EVAL_CYCLES}"),
+        ]:
+            try:
+                self.db.execute(
+                    f"ALTER TABLE agent_improvements ADD COLUMN {col} {coldef}"
+                )
+            except Exception:
+                pass  # Column already exists
 
     # ── Metrics Tracking ──────────────────────────────────────────
 
@@ -108,7 +131,6 @@ class SelfImprover:
 
     def get_metric_trend(self, agent_name: str, metric_name: str) -> dict[str, Any]:
         """Analyze the trend of a metric over time."""
-        # Get metrics ordered chronologically (oldest first)
         rows = self.db.execute(
             "SELECT * FROM agent_metrics WHERE agent_name = ? AND metric_name = ? "
             "ORDER BY cycle ASC, id ASC LIMIT 20",
@@ -142,7 +164,6 @@ class SelfImprover:
 
     def analyze_performance(self, agent_name: str) -> dict[str, Any]:
         """Analyze an agent's overall performance and identify weaknesses."""
-        # Get all metrics for this agent
         all_metrics = self.db.execute(
             "SELECT metric_name, AVG(metric_value) as avg_val, "
             "MIN(metric_value) as min_val, MAX(metric_value) as max_val, "
@@ -151,7 +172,6 @@ class SelfImprover:
             (agent_name,),
         )
 
-        # Get recent failures from agent log
         try:
             failures = self.db.execute(
                 "SELECT action, details, created_at FROM agent_log "
@@ -162,7 +182,6 @@ class SelfImprover:
         except Exception:
             failures = []
 
-        # Get lessons learned (table may not exist if SharedMemory hasn't been initialized)
         try:
             lessons = self.db.execute(
                 "SELECT category, situation, lesson, rule FROM lessons "
@@ -177,12 +196,13 @@ class SelfImprover:
         failure_patterns = [dict(f) for f in failures]
         lesson_list = [dict(l) for l in lessons]
 
+        # Lower threshold: generate improvements with just 1 metric
         return {
             "agent": agent_name,
             "metrics": metrics_summary,
             "failure_patterns": failure_patterns,
             "lessons": lesson_list,
-            "data_richness": "good" if len(all_metrics) >= 3 else "sparse",
+            "data_richness": "good" if len(all_metrics) >= 1 else "sparse",
         }
 
     # ── Improvement Proposals ─────────────────────────────────────
@@ -190,14 +210,15 @@ class SelfImprover:
     def propose_improvement(self, agent_name: str, improvement_type: str,
                             description: str, old_value: str = "",
                             new_value: str = "",
-                            performance_before: dict | None = None) -> int:
+                            performance_before: dict | None = None,
+                            risk: str = "low") -> int:
         """Record a proposed improvement for an agent."""
         return self.db.execute_insert(
             "INSERT INTO agent_improvements "
             "(agent_name, improvement_type, description, old_value, new_value, "
-            "performance_before, status) VALUES (?, ?, ?, ?, ?, ?, 'proposed')",
+            "performance_before, status, risk) VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?)",
             (agent_name, improvement_type, description, old_value, new_value,
-             json.dumps(performance_before or {})),
+             json.dumps(performance_before or {}), risk),
         )
 
     def generate_improvements(self, agent_name: str) -> list[dict[str, Any]]:
@@ -205,7 +226,7 @@ class SelfImprover:
         analysis = self.analyze_performance(agent_name)
 
         if analysis["data_richness"] == "sparse":
-            return []  # Not enough data to improve on
+            return []
 
         response = self.llm.chat_json(
             [
@@ -231,14 +252,17 @@ class SelfImprover:
 
         improvements = response.get("improvements", [])
 
-        # Record each proposal
         for imp in improvements:
+            risk = imp.get("risk", "low")
+            if risk not in ("low", "medium", "high"):
+                risk = "low"
             self.propose_improvement(
                 agent_name,
                 imp.get("type", "strategy"),
                 imp.get("description", ""),
                 new_value=imp.get("new_value", ""),
                 performance_before=analysis.get("metrics"),
+                risk=risk,
             )
 
         return improvements
@@ -258,16 +282,15 @@ class SelfImprover:
         )
 
     def deploy_improvements(self) -> list[dict[str, Any]]:
-        """Deploy low-risk proposed improvements to agents.
+        """Deploy proposed improvements as A/B experiments.
 
-        - prompt improvements: stored as high-priority lessons in SharedMemory
-          so agents pick them up via context enrichment.
-        - parameter improvements: written to the agent_config table for agents
-          to read at startup / runtime.
+        - Low-risk improvements: deployed directly (status='deployed')
+        - Medium-risk improvements: deployed as experiments (status='testing')
+          with metric snapshots for before/after comparison
+        - High-risk improvements: skipped (require manual approval)
 
         Returns a list of dicts describing what was deployed.
         """
-        # Find low-risk proposed improvements
         rows = self.db.execute(
             "SELECT * FROM agent_improvements "
             "WHERE status = 'proposed' "
@@ -277,66 +300,303 @@ class SelfImprover:
 
         deployed: list[dict[str, Any]] = []
         for prop in proposals:
-            # Only auto-deploy low-risk improvements
-            # Check the description for risk hints from generate_improvements
             risk = self._assess_risk(prop)
-            if risk != "low":
+
+            if risk == "high":
                 logger.debug(
-                    "Skipping improvement %s (risk=%s): %s",
-                    prop["id"], risk, prop["description"][:80],
+                    "Skipping high-risk improvement %s: %s",
+                    prop["id"], prop["description"][:80],
                 )
                 continue
 
             try:
+                # Take a metric snapshot BEFORE deploying
+                before_snapshot = self._snapshot_metrics(prop["agent_name"])
+
                 if prop["improvement_type"] == "prompt":
                     self._deploy_prompt_improvement(prop)
                 elif prop["improvement_type"] == "parameter":
                     self._deploy_parameter_improvement(prop)
                 else:
-                    # strategy/tool/workflow — store as a lesson so agents
-                    # can incorporate the advice via context enrichment
                     self._deploy_prompt_improvement(prop)
 
-                # Mark as deployed
                 now = datetime.now().isoformat()
-                self.db.execute(
-                    "UPDATE agent_improvements "
-                    "SET status = 'deployed', deployed_at = ? WHERE id = ?",
-                    (now, prop["id"]),
-                )
-                deployed.append({
-                    "id": prop["id"],
-                    "agent": prop["agent_name"],
-                    "type": prop["improvement_type"],
-                    "description": prop["description"][:120],
-                })
-                logger.info(
-                    "Deployed improvement %s for %s: %s",
-                    prop["id"], prop["agent_name"], prop["description"][:80],
-                )
+
+                if risk == "medium":
+                    # Medium-risk: deploy as experiment (status='testing')
+                    self.db.execute(
+                        "UPDATE agent_improvements "
+                        "SET status = 'testing', deployed_at = ?, "
+                        "performance_before = ?, eval_cycles = 0 "
+                        "WHERE id = ?",
+                        (now, json.dumps(before_snapshot), prop["id"]),
+                    )
+                    deployed.append({
+                        "id": prop["id"],
+                        "agent": prop["agent_name"],
+                        "type": prop["improvement_type"],
+                        "description": prop["description"][:120],
+                        "mode": "experiment",
+                    })
+                    logger.info(
+                        "Started A/B experiment %s for %s: %s",
+                        prop["id"], prop["agent_name"], prop["description"][:80],
+                    )
+                else:
+                    # Low-risk: deploy directly
+                    self.db.execute(
+                        "UPDATE agent_improvements "
+                        "SET status = 'deployed', deployed_at = ? WHERE id = ?",
+                        (now, prop["id"]),
+                    )
+                    deployed.append({
+                        "id": prop["id"],
+                        "agent": prop["agent_name"],
+                        "type": prop["improvement_type"],
+                        "description": prop["description"][:120],
+                        "mode": "direct",
+                    })
+                    logger.info(
+                        "Deployed improvement %s for %s: %s",
+                        prop["id"], prop["agent_name"], prop["description"][:80],
+                    )
             except Exception as e:
                 logger.error("Failed to deploy improvement %s: %s", prop["id"], e)
+                # Mark as failed to prevent infinite retry loops
+                try:
+                    self.db.execute(
+                        "UPDATE agent_improvements SET status = 'reverted' WHERE id = ?",
+                        (prop["id"],),
+                    )
+                except Exception:
+                    pass
 
         return deployed
+
+    # ── A/B Experiment Lifecycle ──────────────────────────────────
+
+    def tick_experiments(self) -> list[dict[str, Any]]:
+        """Advance experiment cycle counters and evaluate ready experiments.
+
+        Call this once per orchestration cycle. Returns a list of
+        experiment results (deployed or reverted).
+        """
+        rows = self.db.execute(
+            "SELECT * FROM agent_improvements WHERE status = 'testing'"
+        )
+        experiments = [dict(r) for r in rows]
+        results: list[dict[str, Any]] = []
+
+        for exp in experiments:
+            eval_cycles = (exp.get("eval_cycles") or 0) + 1
+            eval_after = exp.get("eval_after_cycles") or DEFAULT_EVAL_CYCLES
+
+            # Increment cycle counter
+            self.db.execute(
+                "UPDATE agent_improvements SET eval_cycles = ? WHERE id = ?",
+                (eval_cycles, exp["id"]),
+            )
+
+            if eval_cycles >= eval_after:
+                result = self._evaluate_experiment(exp)
+                results.append(result)
+
+        return results
+
+    def _evaluate_experiment(self, experiment: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate an A/B experiment by comparing before/after metrics.
+
+        If metrics improved (or held steady): promote to 'deployed'.
+        If metrics declined significantly: revert to 'reverted'.
+        """
+        agent_name = experiment["agent_name"]
+        exp_id = experiment["id"]
+
+        # Get before snapshot
+        try:
+            before = json.loads(experiment.get("performance_before") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            before = {}
+
+        # Take after snapshot
+        after = self._snapshot_metrics(agent_name)
+
+        # Compare
+        verdict, details = self._compare_snapshots(before, after)
+
+        now = datetime.now().isoformat()
+        if verdict == "insufficient_data":
+            # Not enough metrics yet — extend experiment
+            extra_cycles = experiment.get("eval_after_cycles") or DEFAULT_EVAL_CYCLES
+            self.db.execute(
+                "UPDATE agent_improvements SET eval_after_cycles = ?, eval_cycles = 0 "
+                "WHERE id = ?",
+                (extra_cycles + DEFAULT_EVAL_CYCLES, exp_id),
+            )
+            logger.info(
+                "Experiment %s EXTENDED (insufficient data): %s",
+                exp_id, experiment["description"][:80],
+            )
+            return {
+                "id": exp_id,
+                "agent": agent_name,
+                "action": "extended",
+                "verdict": verdict,
+                "details": details,
+            }
+
+        if verdict == "improved" or verdict == "stable":
+            # Promote: experiment succeeded
+            self.db.execute(
+                "UPDATE agent_improvements "
+                "SET status = 'deployed', performance_after = ? WHERE id = ?",
+                (json.dumps(after), exp_id),
+            )
+            logger.info(
+                "Experiment %s PROMOTED (verdict=%s): %s",
+                exp_id, verdict, experiment["description"][:80],
+            )
+            return {
+                "id": exp_id,
+                "agent": agent_name,
+                "action": "promoted",
+                "verdict": verdict,
+                "details": details,
+            }
+        else:
+            # Revert: experiment failed
+            self._revert_deployment(experiment)
+            self.db.execute(
+                "UPDATE agent_improvements "
+                "SET status = 'reverted', performance_after = ? WHERE id = ?",
+                (json.dumps(after), exp_id),
+            )
+            logger.warning(
+                "Experiment %s REVERTED (verdict=%s): %s",
+                exp_id, verdict, experiment["description"][:80],
+            )
+            return {
+                "id": exp_id,
+                "agent": agent_name,
+                "action": "reverted",
+                "verdict": verdict,
+                "details": details,
+            }
+
+    def _snapshot_metrics(self, agent_name: str) -> dict[str, float]:
+        """Capture current metric averages for an agent (last 50 entries)."""
+        rows = self.db.execute(
+            "SELECT metric_name, AVG(metric_value) as avg_val "
+            "FROM ("
+            "  SELECT metric_name, metric_value FROM agent_metrics "
+            "  WHERE agent_name = ? ORDER BY created_at DESC LIMIT 50"
+            ") GROUP BY metric_name",
+            (agent_name,),
+        )
+        return {r["metric_name"]: r["avg_val"] for r in rows}
+
+    def _compare_snapshots(
+        self,
+        before: dict[str, float],
+        after: dict[str, float],
+    ) -> tuple[str, dict[str, Any]]:
+        """Compare before/after metric snapshots.
+
+        Returns (verdict, details) where verdict is one of:
+        - 'improved': at least one metric improved >= MIN_IMPROVEMENT_PCT
+        - 'stable': no significant change
+        - 'declined': at least one metric declined > MAX_DECLINE_PCT
+        """
+        if not before or not after:
+            return "insufficient_data", {"reason": "no_metrics"}
+
+        changes: dict[str, float] = {}
+        improved_count = 0
+        declined_count = 0
+
+        for metric_name, before_val in before.items():
+            after_val = after.get(metric_name)
+            if after_val is None or before_val == 0:
+                continue
+
+            pct_change = ((after_val - before_val) / abs(before_val)) * 100
+            changes[metric_name] = pct_change
+
+            if pct_change >= MIN_IMPROVEMENT_PCT:
+                improved_count += 1
+            elif pct_change <= MAX_DECLINE_PCT:
+                declined_count += 1
+
+        if declined_count > 0:
+            return "declined", {"changes": changes, "declined_metrics": declined_count}
+        elif improved_count > 0:
+            return "improved", {"changes": changes, "improved_metrics": improved_count}
+        else:
+            return "stable", {"changes": changes}
+
+    def _revert_deployment(self, experiment: dict[str, Any]) -> None:
+        """Undo a deployed experiment's changes."""
+        if experiment["improvement_type"] == "parameter":
+            # Restore old parameter values
+            old_value = experiment.get("old_value", "")
+            if old_value:
+                try:
+                    old_params = json.loads(old_value)
+                    if isinstance(old_params, dict):
+                        now = datetime.now().isoformat()
+                        for key, value in old_params.items():
+                            self.db.execute(
+                                "INSERT INTO agent_config "
+                                "(agent_name, config_key, config_value, updated_at) "
+                                "VALUES (?, ?, ?, ?) "
+                                "ON CONFLICT(agent_name, config_key) DO UPDATE "
+                                "SET config_value = excluded.config_value, "
+                                "updated_at = excluded.updated_at",
+                                (experiment["agent_name"], key, json.dumps(value), now),
+                            )
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Could not parse old_value for revert of experiment %s",
+                        experiment["id"],
+                    )
+
+        elif experiment["improvement_type"] == "prompt" and self.memory:
+            # Remove the lesson that was added
+            try:
+                self.memory.db.execute(
+                    "DELETE FROM lessons WHERE agent_name = ? AND category = 'optimization' "
+                    "AND situation LIKE ? ORDER BY created_at DESC LIMIT 1",
+                    (experiment["agent_name"],
+                     f"%{experiment['description'][:100]}%"),
+                )
+            except Exception as e:
+                logger.warning("Could not revert prompt lesson for experiment %s: %s",
+                               experiment["id"], e)
+
+        logger.info("Reverted experiment %s for %s",
+                     experiment["id"], experiment["agent_name"])
 
     # ── Deployment Helpers ────────────────────────────────────────
 
     def _assess_risk(self, proposal: dict[str, Any]) -> str:
         """Determine the risk level of a proposed improvement.
 
-        Uses the description text to look for risk signals. Returns
-        'low', 'medium', or 'high'.
+        First checks for a stored risk level from the LLM, then falls back
+        to keyword-based heuristics.
         """
+        # Use stored risk if available
+        stored_risk = (proposal.get("risk") or "").lower()
+        if stored_risk in ("low", "medium", "high"):
+            return stored_risk
+
         desc_lower = (proposal.get("description", "") or "").lower()
 
-        # High-risk keywords — never auto-deploy
         high_risk = ["ethic", "payment", "financial", "delete", "irreversible",
                       "credentials", "secret", "api key", "production"]
         if any(kw in desc_lower for kw in high_risk):
             return "high"
 
-        # Medium-risk keywords — require manual approval
-        medium_risk = ["cost", "budget", "external", "third.party", "deploy"]
+        medium_risk = ["cost", "budget", "external", "third-party", "third_party", "deploy"]
         if any(kw in desc_lower for kw in medium_risk):
             return "medium"
 
@@ -366,11 +626,9 @@ class SelfImprover:
             )
             raise ValueError("Parameter improvement missing new_value")
 
-        # new_value should be a JSON dict of key-value pairs, e.g. {"temperature": 0.3}
         try:
             params = json.loads(new_value)
         except (json.JSONDecodeError, TypeError):
-            # Treat the whole thing as a single config entry
             params = {"setting": new_value}
 
         if not isinstance(params, dict):
@@ -433,3 +691,11 @@ class SelfImprover:
                 summary[agent] = {}
             summary[agent][r["status"]] = r["count"]
         return summary
+
+    def get_active_experiments(self) -> list[dict[str, Any]]:
+        """Get all currently running A/B experiments."""
+        rows = self.db.execute(
+            "SELECT * FROM agent_improvements WHERE status = 'testing' "
+            "ORDER BY deployed_at ASC"
+        )
+        return [dict(r) for r in rows]

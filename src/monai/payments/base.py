@@ -48,7 +48,8 @@ def _resolve_proxy_url(explicit_url: str = "", allow_direct: bool = False) -> st
             return url
     except Exception:
         pass
-    if not allow_direct and not _proxy_warning_emitted:
+    if not allow_direct:
+        # Log every occurrence (not just first) to ensure visibility
         logger.critical(
             "SECURITY: No proxy available for payment provider — direct connection "
             "will expose creator's real IP. Configure Tor or a proxy ASAP."

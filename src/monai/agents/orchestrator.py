@@ -357,6 +357,18 @@ class Orchestrator(BaseAgent):
         # Phase 6.5: Self-improvement — analyze and improve agents
         cycle_result["self_improvement"] = self._run_self_improvement()
 
+        # Phase 6.55: Evaluate running A/B experiments
+        try:
+            experiment_results = self.self_improver.tick_experiments()
+            if experiment_results:
+                cycle_result["experiments"] = experiment_results
+                self.log_action(
+                    "experiments_evaluated",
+                    json.dumps(experiment_results, default=str)[:500],
+                )
+        except Exception as e:
+            logger.warning(f"Experiment evaluation failed: {e}")
+
         # Phase 6.6: Finance + Research + Marketing + Social + Web teams (parallelized)
         team_results = self._run_teams_parallel()
         cycle_result["finance_analysis"] = team_results.get("finance", {})
@@ -1425,9 +1437,32 @@ class Orchestrator(BaseAgent):
             return {"status": "skipped", "reason": "not_improvement_cycle"}
 
         results = {}
+
+        # Record real metrics from strategy results (previous cycle)
+        strategy_results = getattr(self, "_last_strategy_results", {})
         for name, agent in self._strategy_agents.items():
-            # Record basic metrics
-            self.self_improver.record_metric(name, self._cycle, "cycle_reached", self._cycle)
+            # Record execution outcome from previous cycle
+            sr = strategy_results.get(name, {})
+            success = 1.0 if sr.get("status") == "ok" else 0.0
+            self.self_improver.record_metric(name, self._cycle, "execution_success", success)
+
+            # Record revenue metrics from finance data
+            try:
+                pnl = self.finance.get_strategy_pnl()
+                for s in pnl:
+                    if s.get("name") == name:
+                        self.self_improver.record_metric(
+                            name, self._cycle, "revenue", s.get("revenue", 0.0),
+                        )
+                        self.self_improver.record_metric(
+                            name, self._cycle, "expenses", s.get("expenses", 0.0),
+                        )
+                        rev, exp = s.get("revenue", 0), s.get("expenses", 0)
+                        roi = rev / exp if exp > 0 else 0.0
+                        self.self_improver.record_metric(name, self._cycle, "roi", roi)
+                        break
+            except Exception:
+                pass  # Finance data may not be available yet
 
             # Generate improvements if enough data
             analysis = self.self_improver.analyze_performance(name)
@@ -1713,9 +1748,12 @@ class Orchestrator(BaseAgent):
             return {"status": "error", "error": str(e)}
 
     def _run_strategies(self) -> dict[str, Any]:
+        import concurrent.futures
+
         results = {}
         active = self.db.execute("SELECT name FROM strategies WHERE status = 'active'")
         active_names = {r["name"] for r in active}
+        strategy_timeout = 300  # 5 minutes max per strategy
 
         for name, agent in self._strategy_agents.items():
             if name in active_names:
@@ -1725,7 +1763,10 @@ class Orchestrator(BaseAgent):
                     continue
                 t0 = datetime.now()
                 try:
-                    result = agent.run()
+                    # Run with timeout to prevent hung strategies from freezing daemon
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        future = pool.submit(agent.run)
+                        result = future.result(timeout=strategy_timeout)
                     duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
                     results[name] = {"status": "ok", "result": result}
                     # Share success insights
@@ -1739,6 +1780,13 @@ class Orchestrator(BaseAgent):
                     self.task_router.update_performance(
                         name, "strategy_execution", True, duration_ms,
                     )
+                except concurrent.futures.TimeoutError:
+                    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+                    logger.error(f"Strategy {name} timed out after {strategy_timeout}s")
+                    results[name] = {"status": "timeout", "error": f"Exceeded {strategy_timeout}s"}
+                    self.task_router.update_performance(
+                        name, "strategy_execution", False, duration_ms,
+                    )
                 except Exception as e:
                     duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
                     logger.error(f"Strategy {name} failed: {e}")
@@ -1749,4 +1797,7 @@ class Orchestrator(BaseAgent):
                     self.task_router.update_performance(
                         name, "strategy_execution", False, duration_ms,
                     )
+
+        # Store results for next cycle's metrics recording
+        self._last_strategy_results = results
         return results

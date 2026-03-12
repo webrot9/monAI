@@ -45,7 +45,15 @@ class Browser:
         self._playwright = await async_playwright().start()
 
         # Launch with proxy — all traffic routed through Tor/SOCKS5
-        launch_args = {"headless": self.headless}
+        launch_args = {
+            "headless": self.headless,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=WebGLDraftExtensions",
+                "--disable-webgl",
+                "--disable-webgl2",
+            ],
+        }
         proxy_config = self._anonymizer.get_browser_proxy()
         if proxy_config:
             launch_args["proxy"] = proxy_config
@@ -65,7 +73,7 @@ class Browser:
             permissions=[],  # Block all permissions (geolocation, notifications, etc.)
         )
 
-        # Inject anti-fingerprinting scripts
+        # Inject anti-fingerprinting and anti-headless-detection scripts
         await self._context.add_init_script("""
             // Disable WebRTC to prevent real IP leak via STUN/TURN
             Object.defineProperty(navigator, 'mediaDevices', { get: () => undefined });
@@ -77,6 +85,25 @@ class Browser:
             Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
             Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
             Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+            // Anti-headless detection: spoof chrome.runtime
+            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+            // Spoof webdriver flag
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            // Spoof plugins (headless has 0 plugins)
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+            // Spoof languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+            // Disable WebGL fingerprinting
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(param) {
+                if (param === 37445) return 'Intel Inc.';
+                if (param === 37446) return 'Intel Iris OpenGL Engine';
+                return getParameter.call(this, param);
+            };
             // Prevent canvas fingerprinting
             const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
             HTMLCanvasElement.prototype.toDataURL = function(type) {
@@ -297,7 +324,15 @@ class Browser:
             from playwright.async_api import async_playwright
             self._playwright = await async_playwright().start()
 
-        launch_args = {"headless": self.headless}
+        launch_args = {
+            "headless": self.headless,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=WebGLDraftExtensions",
+                "--disable-webgl",
+                "--disable-webgl2",
+            ],
+        }
         if proxy_url:
             launch_args["proxy"] = {"server": proxy_url}
         self._browser = await self._playwright.chromium.launch(**launch_args)
@@ -313,7 +348,7 @@ class Browser:
             permissions=[],
         )
 
-        # Re-inject anti-fingerprinting scripts
+        # Re-inject anti-fingerprinting and anti-headless-detection scripts
         await self._context.add_init_script("""
             Object.defineProperty(navigator, 'mediaDevices', { get: () => undefined });
             window.RTCPeerConnection = undefined;
@@ -323,6 +358,16 @@ class Browser:
             Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
             Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
             Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(param) {
+                if (param === 37445) return 'Intel Inc.';
+                if (param === 37446) return 'Intel Iris OpenGL Engine';
+                return getParameter.call(this, param);
+            };
             const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
             HTMLCanvasElement.prototype.toDataURL = function(type) {
                 const ctx = this.getContext('2d');

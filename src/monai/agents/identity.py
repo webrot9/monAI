@@ -77,14 +77,29 @@ class IdentityManager:
             )
             logger.info(f"Created base identity: {identity['name']}")
 
-    def _generate_identity(self) -> dict[str, Any]:
-        """Use LLM to generate a professional business identity."""
+    def _generate_identity(self, platform: str = "") -> dict[str, Any]:
+        """Use LLM to generate a professional business identity.
+
+        Each platform gets a UNIQUE identity to prevent cross-platform
+        correlation.  The base identity is used only as an internal
+        reference.
+        """
+        platform_hint = ""
+        if platform:
+            platform_hint = (
+                f" This identity is specifically for the '{platform}' platform. "
+                "It must be COMPLETELY DIFFERENT from identities used on other "
+                "platforms — different company name, different username, different "
+                "description. No overlap."
+            )
+
         result = self.llm.quick_json(
-            "Generate a professional business identity for an AI-powered digital services company. "
+            "Generate a professional business identity for a digital services company. "
+            "The name must be unique and creative — NOT generic like 'Digital Solutions'. "
             "Return JSON: {\"name\": str (company name, professional sounding), "
             "\"tagline\": str, \"description\": str (what the company does), "
-            "\"preferred_username\": str (lowercase, no spaces), "
-            "\"business_type\": str}"
+            "\"preferred_username\": str (lowercase, no spaces, unique random suffix), "
+            "\"business_type\": str}" + platform_hint
         )
         return result
 
@@ -121,13 +136,27 @@ class IdentityManager:
 
     def store_account(self, platform: str, identifier: str,
                       credentials: dict | None = None, metadata: dict | None = None) -> int:
-        """Store a new platform account with encrypted credentials."""
+        """Store a new platform account with encrypted credentials.
+
+        Each platform account gets a unique identity to prevent
+        cross-platform correlation.
+        """
+        # Generate a platform-specific identity if metadata doesn't already include one
+        if metadata is None:
+            metadata = {}
+        if "platform_identity" not in metadata:
+            try:
+                platform_identity = self._generate_identity(platform=platform)
+                metadata["platform_identity"] = platform_identity
+            except Exception as e:
+                logger.warning(f"Could not generate platform identity for {platform}: {e}")
+
         return self.db.execute_insert(
             "INSERT INTO identities (type, platform, identifier, credentials, metadata) "
             "VALUES ('platform_account', ?, ?, ?, ?)",
             (platform, identifier,
              self._encrypt_credentials(credentials),
-             json.dumps(metadata) if metadata else None),
+             json.dumps(metadata)),
         )
 
     def get_account(self, platform: str) -> dict[str, Any] | None:
@@ -205,10 +234,14 @@ class IdentityManager:
         return "".join(secrets.choice(chars) for _ in range(length))
 
     def generate_email_alias(self, base_domain: str = "") -> str:
-        """Generate a unique email alias for platform registrations."""
-        identity = self.get_identity()
-        username = identity.get("preferred_username", "monai")
-        suffix = secrets.token_hex(4)
+        """Generate a unique email alias for platform registrations.
+
+        Uses fully random usernames to prevent cross-platform correlation.
+        """
+        # Random username — no connection to base identity
+        prefix = secrets.token_hex(3)  # 6 random hex chars
+        word = secrets.choice(["dev", "team", "ops", "lab", "hub", "net", "pro", "app"])
+        username = f"{word}{prefix}"
         if base_domain:
-            return f"{username}+{suffix}@{base_domain}"
-        return f"{username}.{suffix}"
+            return f"{username}@{base_domain}"
+        return username

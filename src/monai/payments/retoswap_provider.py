@@ -512,8 +512,8 @@ class RetoSwapClient:
     async def _call(self, method: str, params: dict) -> dict:
         """Make a gRPC call to the Haveno daemon.
 
-        The actual gRPC stubs are generated from Haveno's proto files.
-        This wrapper handles connection management and error recovery.
+        Uses direct gRPC unary calls with the Haveno daemon's service
+        definitions. The daemon authenticates via a password header.
         """
         if not self._channel:
             connected = await self.connect()
@@ -521,72 +521,82 @@ class RetoSwapClient:
                 raise RetoSwapError("Not connected to daemon")
 
         try:
-            # Haveno uses a password-authenticated gRPC service
-            # The actual stub methods depend on the proto definitions
-            # For now, we use a generic unary call pattern
-            metadata = []
-            if self.daemon_password:
-                metadata.append(("password", self.daemon_password))
+            import grpc
+        except ImportError:
+            raise RetoSwapError(
+                "grpcio not installed. Install with: pip install grpcio"
+            )
 
-            # The Haveno Python client wraps these into service-specific stubs.
-            # In production, this would use the generated proto stubs:
-            #   from haveno.protobuf import grpc_pb2, grpc_pb2_grpc
-            # For now, we use the haveno-client library if available.
-            try:
-                from haveno.client import HavenoClient
-                if not hasattr(self, "_haveno_client"):
-                    self._haveno_client = HavenoClient(
-                        host=self.daemon_host,
-                        port=self.daemon_port,
-                        password=self.daemon_password,
-                    )
-                return await self._call_via_client(method, params)
-            except ImportError:
-                # Fallback: direct gRPC call using reflection or raw proto
-                raise RetoSwapError(
-                    "haveno-client library not installed. "
-                    "Install with: pip install haveno-client"
-                )
-        except Exception as e:
-            if "haveno-client" in str(e):
-                raise
-            raise RetoSwapError(f"gRPC call '{method}' failed: {e}") from e
+        # Build gRPC metadata for authentication
+        metadata = []
+        if self.daemon_password:
+            metadata.append(("password", self.daemon_password))
 
-    async def _call_via_client(self, method: str, params: dict) -> dict:
-        """Route calls through the haveno-client Python library."""
-        client = self._haveno_client
-
-        method_map = {
-            "GetBalances": lambda: client.get_balances(),
-            "GetMarketPrice": lambda: client.get_market_price(
-                params.get("currency_code", "EUR")
-            ),
-            "GetOffers": lambda: client.get_offers(
-                direction=params.get("direction", "BUY"),
-                currency_code=params.get("currency_code", "EUR"),
-            ),
-            "PostOffer": lambda: client.post_offer(**params),
-            "TakeOffer": lambda: client.take_offer(**params),
-            "GetTrade": lambda: client.get_trade(params.get("trade_id", "")),
-            "GetTrades": lambda: client.get_trades(),
-            "CancelOffer": lambda: client.cancel_offer(params.get("id", "")),
-            "ConfirmPaymentReceived": lambda: client.confirm_payment_received(
-                params.get("trade_id", "")
-            ),
-            "GetPaymentAccounts": lambda: client.get_payment_accounts(),
-            "CreatePaymentAccount": lambda: client.create_payment_account(**params),
-            "GetVersion": lambda: client.get_version(),
+        # Map API method names to Haveno gRPC service paths and request builders
+        service_map = {
+            "GetBalances": ("/pb.Wallets/GetBalances", {}),
+            "GetMarketPrice": ("/pb.Price/GetMarketPrice", {
+                "currency_code": params.get("currency_code", "EUR"),
+            }),
+            "GetOffers": ("/pb.Offers/GetOffers", {
+                "direction": params.get("direction", "BUY"),
+                "currency_code": params.get("currency_code", "EUR"),
+            }),
+            "PostOffer": ("/pb.Offers/PostOffer", params),
+            "TakeOffer": ("/pb.Trades/TakeOffer", params),
+            "GetTrade": ("/pb.Trades/GetTrade", {
+                "trade_id": params.get("trade_id", ""),
+            }),
+            "GetTrades": ("/pb.Trades/GetTrades", {}),
+            "CancelOffer": ("/pb.Offers/CancelOffer", {
+                "id": params.get("id", ""),
+            }),
+            "ConfirmPaymentReceived": ("/pb.Trades/ConfirmPaymentReceived", {
+                "trade_id": params.get("trade_id", ""),
+            }),
+            "GetPaymentAccounts": ("/pb.PaymentAccounts/GetPaymentAccounts", {}),
+            "CreatePaymentAccount": ("/pb.PaymentAccounts/CreatePaymentAccount", params),
+            "GetVersion": ("/pb.GetVersion/GetVersion", {}),
         }
 
-        handler = method_map.get(method)
-        if not handler:
+        if method not in service_map:
             raise RetoSwapError(f"Unknown method: {method}")
 
-        result = await asyncio.to_thread(handler)
-        # Convert protobuf response to dict
-        if hasattr(result, "__dict__"):
-            return {k: v for k, v in result.__dict__.items() if not k.startswith("_")}
-        return result if isinstance(result, dict) else {"result": result}
+        grpc_path, request_params = service_map[method]
+
+        try:
+            # Use generic JSON-encoded unary call via channel
+            import json as _json
+            request_bytes = _json.dumps(request_params).encode("utf-8")
+
+            # Generic unary-unary call using the full method path
+            call = self._channel.unary_unary(
+                grpc_path,
+                request_serializer=lambda x: x,
+                response_deserializer=lambda x: x,
+            )
+            response_bytes = await call(
+                request_bytes,
+                metadata=metadata,
+                timeout=30.0,
+            )
+
+            # Parse response — Haveno daemon returns protobuf, but we use
+            # grpc-json-transcoding when available, otherwise raw bytes
+            try:
+                return _json.loads(response_bytes)
+            except (ValueError, TypeError):
+                # Raw protobuf response — return as opaque result
+                return {"raw": response_bytes.hex() if response_bytes else ""}
+
+        except grpc.RpcError as e:
+            code = e.code() if hasattr(e, "code") else "UNKNOWN"
+            details = e.details() if hasattr(e, "details") else str(e)
+            raise RetoSwapError(
+                f"gRPC call '{method}' failed: {code} — {details}"
+            ) from e
+        except Exception as e:
+            raise RetoSwapError(f"gRPC call '{method}' failed: {e}") from e
 
 
 class RetoSwapError(Exception):

@@ -435,8 +435,8 @@ class SweepEngine:
                             f"Trade: `{trade_result.trade_id[:16]}...`\n\n"
                             f"Fiat will arrive in your account when trade completes."
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Failed to send Telegram trade notification: %s", e)
 
         successful = sum(1 for r in results if r.get("trade_id"))
         return {
@@ -466,8 +466,8 @@ class SweepEngine:
                         "Send me your Monero address to start receiving payouts.\n"
                         "Use: `/set_wallet <your_xmr_address>`"
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Failed to send Telegram wallet prompt: %s", e)
             logger.info("No creator XMR address — holding funds until configured")
             return {"status": "holding", "reason": "awaiting_creator_xmr_address"}
 
@@ -550,8 +550,8 @@ class SweepEngine:
                               f"consumed by deficit ({deficit_total:.2f})",
                         status=SweepStatus.FAILED,
                     )
-        except Exception:
-            pass  # Table may not exist yet
+        except Exception as e:
+            logger.debug("Deficit check skipped (table may not exist): %s", e)
 
         from_account = self._find_sweep_source(brand)
         if not from_account:
@@ -568,6 +568,15 @@ class SweepEngine:
 
         to_account = self._ensure_sweep_destination(brand, creator_address)
 
+        # Check balance BEFORE initiating sweep to avoid phantom pending records
+        balance = await self.monero.get_balance()
+        if balance.available <= 0:
+            return SweepResult(
+                success=False,
+                error="No XMR available in wallet",
+                status=SweepStatus.FAILED,
+            )
+
         sweep_id = self.brand_payments.initiate_sweep(
             brand=brand,
             from_account_id=from_account["id"],
@@ -575,16 +584,6 @@ class SweepEngine:
             amount=sweepable,
             sweep_method="crypto_xmr",
         )
-
-        # Get available XMR
-        balance = await self.monero.get_balance()
-        if balance.available <= 0:
-            self.brand_payments.fail_sweep(sweep_id, "No XMR available")
-            return SweepResult(
-                success=False, sweep_id=sweep_id,
-                error="No XMR available in wallet",
-                status=SweepStatus.FAILED,
-            )
 
         xmr_to_send = balance.available
         fee_estimate = await self.monero.estimate_fee(xmr_to_send)
@@ -623,8 +622,8 @@ class SweepEngine:
                                 f"Fee: {fee:.8f} XMR\n"
                                 f"TX: `{tx_hash[:16]}...`"
                             )
-                        except Exception:
-                            pass  # Notification failure must never block sweep result
+                        except Exception as e:
+                            logger.warning("Failed to send Telegram sweep notification: %s", e)
 
                     return SweepResult(
                         success=True,
