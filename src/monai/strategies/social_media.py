@@ -76,6 +76,12 @@ class SocialMediaAgent(BaseAgent):
         if stats.get("onboarding", 0) > 0:
             return ["create_content_batch"]
         if stats.get("active", 0) > 0:
+            # Check for draft posts needing review
+            drafts = self.db.execute(
+                "SELECT COUNT(*) as c FROM social_posts WHERE status = 'draft'"
+            )
+            if drafts and drafts[0]["c"] > 0:
+                return ["review_posts"]
             return ["create_content_batch"]
 
         # All clients churned — find new ones
@@ -91,6 +97,8 @@ class SocialMediaAgent(BaseAgent):
                 results["prospecting"] = self._find_clients()
             elif step == "create_content_batch":
                 results["content"] = self._create_content_batch()
+            elif step == "review_posts":
+                results["review"] = self._review_posts()
             elif step == "analyze_engagement":
                 results["engagement"] = self._analyze_engagement()
             elif step == "report_to_clients":
@@ -273,6 +281,45 @@ class SocialMediaAgent(BaseAgent):
             "posts_published": total_posted,
             "clients_served": len(clients),
         }
+
+    def _review_posts(self) -> dict[str, Any]:
+        """Quality gate: review draft posts via Humanizer before posting."""
+        drafts = self.db.execute(
+            "SELECT sp.*, sc.client_name, sc.industry FROM social_posts sp "
+            "JOIN smm_clients sc ON sp.client_id = sc.id "
+            "WHERE sp.status = 'draft' LIMIT 5"
+        )
+        reviewed = 0
+        for post in drafts:
+            p = dict(post)
+            product_data = {
+                "spec": {"title": f"{p['platform']} post for {p['client_name']}"},
+                "content": [{"section": "post", "content": p["content"]}],
+            }
+
+            result = self.reviewer.review_product(
+                strategy=self.name,
+                product_name=f"{p['platform']}_post_{p['id']}",
+                product_data=product_data,
+                product_type="content",
+            )
+
+            if result.verdict == "rejected":
+                self.db.execute(
+                    "DELETE FROM social_posts WHERE id = ?", (p["id"],),
+                )
+                self.log_action("post_rejected", f"Post {p['id']} for {p['client_name']}: REJECTED")
+            else:
+                new_content = p["content"]
+                if result.improved_content.get("humanized"):
+                    new_content = result.improved_content["humanized"]
+                self.db.execute(
+                    "UPDATE social_posts SET status = 'approved', content = ? WHERE id = ?",
+                    (new_content, p["id"]),
+                )
+                reviewed += 1
+
+        return {"reviewed": reviewed}
 
     def _analyze_engagement(self) -> dict[str, Any]:
         """Analyze engagement metrics for posted content."""

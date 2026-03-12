@@ -31,6 +31,7 @@ from monai.agents.api_provisioner import APIProvisioner
 from monai.agents.llc_provisioner import LLCProvisioner
 from monai.agents.phone_provisioner import PhoneProvisioner
 from monai.agents.provisioner import Provisioner
+from monai.agents.product_iterator import ProductIterator
 from monai.agents.self_improve import SelfImprover
 from monai.agents.spawner import AgentSpawner
 from monai.business.brand_payments import BrandPayments
@@ -87,6 +88,7 @@ class Orchestrator(BaseAgent):
         self.telegram = TelegramBot(config, db)
         self.ethics_tester = EthicsTester(config, db, llm)
         self.self_improver = SelfImprover(config, db, llm, memory=self.memory)
+        self.product_iterator = ProductIterator(config, db, llm)
         self.legal = LegalAdvisorFactory(config, db, llm)
         self.collab = CollaborationHub(config, db)
         self.eng_team = EngineeringTeam(config, db, llm)
@@ -368,6 +370,9 @@ class Orchestrator(BaseAgent):
                 )
         except Exception as e:
             logger.warning(f"Experiment evaluation failed: {e}")
+
+        # Phase 6.58: Product iteration — improve underperforming products
+        cycle_result["product_iteration"] = self._run_product_iteration()
 
         # Phase 6.6: Finance + Research + Marketing + Social + Web teams (parallelized)
         team_results = self._run_teams_parallel()
@@ -1485,6 +1490,34 @@ class Orchestrator(BaseAgent):
             )
 
         return results
+
+    def _run_product_iteration(self) -> dict[str, Any]:
+        """Analyze product performance and trigger improvement cycles."""
+        # Only run every 5 cycles to avoid excessive API costs
+        if self._cycle % 5 != 0:
+            return {"status": "skipped", "reason": "not_iteration_cycle"}
+
+        try:
+            result = self.product_iterator.run()
+
+            # Feed pending improvements back to strategy agents
+            for name, agent in self._strategy_agents.items():
+                pending = self.product_iterator.get_pending_improvements(name)
+                if pending:
+                    self.log_action(
+                        "product_improvements_pending",
+                        f"{name}: {len(pending)} improvement(s) queued",
+                    )
+                    # Mark as applied — the strategy will pick up review feedback
+                    # on its next cycle via the product_reviews table
+                    for p in pending:
+                        self.product_iterator.mark_applied(p["id"])
+
+            self.log_action("product_iteration", json.dumps(result, default=str)[:500])
+            return result
+        except Exception as e:
+            logger.error(f"Product iteration failed: {e}")
+            return {"status": "error", "error": str(e)}
 
     def _run_engineering_team(self) -> dict[str, Any]:
         """Run the engineering team to fix bugs and improve the system."""

@@ -49,6 +49,8 @@ class AffiliateAgent(BaseAgent):
         if statuses.get("researched", 0) > 0:
             return ["write_review"]
         if statuses.get("draft", 0) > 0:
+            return ["review_content"]
+        if statuses.get("reviewed", 0) > 0:
             return ["write_comparison"]  # Create more content types
 
         # All content published — research new programs
@@ -66,6 +68,8 @@ class AffiliateAgent(BaseAgent):
                 results["products"] = self._research_products()
             elif step == "write_review":
                 results["review"] = self._write_review()
+            elif step == "review_content":
+                results["content_review"] = self._review_content()
             elif step == "write_comparison":
                 results["comparison"] = self._write_comparison()
 
@@ -265,6 +269,48 @@ class AffiliateAgent(BaseAgent):
 
         self.log_action("review_written", product)
         return {"product": product, "sections": len(parts)}
+
+    def _review_content(self) -> dict[str, Any]:
+        """Quality gate: review draft content before publishing."""
+        for path in self.content_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("status") != "draft":
+                continue
+
+            name = data.get("target", {}).get("product_name",
+                   data.get("target", {}).get("title", path.stem))
+
+            result = self.reviewer.review_product(
+                strategy=self.name,
+                product_name=name,
+                product_data=data,
+                product_type="content",
+            )
+
+            if result.verdict == "approved":
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("content_reviewed", f"{name}: APPROVED")
+            elif result.verdict == "rejected":
+                data["status"] = "researched"
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("content_rejected", f"{name}: REJECTED")
+            else:
+                revised = self.reviewer.revise_product(data, result, "content")
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                data["revised_content"] = revised
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("content_revised", f"{name}: REVISED")
+
+            return result.to_dict()
+
+        return {"status": "no_content_to_review"}
 
     def _write_comparison(self) -> dict[str, Any]:
         """Write a product comparison (e.g., 'X vs Y vs Z')."""

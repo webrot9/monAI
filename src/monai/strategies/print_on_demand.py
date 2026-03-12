@@ -63,6 +63,8 @@ class PrintOnDemandAgent(BaseAgent):
         if stats.get("concept", 0) > 0:
             return ["generate_design_concepts"]
         if stats.get("designed", 0) > 0:
+            return ["review_design"]
+        if stats.get("reviewed", 0) > 0:
             return ["create_listings"]
         if stats.get("listed", 0) > 0:
             return ["optimize_tags"]
@@ -82,6 +84,8 @@ class PrintOnDemandAgent(BaseAgent):
                 results["niches"] = self._research_niches()
             elif step == "generate_design_concepts":
                 results["concepts"] = self._generate_concepts()
+            elif step == "review_design":
+                results["review"] = self._review_design()
             elif step == "create_listings":
                 results["listings"] = self._create_listings()
             elif step == "find_trending":
@@ -267,6 +271,54 @@ class PrintOnDemandAgent(BaseAgent):
             "designs_generated": generated,
             "concepts": concepts.get("concepts", []),
         }
+
+    def _review_design(self) -> dict[str, Any]:
+        """Quality gate: review design listing text before publishing."""
+        designs = self.db.execute(
+            "SELECT * FROM pod_designs WHERE status = 'designed' LIMIT 1"
+        )
+        if not designs:
+            return {"status": "no_designs_to_review"}
+
+        design = dict(designs[0])
+        product_data = {
+            "spec": {
+                "title": design["title"],
+                "description": design.get("description", ""),
+                "niche": design.get("niche", ""),
+            },
+            "listing": design.get("description", ""),
+        }
+
+        result = self.reviewer.review_product(
+            strategy=self.name,
+            product_name=design["title"],
+            product_data=product_data,
+            product_type="digital_product",
+        )
+
+        if result.verdict == "approved":
+            self.db.execute(
+                "UPDATE pod_designs SET status = 'reviewed' WHERE id = ?",
+                (design["id"],),
+            )
+            self.log_action("design_reviewed", f"{design['title']}: APPROVED")
+        elif result.verdict == "rejected":
+            self.db.execute(
+                "UPDATE pod_designs SET status = 'concept' WHERE id = ?",
+                (design["id"],),
+            )
+            self.log_action("design_rejected", f"{design['title']}: REJECTED — redesign")
+        else:
+            revised = self.reviewer.revise_product(product_data, result, "digital_product")
+            revised_desc = revised.get("revised_content", design.get("description", ""))
+            self.db.execute(
+                "UPDATE pod_designs SET status = 'reviewed', description = ? WHERE id = ?",
+                (revised_desc, design["id"]),
+            )
+            self.log_action("design_revised", f"{design['title']}: REVISED")
+
+        return result.to_dict()
 
     def _create_listings(self) -> dict[str, Any]:
         """ACTUALLY create listings on POD platforms using platform_action."""
