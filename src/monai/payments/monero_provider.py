@@ -11,10 +11,12 @@ Requires a running monero-wallet-rpc instance:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -65,7 +67,9 @@ class MoneroProvider(CryptoProvider):
         if self._client is None or self._client.is_closed:
             kwargs: dict[str, Any] = {"timeout": 30.0}
             from monai.payments.base import _resolve_proxy_url
-            proxy = _resolve_proxy_url(self.proxy_url)
+            # Monero wallet RPC is typically local — allow direct connection
+            is_local = any(h in self.wallet_rpc_url for h in ("127.0.0.1", "localhost", "[::1]"))
+            proxy = _resolve_proxy_url(self.proxy_url, allow_direct=is_local)
             if proxy:
                 kwargs["proxy"] = proxy
             if self.rpc_user and self.rpc_password:
@@ -73,8 +77,23 @@ class MoneroProvider(CryptoProvider):
             self._client = httpx.AsyncClient(**kwargs)
         return self._client
 
+    # Per-call timeout (seconds). The httpx client has a 30s global timeout,
+    # but individual RPC calls get wrapped with asyncio.wait_for to ensure
+    # no single call blocks the sweep cycle indefinitely.
+    RPC_CALL_TIMEOUT = 30.0
+
     async def _rpc_call(self, method: str, params: dict | None = None) -> dict:
-        """Make a JSON-RPC 2.0 call to monero-wallet-rpc."""
+        """Make a JSON-RPC 2.0 call to monero-wallet-rpc with per-call timeout."""
+        try:
+            return await asyncio.wait_for(
+                self._rpc_call_inner(method, params),
+                timeout=self.RPC_CALL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise MoneroRPCError(-1, f"RPC call '{method}' timed out after {self.RPC_CALL_TIMEOUT}s")
+
+    async def _rpc_call_inner(self, method: str, params: dict | None = None) -> dict:
+        """Inner RPC call without timeout wrapper."""
         self._request_id += 1
         payload = {
             "jsonrpc": "2.0",
@@ -266,6 +285,26 @@ class MoneroProvider(CryptoProvider):
         """
         return None
 
+    @staticmethod
+    def validate_xmr_address(address: str) -> bool:
+        """Validate Monero address format before sending.
+
+        Standard addresses are 95 chars, subaddresses are 95 chars,
+        integrated addresses are 106 chars. All are base58-encoded.
+        """
+        if not address:
+            return False
+        # Must be alphanumeric base58 (no 0, O, I, l)
+        if not re.match(r'^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]+$', address):
+            return False
+        # Standard / subaddress: 95 chars; integrated: 106 chars
+        if len(address) not in (95, 106):
+            return False
+        # Standard mainnet starts with 4, subaddress with 8
+        if not address[0] in ('4', '8'):
+            return False
+        return True
+
     async def send_payout(self, to_address: str, amount: float,
                           currency: str = "XMR",
                           priority: str = "normal",
@@ -275,6 +314,15 @@ class MoneroProvider(CryptoProvider):
         This is the core sweep operation — sends XMR from the brand wallet
         to the creator's anonymous wallet.
         """
+        # Validate address format BEFORE attempting send (irreversible!)
+        if not self.validate_xmr_address(to_address):
+            return PaymentResult(
+                success=False,
+                error=f"Invalid Monero address format: {to_address[:20]}...",
+                amount=amount,
+                currency="XMR",
+            )
+
         priority_map = {
             "low": 1, "normal": 2, "elevated": 3, "priority": 4,
         }

@@ -178,20 +178,32 @@ class LemonSqueezyProvider(PaymentProvider):
         )
 
     async def get_balance(self, account_id: str = "") -> ProviderBalance:
-        """Get store revenue (LS doesn't have a balance endpoint, we sum orders)."""
+        """Get store net revenue: paid orders minus refunded orders.
+
+        LS doesn't have a balance endpoint, so we sum orders and subtract
+        refunded ones to get an accurate sweepable amount.
+        """
         try:
             result = await self._api_call(
                 "GET", f"orders",
                 {"filter[store_id]": self.store_id, "page[size]": "100"},
             )
             orders = result.get("data", [])
-            total = sum(
-                float(o.get("attributes", {}).get("total", 0)) / 100
-                for o in orders
-                if o.get("attributes", {}).get("status") == "paid"
-            )
+            paid_total = 0.0
+            refunded_total = 0.0
+            for o in orders:
+                attrs = o.get("attributes", {})
+                amount = float(attrs.get("total", 0)) / 100
+                status = attrs.get("status", "")
+                if status == "paid":
+                    paid_total += amount
+                elif status == "refunded":
+                    refunded_total += amount
+
+            net = paid_total - refunded_total
             return ProviderBalance(
-                available=total,
+                available=max(net, 0.0),
+                pending=0.0,
                 currency="USD",
                 provider=self.provider_name,
                 account_id=account_id or self.store_id,

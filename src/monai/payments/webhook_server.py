@@ -106,9 +106,10 @@ class _RateLimiter:
 class WebhookServer:
     """Async HTTP server for receiving payment webhooks."""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8420):
+    def __init__(self, host: str = "0.0.0.0", port: int = 8420, db=None):
         self.host = host
         self.port = port
+        self.db = db  # Database for dead letter queue
         self._providers: dict[str, PaymentProvider] = {}
         self._event_handlers: list[Callable[[WebhookEvent], Awaitable[None]]] = []
         self._server: asyncio.Server | None = None
@@ -263,12 +264,27 @@ class WebhookServer:
             await self._send_response(writer, 400, "Invalid webhook")
             return
 
-        # Dispatch to event handlers
+        # Dispatch to event handlers — if ANY handler fails, return 500
+        # so the payment provider retries delivery (never silently drop).
         for handler in self._event_handlers:
             try:
                 await handler(event)
             except Exception as e:
                 logger.error(f"Event handler error: {e}")
+                if _audit_trail:
+                    _audit_trail.log(
+                        "webhook_server", "payment", "handler_error",
+                        details={"provider": event.provider, "error": str(e),
+                                 "payment_ref": event.payment_ref},
+                        success=False, risk_level="critical",
+                    )
+                # Save to dead letter queue for later retry
+                self._save_to_dead_letter(
+                    provider=event.provider, raw_payload=body,
+                    headers=headers, error=str(e),
+                )
+                await self._send_response(writer, 500, f"Handler error: {e}")
+                return
 
         # Audit successful webhook
         if _audit_trail:
@@ -290,6 +306,23 @@ class WebhookServer:
         )
 
         await self._send_response(writer, 200, "OK")
+
+    def _save_to_dead_letter(self, provider: str, raw_payload: bytes,
+                             headers: dict[str, str], error: str) -> None:
+        """Save a failed webhook to the dead letter queue for later retry."""
+        if not self.db:
+            logger.warning("No DB configured — cannot save to dead letter queue")
+            return
+        try:
+            self.db.execute_insert(
+                "INSERT INTO webhook_dead_letter "
+                "(provider, raw_payload, headers, error) VALUES (?, ?, ?, ?)",
+                (provider, raw_payload.decode("utf-8", errors="replace"),
+                 json.dumps(headers), error),
+            )
+            logger.info(f"Webhook saved to dead letter queue: {provider} — {error}")
+        except Exception as e:
+            logger.error(f"Failed to save to dead letter queue: {e}")
 
     @staticmethod
     async def _send_response(writer: asyncio.StreamWriter,

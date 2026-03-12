@@ -232,9 +232,36 @@ class BTCPayProvider(PaymentProvider):
             raw=event,
         )
 
+    @staticmethod
+    def validate_btc_address(address: str) -> bool:
+        """Validate Bitcoin address format before sending.
+
+        Supports:
+        - Legacy (P2PKH): starts with 1, 25-34 chars
+        - P2SH: starts with 3, 25-34 chars
+        - Bech32 (SegWit): starts with bc1, 42-62 chars
+        """
+        import re
+        if not address:
+            return False
+        # Bech32 / Bech32m (native SegWit)
+        if address.startswith("bc1"):
+            return bool(re.match(r'^bc1[a-z0-9]{39,59}$', address))
+        # Legacy (1...) or P2SH (3...)
+        if address[0] in ('1', '3'):
+            return bool(re.match(r'^[13][a-km-zA-HJ-NP-Z1-9]{24,33}$', address))
+        return False
+
     async def send_payout(self, to_address: str, amount: float,
                           currency: str = "BTC", **kwargs: Any) -> PaymentResult:
         """Send BTC from BTCPay wallet to an address."""
+        # Validate address format BEFORE attempting send (irreversible!)
+        if not self.validate_btc_address(to_address):
+            return PaymentResult(
+                success=False,
+                error=f"Invalid Bitcoin address format: {to_address[:20]}...",
+            )
+
         try:
             # Create a transaction
             tx_data: dict[str, Any] = {

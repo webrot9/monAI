@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -47,6 +48,18 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 5  # seconds
 
+# Per-brand locks to prevent concurrent sweeps/refunds from racing
+_brand_locks: dict[str, asyncio.Lock] = {}
+_brand_locks_mutex = threading.Lock()
+
+
+def _get_brand_lock(brand: str) -> asyncio.Lock:
+    """Get or create an asyncio.Lock for a brand (thread-safe creation)."""
+    with _brand_locks_mutex:
+        if brand not in _brand_locks:
+            _brand_locks[brand] = asyncio.Lock()
+        return _brand_locks[brand]
+
 
 class SweepEngine:
     """Orchestrates profit sweeps from brand accounts to creator.
@@ -56,10 +69,14 @@ class SweepEngine:
     - Crypto mode: sends XMR from brand wallet to creator wallet
     """
 
-    def __init__(self, config: Config, db: Database):
+    # Sweeps above this EUR threshold require creator approval via Telegram
+    CONFIRMATION_THRESHOLD_EUR = 50.0
+
+    def __init__(self, config: Config, db: Database, telegram_bot=None):
         self.config = config
         self.db = db
         self.brand_payments = BrandPayments(db)
+        self.telegram_bot = telegram_bot  # TelegramBot for sweep confirmations
         self._monero = None  # Lazy-loaded only if crypto is configured
 
         # Lazy import corporate module
@@ -369,7 +386,18 @@ class SweepEngine:
 
     async def _crypto_sweep_brand(self, brand: str,
                                   amount: float | None = None) -> SweepResult:
-        """Execute a crypto sweep for a single brand."""
+        """Execute a crypto sweep for a single brand.
+
+        Acquires a per-brand lock to prevent race conditions with concurrent
+        refund webhooks modifying the same brand's balance mid-sweep.
+        """
+        lock = _get_brand_lock(brand)
+        async with lock:
+            return await self._crypto_sweep_brand_locked(brand, amount)
+
+    async def _crypto_sweep_brand_locked(self, brand: str,
+                                         amount: float | None = None) -> SweepResult:
+        """Actual sweep logic — must be called under brand lock."""
         from monai.payments.monero_provider import MoneroRPCError
 
         creator_address = self.config.creator_wallet.xmr_address
@@ -453,6 +481,29 @@ class SweepEngine:
                 error="Balance too low after fee estimate",
                 status=SweepStatus.FAILED,
             )
+
+        # Creator confirmation for sweeps above threshold
+        if sweepable >= self.CONFIRMATION_THRESHOLD_EUR and self.telegram_bot:
+            try:
+                if self.telegram_bot.is_configured:
+                    response = self.telegram_bot.ask_creator(
+                        f"Sweep request: *{xmr_to_send:.8f} XMR* "
+                        f"(~€{sweepable:.2f}) from brand `{brand}` to your wallet.\n\n"
+                        f"Fee estimate: {fee_estimate:.8f} XMR\n"
+                        f"Destination: `{creator_address[:12]}...`\n\n"
+                        f"Reply *yes* to approve or *no* to cancel.",
+                        timeout=300,  # 5 min timeout
+                    )
+                    if not response or response.strip().lower() not in ("yes", "si", "sì", "y", "ok"):
+                        self.brand_payments.fail_sweep(sweep_id, "Creator rejected sweep")
+                        return SweepResult(
+                            success=False, sweep_id=sweep_id,
+                            error=f"Creator rejected sweep (response: {response})",
+                            status=SweepStatus.FAILED,
+                        )
+                    logger.info(f"Creator approved sweep for brand {brand}")
+            except Exception as e:
+                logger.warning(f"Telegram confirmation failed, proceeding anyway: {e}")
 
         # Attempt send with retries
         last_error = ""

@@ -298,7 +298,7 @@ class TestPaymentFlowE2E:
 
     @pytest.mark.asyncio
     async def test_negative_amount_rejected_no_gl(self, manager, ledger, db):
-        """Negative webhook amounts are rejected before GL recording."""
+        """Negative webhook amounts raise ValueError (saved to DLQ by webhook server)."""
         _ensure_payment_tables(db)
 
         event = WebhookEvent(
@@ -310,7 +310,8 @@ class TestPaymentFlowE2E:
             metadata={"brand": "neg_brand"},
             raw={},
         )
-        await manager._handle_webhook_event(event)
+        with pytest.raises(ValueError, match="negative amount"):
+            await manager._handle_webhook_event(event)
 
         # No GL entries should exist
         entries = ledger.get_journal_entries(brand="neg_brand")
@@ -318,7 +319,7 @@ class TestPaymentFlowE2E:
 
     @pytest.mark.asyncio
     async def test_suspicious_amount_rejected_no_gl(self, manager, ledger, db):
-        """Amounts > €1M are rejected before GL recording."""
+        """Amounts > €1M raise ValueError (saved to DLQ by webhook server)."""
         _ensure_payment_tables(db)
 
         event = WebhookEvent(
@@ -330,7 +331,8 @@ class TestPaymentFlowE2E:
             metadata={"brand": "huge_brand"},
             raw={},
         )
-        await manager._handle_webhook_event(event)
+        with pytest.raises(ValueError, match="suspicious amount"):
+            await manager._handle_webhook_event(event)
 
         entries = ledger.get_journal_entries(brand="huge_brand")
         assert len(entries) == 0
