@@ -69,7 +69,7 @@ class SweepEngine:
     - Crypto mode: sends XMR from brand wallet to creator wallet
     """
 
-    # Sweeps above this EUR threshold require creator approval via Telegram
+    # Sweeps above this EUR threshold trigger a Telegram notification to creator
     CONFIRMATION_THRESHOLD_EUR = 50.0
 
     def __init__(self, config: Config, db: Database, telegram_bot=None):
@@ -482,29 +482,6 @@ class SweepEngine:
                 status=SweepStatus.FAILED,
             )
 
-        # Creator confirmation for sweeps above threshold
-        if sweepable >= self.CONFIRMATION_THRESHOLD_EUR and self.telegram_bot:
-            try:
-                if self.telegram_bot.is_configured:
-                    response = self.telegram_bot.ask_creator(
-                        f"Sweep request: *{xmr_to_send:.8f} XMR* "
-                        f"(~€{sweepable:.2f}) from brand `{brand}` to your wallet.\n\n"
-                        f"Fee estimate: {fee_estimate:.8f} XMR\n"
-                        f"Destination: `{creator_address[:12]}...`\n\n"
-                        f"Reply *yes* to approve or *no* to cancel.",
-                        timeout=300,  # 5 min timeout
-                    )
-                    if not response or response.strip().lower() not in ("yes", "si", "sì", "y", "ok"):
-                        self.brand_payments.fail_sweep(sweep_id, "Creator rejected sweep")
-                        return SweepResult(
-                            success=False, sweep_id=sweep_id,
-                            error=f"Creator rejected sweep (response: {response})",
-                            status=SweepStatus.FAILED,
-                        )
-                    logger.info(f"Creator approved sweep for brand {brand}")
-            except Exception as e:
-                logger.warning(f"Telegram confirmation failed, proceeding anyway: {e}")
-
         # Attempt send with retries
         last_error = ""
         for attempt in range(MAX_RETRIES):
@@ -519,6 +496,19 @@ class SweepEngine:
                     tx_hash = result.payment_ref
                     fee = result.raw.get("fee", 0)
                     self.brand_payments.complete_sweep(sweep_id, tx_reference=tx_hash)
+
+                    # Notify creator (non-blocking — sweep already done)
+                    if self.telegram_bot and sweepable >= self.CONFIRMATION_THRESHOLD_EUR:
+                        try:
+                            self.telegram_bot.notify_creator(
+                                f"💰 *Sweep completed*\n\n"
+                                f"Brand: `{brand}`\n"
+                                f"Amount: {xmr_to_send:.8f} XMR (~€{sweepable:.2f})\n"
+                                f"Fee: {fee:.8f} XMR\n"
+                                f"TX: `{tx_hash[:16]}...`"
+                            )
+                        except Exception:
+                            pass  # Notification failure must never block sweep result
 
                     return SweepResult(
                         success=True,
