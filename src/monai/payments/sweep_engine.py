@@ -435,8 +435,8 @@ class SweepEngine:
                             f"Trade: `{trade_result.trade_id[:16]}...`\n\n"
                             f"Fiat will arrive in your account when trade completes."
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Failed to send Telegram trade notification: %s", e)
 
         successful = sum(1 for r in results if r.get("trade_id"))
         return {
@@ -466,8 +466,8 @@ class SweepEngine:
                         "Send me your Monero address to start receiving payouts.\n"
                         "Use: `/set_wallet <your_xmr_address>`"
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Failed to send Telegram wallet prompt: %s", e)
             logger.info("No creator XMR address — holding funds until configured")
             return {"status": "holding", "reason": "awaiting_creator_xmr_address"}
 
@@ -550,8 +550,8 @@ class SweepEngine:
                               f"consumed by deficit ({deficit_total:.2f})",
                         status=SweepStatus.FAILED,
                     )
-        except Exception:
-            pass  # Table may not exist yet
+        except Exception as e:
+            logger.debug("Deficit check skipped (table may not exist): %s", e)
 
         from_account = self._find_sweep_source(brand)
         if not from_account:
@@ -622,8 +622,8 @@ class SweepEngine:
                                 f"Fee: {fee:.8f} XMR\n"
                                 f"TX: `{tx_hash[:16]}...`"
                             )
-                        except Exception:
-                            pass  # Notification failure must never block sweep result
+                        except Exception as e:
+                            logger.warning("Failed to send Telegram sweep notification: %s", e)
 
                     return SweepResult(
                         success=True,
