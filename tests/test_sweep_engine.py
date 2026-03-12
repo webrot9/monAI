@@ -21,6 +21,7 @@ def mock_config():
     config.monero.rpc_password = ""
     config.monero.proxy_url = ""
     config.llc.enabled = False
+    config.retoswap.enabled = False  # No RetoSwap by default
     return config
 
 

@@ -118,6 +118,23 @@ class CommsConfig:
 
 
 @dataclass
+class RetoSwapConfig:
+    """RetoSwap/Haveno P2P exchange for XMR→fiat conversion (optional).
+
+    Enables automatic conversion of Monero to EUR/cash via decentralized
+    P2P trading. No KYC. Requires Haveno daemon running locally.
+    """
+    enabled: bool = False
+    daemon_host: str = "127.0.0.1"
+    daemon_port: int = 9999
+    daemon_password: str = ""
+    preferred_payment_method: str = "SEPA"  # SEPA, REVOLUT, WISE, CASH_BY_MAIL
+    preferred_currency: str = "EUR"
+    price_margin_pct: float = -1.0  # Sell 1% below market for faster fills
+    auto_confirm_fiat: bool = False  # Auto-confirm fiat receipt (risky, verify manually)
+
+
+@dataclass
 class CreatorWalletConfig:
     """Creator's crypto wallets — optional, only for crypto flow."""
     xmr_address: str = ""
@@ -223,6 +240,7 @@ class Config:
     privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     creator_wallet: CreatorWalletConfig = field(default_factory=CreatorWalletConfig)
+    retoswap: RetoSwapConfig = field(default_factory=RetoSwapConfig)
     llc: LLCConfig = field(default_factory=LLCConfig)
     bootstrap_wallet: BootstrapWalletConfig = field(default_factory=BootstrapWalletConfig)
     monero: MoneroConfig = field(default_factory=MoneroConfig)
@@ -255,6 +273,8 @@ class Config:
                 config.telegram = TelegramConfig(**data["telegram"])
             if "creator_wallet" in data:
                 config.creator_wallet = CreatorWalletConfig(**data["creator_wallet"])
+            if "retoswap" in data:
+                config.retoswap = RetoSwapConfig(**data["retoswap"])
             if "llc" in data:
                 config.llc = LLCConfig(**data["llc"])
             if "bootstrap_wallet" in data:
@@ -360,6 +380,15 @@ class Config:
                 "sweep_interval_hours": self.creator_wallet.sweep_interval_hours,
                 "min_confirmations_xmr": self.creator_wallet.min_confirmations_xmr,
                 "min_confirmations_btc": self.creator_wallet.min_confirmations_btc,
+            },
+            "retoswap": {
+                "enabled": self.retoswap.enabled,
+                "daemon_host": self.retoswap.daemon_host,
+                "daemon_port": self.retoswap.daemon_port,
+                "preferred_payment_method": self.retoswap.preferred_payment_method,
+                "preferred_currency": self.retoswap.preferred_currency,
+                "price_margin_pct": self.retoswap.price_margin_pct,
+                "auto_confirm_fiat": self.retoswap.auto_confirm_fiat,
             },
             "monero": {
                 "wallet_rpc_url": self.monero.wallet_rpc_url,

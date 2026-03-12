@@ -102,6 +102,22 @@ class SweepEngine:
             )
         return self._monero
 
+    @property
+    def retoswap(self):
+        if not hasattr(self, "_retoswap") or self._retoswap is None:
+            self._retoswap = None
+            if getattr(self.config, "retoswap", None) and self.config.retoswap.enabled:
+                from monai.payments.retoswap_provider import RetoSwapClient
+                self._retoswap = RetoSwapClient(
+                    daemon_host=self.config.retoswap.daemon_host,
+                    daemon_port=self.config.retoswap.daemon_port,
+                    daemon_password=self.config.retoswap.daemon_password,
+                    preferred_payment_method=self.config.retoswap.preferred_payment_method,
+                    preferred_currency=self.config.retoswap.preferred_currency,
+                    price_margin_pct=self.config.retoswap.price_margin_pct,
+                )
+        return self._retoswap
+
     def get_active_flow(self) -> str:
         """Determine which payout flow is active."""
         # LLC mode is primary if configured
@@ -111,7 +127,11 @@ class SweepEngine:
             if contractor:
                 return "llc_contractor"
 
-        # Crypto fallback
+        # RetoSwap: XMR → fiat via P2P exchange (no KYC, anonymous cash-out)
+        if getattr(self.config, "retoswap", None) and self.config.retoswap.enabled:
+            return "crypto_retoswap"
+
+        # Direct XMR transfer to creator wallet
         if self.config.creator_wallet.xmr_address:
             return "crypto_xmr"
 
@@ -161,13 +181,15 @@ class SweepEngine:
 
         if flow == "llc_contractor":
             return await self._run_llc_sweep_cycle()
+        elif flow == "crypto_retoswap":
+            return await self._run_retoswap_sweep_cycle()
         elif flow == "crypto_xmr":
             return await self._run_crypto_sweep_cycle()
         else:
             return {
                 "status": "skipped",
                 "reason": "no_payout_method_configured",
-                "hint": "Configure LLC entity + contractor, or set creator_wallet.xmr_address",
+                "hint": "Configure LLC, RetoSwap, or set creator_wallet.xmr_address",
             }
 
     async def _run_llc_sweep_cycle(self) -> dict[str, Any]:
@@ -341,6 +363,83 @@ class SweepEngine:
         )
 
     # ── Crypto Flow (Monero) ───────────────────────────────────
+
+    async def _run_retoswap_sweep_cycle(self) -> dict[str, Any]:
+        """RetoSwap flow: sell XMR on P2P exchange for fiat (EUR/cash).
+
+        Flow: Brand XMR wallet → RetoSwap P2P trade → fiat to creator's bank/PayPal.
+        No KYC. Fully decentralized via Haveno protocol.
+        """
+        if not self.monero:
+            return {"status": "error", "reason": "monero_not_configured"}
+        if not self.retoswap:
+            return {"status": "error", "reason": "retoswap_not_configured"}
+
+        if not await self.monero.health_check():
+            return {"status": "error", "reason": "monero_offline"}
+        if not await self.retoswap.health_check():
+            logger.warning("RetoSwap daemon unreachable — skipping conversion cycle")
+            return {"status": "error", "reason": "retoswap_offline"}
+
+        threshold = self.config.creator_wallet.sweep_threshold_eur
+        results = []
+        all_revenue = self.brand_payments.get_all_brands_revenue()
+
+        for brand_data in all_revenue:
+            brand = brand_data["brand"]
+            sweepable = self.brand_payments.get_sweepable_balance(brand)
+            if sweepable < threshold:
+                continue
+
+            lock = _get_brand_lock(brand)
+            async with lock:
+                # Get brand wallet balance in XMR
+                balance = await self.monero.get_balance(brand)
+                xmr_available = balance.available
+                if xmr_available < 0.01:
+                    continue
+
+                # Sell XMR for fiat via P2P exchange
+                logger.info(
+                    f"RetoSwap: selling {xmr_available:.4f} XMR from brand '{brand}' "
+                    f"(~€{sweepable:.2f})"
+                )
+                trade_result = await self.retoswap.auto_sell_xmr(
+                    amount_xmr=xmr_available,
+                )
+
+                results.append({
+                    "brand": brand,
+                    "amount_xmr": xmr_available,
+                    "trade_id": trade_result.trade_id,
+                    "status": trade_result.status.value,
+                    "amount_fiat": trade_result.amount_fiat,
+                    "error": trade_result.error,
+                })
+
+                # Notify creator
+                if self.telegram_bot and trade_result.trade_id:
+                    try:
+                        self.telegram_bot.notify_creator(
+                            f"💱 *RetoSwap trade initiated*\n\n"
+                            f"Brand: `{brand}`\n"
+                            f"Selling: {xmr_available:.4f} XMR\n"
+                            f"Expected: ~€{trade_result.amount_fiat:.2f}\n"
+                            f"Method: {self.config.retoswap.preferred_payment_method}\n"
+                            f"Trade: `{trade_result.trade_id[:16]}...`\n\n"
+                            f"Fiat will arrive in your account when trade completes."
+                        )
+                    except Exception:
+                        pass
+
+        successful = sum(1 for r in results if r.get("trade_id"))
+        return {
+            "flow": "crypto_retoswap",
+            "trades_initiated": len(results),
+            "trades_successful": successful,
+            "results": results,
+            "status": "ok",
+        }
 
     async def _run_crypto_sweep_cycle(self) -> dict[str, Any]:
         """Crypto flow: send XMR from brand wallets to creator."""
