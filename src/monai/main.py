@@ -213,8 +213,10 @@ def run_daemon(config: Config, cycle_interval: int = 300):
 
     # Start webhook server in background thread
     webhook_port = getattr(config, "webhook_port", 8420)
+    webhook_server = None
+    webhook_loop = None
     try:
-        _start_webhook_server(orchestrator, webhook_port)
+        webhook_server, webhook_loop = _start_webhook_server(orchestrator, webhook_port)
     except Exception as e:
         logger.error(f"Webhook server failed to start: {e}")
         logger.warning("Continuing without webhook server — payments will NOT be received")
@@ -240,6 +242,14 @@ def run_daemon(config: Config, cycle_interval: int = 300):
             if _shutdown:
                 break
             time.sleep(1)
+
+    # Shut down webhook server cleanly
+    if webhook_server and webhook_loop:
+        try:
+            webhook_loop.call_soon_threadsafe(webhook_loop.stop)
+            logger.info("Webhook server stopped")
+        except Exception as e:
+            logger.warning(f"Error stopping webhook server: {e}")
 
     logger.info("monAI shut down gracefully.")
 

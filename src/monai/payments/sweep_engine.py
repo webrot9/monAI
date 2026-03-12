@@ -568,6 +568,15 @@ class SweepEngine:
 
         to_account = self._ensure_sweep_destination(brand, creator_address)
 
+        # Check balance BEFORE initiating sweep to avoid phantom pending records
+        balance = await self.monero.get_balance()
+        if balance.available <= 0:
+            return SweepResult(
+                success=False,
+                error="No XMR available in wallet",
+                status=SweepStatus.FAILED,
+            )
+
         sweep_id = self.brand_payments.initiate_sweep(
             brand=brand,
             from_account_id=from_account["id"],
@@ -575,16 +584,6 @@ class SweepEngine:
             amount=sweepable,
             sweep_method="crypto_xmr",
         )
-
-        # Get available XMR
-        balance = await self.monero.get_balance()
-        if balance.available <= 0:
-            self.brand_payments.fail_sweep(sweep_id, "No XMR available")
-            return SweepResult(
-                success=False, sweep_id=sweep_id,
-                error="No XMR available in wallet",
-                status=SweepStatus.FAILED,
-            )
 
         xmr_to_send = balance.available
         fee_estimate = await self.monero.estimate_fee(xmr_to_send)
