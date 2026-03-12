@@ -93,8 +93,15 @@ class NewsletterAgent(BaseAgent):
         newsletters = self.db.execute("SELECT * FROM newsletters WHERE status != 'paused'")
         statuses: dict[str, int] = {}
         for nl in newsletters:
-            s = nl.get("status", "unknown")
+            s = nl["status"] if nl["status"] else "unknown"
             statuses[s] = statuses.get(s, 0) + 1
+
+        # Check for draft issues that need review before anything else
+        draft_issues = self.db.execute(
+            "SELECT COUNT(*) as c FROM newsletter_issues WHERE status = 'draft'"
+        )
+        if draft_issues and draft_issues[0]["c"] > 0:
+            return ["review_issue"]
 
         # Deterministic progression
         if not statuses:
@@ -123,6 +130,8 @@ class NewsletterAgent(BaseAgent):
                 results["planned"] = self._plan_newsletter()
             elif step == "write_issue":
                 results["issue"] = self._write_issue()
+            elif step == "review_issue":
+                results["review"] = self._review_issue()
             elif step == "find_sponsors":
                 results["sponsors"] = self._find_sponsors()
             elif step == "grow_subscribers":
@@ -337,6 +346,65 @@ class NewsletterAgent(BaseAgent):
             "sections": len(written_sections),
             "content_path": str(path),
         }
+
+    def _review_issue(self) -> dict[str, Any]:
+        """Quality gate: review draft newsletter issues before sending."""
+        draft_issues = self.db.execute(
+            "SELECT ni.*, n.name as newsletter_name FROM newsletter_issues ni "
+            "JOIN newsletters n ON ni.newsletter_id = n.id "
+            "WHERE ni.status = 'draft' LIMIT 1"
+        )
+        if not draft_issues:
+            return {"status": "no_drafts_to_review"}
+
+        issue = dict(draft_issues[0])
+        content_path = issue.get("content_path", "")
+
+        # Load issue content
+        import os
+        product_data = {"spec": {"title": issue["subject"]}, "content": []}
+        if content_path and os.path.exists(content_path):
+            try:
+                issue_data = json.loads(open(content_path).read())
+                product_data["content"] = issue_data.get("sections", [])
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        result = self.reviewer.review_product(
+            strategy=self.name,
+            product_name=issue["subject"],
+            product_data=product_data,
+            product_type="content",
+        )
+
+        if result.verdict == "approved":
+            self.db.execute(
+                "UPDATE newsletter_issues SET status = 'reviewed' WHERE id = ?",
+                (issue["id"],),
+            )
+            self.log_action("issue_reviewed", f"{issue['subject']}: APPROVED")
+        elif result.verdict == "rejected":
+            self.db.execute(
+                "DELETE FROM newsletter_issues WHERE id = ?",
+                (issue["id"],),
+            )
+            self.log_action("issue_rejected", f"{issue['subject']}: REJECTED — will rewrite")
+        else:
+            revised = self.reviewer.revise_product(product_data, result, "content")
+            if content_path and os.path.exists(content_path):
+                try:
+                    issue_data = json.loads(open(content_path).read())
+                    issue_data["revised_content"] = revised
+                    open(content_path, "w").write(json.dumps(issue_data, indent=2))
+                except (json.JSONDecodeError, OSError):
+                    pass
+            self.db.execute(
+                "UPDATE newsletter_issues SET status = 'reviewed' WHERE id = ?",
+                (issue["id"],),
+            )
+            self.log_action("issue_revised", f"{issue['subject']}: REVISED")
+
+        return result.to_dict()
 
     def _find_sponsors(self) -> dict[str, Any]:
         """Find REAL potential sponsors by browsing sponsor platforms and newsletters."""

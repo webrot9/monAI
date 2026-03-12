@@ -49,6 +49,8 @@ class ContentSiteAgent(BaseAgent):
         if statuses.get("researched", 0) > 0:
             return ["create_article"]
         if statuses.get("draft", 0) > 0:
+            return ["review_content"]
+        if statuses.get("reviewed", 0) > 0:
             return ["find_affiliate_programs"]
 
         # All content published — research more keywords
@@ -64,6 +66,8 @@ class ContentSiteAgent(BaseAgent):
                 results["keywords"] = self._research_keywords()
             elif step == "create_article":
                 results["article"] = self._create_article()
+            elif step == "review_content":
+                results["content_review"] = self._review_content()
             elif step == "find_affiliate_programs":
                 results["affiliates"] = self._find_affiliate_programs()
             elif step == "plan_new_site":
@@ -183,6 +187,48 @@ class ContentSiteAgent(BaseAgent):
 
         self.log_action("article_created", keyword, f"{len(sections)} sections")
         return {"keyword": keyword, "sections": len(sections)}
+
+    def _review_content(self) -> dict[str, Any]:
+        """Quality gate: review draft articles before publishing."""
+        for path in self.sites_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("status") != "draft":
+                continue
+
+            name = data.get("target", {}).get("keyword",
+                   data.get("target", {}).get("title", path.stem))
+
+            result = self.reviewer.review_product(
+                strategy=self.name,
+                product_name=name,
+                product_data=data,
+                product_type="content",
+            )
+
+            if result.verdict == "approved":
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("content_reviewed", f"{name}: APPROVED")
+            elif result.verdict == "rejected":
+                data["status"] = "researched"
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("content_rejected", f"{name}: REJECTED")
+            else:
+                revised = self.reviewer.revise_product(data, result, "content")
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                data["revised_content"] = revised
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("content_revised", f"{name}: REVISED")
+
+            return result.to_dict()
+
+        return {"status": "no_content_to_review"}
 
     def _find_affiliate_programs(self) -> dict[str, Any]:
         """Research affiliate programs using REAL data from affiliate networks."""

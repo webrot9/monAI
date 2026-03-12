@@ -118,8 +118,15 @@ PHASE 3: Self-Sustaining
 ## Content Quality Pipeline
 
 ```
-Content Generation → FactChecker → Humanizer → Publish/Revise/Block
+Content Generation → ProductReviewer (Humanizer + FactChecker + Legal) → Publish/Revise/Block
+                                          ↓
+                              ProductIterator (monitors sales/quality)
+                                          ↓
+                            Competitor Analysis → Improvement Plan → Rebuild
 ```
+
+All 11 content/product-producing strategies pass through the ProductReviewer quality gate.
+The ProductIterator runs every 5 cycles to identify underperformers and trigger improvements.
 
 - **Humanizer**: Ensures content passes AI detection tools
 - **FactChecker**: Extracts claims, verifies each one, tracks per-brand accuracy
@@ -177,7 +184,9 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `legal.py` | Per-activity legal compliance advisor |
 | `ethics.py` | Hardcoded ethical rules |
 | `ethics_test.py` | Ethical testing framework |
-| `self_improve.py` | Agent self-improvement |
+| `self_improve.py` | Agent self-improvement with A/B experiments |
+| `product_iterator.py` | Continuous product improvement (sales analysis, competitor monitoring, auto-iteration) |
+| `product_reviewer.py` | Quality gate for all products (humanizer + fact-checker + legal review) |
 | `llc_provisioner.py` | Autonomous LLC formation |
 | `phone_provisioner.py` | Virtual phone number acquisition |
 | `finance_expert.py` | Financial advisory and ROI analysis |
@@ -312,7 +321,7 @@ All strategies use real browser automation and APIs — zero simulation:
 
 ## Test Suite
 
-- **1520 tests** across 70+ test files
+- **1605 tests** across 80+ test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
@@ -354,6 +363,14 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 - **Only OpenAI key provided**: Agents self-provision all other credentials via browser automation
 
 ## Recent Changes
+
+### Product Quality & Iteration (2026-03-12)
+- **ProductReviewer integrated into ALL content strategies**: affiliate, content_sites, newsletter, freelance_writing, social_media, print_on_demand now pass through quality gate (humanizer + fact-checker + legal review) before publishing
+- **ProductIterator agent**: Continuous product improvement engine — monitors sales/quality, analyzes competitors, identifies gaps, generates improvement plans, feeds back to strategies
+- **Phase 6.58 in orchestrator**: Product iteration runs every 5 cycles — auto-detects underperformers, triggers competitor analysis and improvement cycles
+- **Newsletter review fix**: `.get()` on sqlite3.Row replaced with bracket access
+- **Draft-first review**: Newsletter issues are reviewed before growth/sponsoring activities
+- **26 new tests**: Full coverage for ProductIterator and content review integration
 
 ### Security Hardening (Critical)
 - **Webhook signature enforcement**: ALL providers now REJECT unsigned webhooks (was: optional)

@@ -70,6 +70,16 @@ class FreelanceWritingAgent(BaseAgent):
             return ["send_invoice"]
         if active_jobs > 0:
             return ["write_content"]
+
+        # Check for written content needing review before delivery
+        written = self.db.execute(
+            "SELECT COUNT(*) as c FROM projects WHERE status = 'written' "
+            "AND strategy_id = (SELECT id FROM strategies WHERE name = ?)",
+            (self.name,),
+        )
+        if written and written[0]["c"] > 0:
+            return ["review_content"]
+
         if proposals > 0:
             return ["follow_up"]
         if leads > 0:
@@ -91,6 +101,8 @@ class FreelanceWritingAgent(BaseAgent):
                 results["proposals"] = self._send_proposals()
             elif step == "write_content":
                 results["content"] = self._write_content()
+            elif step == "review_content":
+                results["content_review"] = self._review_content()
             elif step == "deliver_work":
                 results["delivery"] = self._deliver_work()
             elif step == "send_invoice":
@@ -228,6 +240,56 @@ class FreelanceWritingAgent(BaseAgent):
             written += 1
 
         return {"pieces_written": written}
+
+    def _review_content(self) -> dict[str, Any]:
+        """Quality gate: review written content before client delivery."""
+        projects = self.db.execute(
+            "SELECT p.*, c.name as client_name FROM projects p "
+            "JOIN contacts c ON p.contact_id = c.id "
+            "WHERE p.strategy_id = (SELECT id FROM strategies WHERE name = ?) "
+            "AND p.status = 'written'",
+            (self.name,),
+        )
+        reviewed = 0
+        for project in projects:
+            p = dict(project)
+            content_path = self.config.data_dir / "deliverables" / f"project_{p['id']}.txt"
+            content = ""
+            if content_path.exists():
+                content = content_path.read_text()
+
+            product_data = {
+                "spec": {"title": p.get("title", ""), "description": p.get("description", "")},
+                "content": [{"section": "deliverable", "content": content[:4000]}],
+            }
+
+            result = self.reviewer.review_product(
+                strategy=self.name,
+                product_name=p.get("title", f"project_{p['id']}"),
+                product_data=product_data,
+                product_type="content",
+            )
+
+            if result.verdict == "approved":
+                self.log_action("content_reviewed", f"Project {p['id']}: APPROVED")
+                reviewed += 1
+            elif result.verdict == "rejected":
+                # Rewrite — send back to in_progress
+                self.db.execute(
+                    "UPDATE projects SET status = 'in_progress' WHERE id = ?",
+                    (p["id"],),
+                )
+                self.log_action("content_rejected", f"Project {p['id']}: REJECTED — rewriting")
+            else:
+                # Revise inline
+                revised = self.reviewer.revise_product(product_data, result, "content")
+                revised_text = revised.get("revised_content", content)
+                if revised_text and content_path.exists():
+                    content_path.write_text(revised_text)
+                self.log_action("content_revised", f"Project {p['id']}: REVISED")
+                reviewed += 1
+
+        return {"reviewed": reviewed}
 
     def _deliver_work(self) -> dict[str, Any]:
         """Deliver completed work to clients on their platforms."""
