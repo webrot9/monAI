@@ -120,7 +120,7 @@ class StripeProvider(PaymentProvider):
 
         return PaymentResult(
             success=True,
-            payment_ref=session["id"],
+            payment_ref=session.get("id", ""),
             amount=intent.amount,
             currency=intent.currency,
             status=PaymentStatus.PENDING,
@@ -269,12 +269,12 @@ class StripeProvider(PaymentProvider):
         price_data = await self._api_call("POST", "prices", {
             "unit_amount": str(amount_cents),
             "currency": currency.lower(),
-            "product": product_data["id"],
+            "product": product_data.get("id", ""),
         })
 
         # Create payment link
         link_data = await self._api_call("POST", "payment_links", {
-            "line_items[0][price]": price_data["id"],
+            "line_items[0][price]": price_data.get("id", ""),
             "line_items[0][quantity]": "1",
         })
 

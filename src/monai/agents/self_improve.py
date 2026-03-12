@@ -21,6 +21,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from monai.agents.memory import SharedMemory
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.llm import LLM
@@ -43,6 +44,16 @@ CREATE TABLE IF NOT EXISTS agent_improvements (
     deployed_at TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS agent_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_name TEXT NOT NULL,
+    config_key TEXT NOT NULL,
+    config_value TEXT NOT NULL,
+    updated_by TEXT DEFAULT 'self_improver',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(agent_name, config_key)
+);
+
 CREATE TABLE IF NOT EXISTS agent_metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_name TEXT NOT NULL,
@@ -57,10 +68,12 @@ CREATE TABLE IF NOT EXISTS agent_metrics (
 class SelfImprover:
     """Manages agent self-improvement within ethical and budgetary constraints."""
 
-    def __init__(self, config: Config, db: Database, llm: LLM):
+    def __init__(self, config: Config, db: Database, llm: LLM,
+                 memory: SharedMemory | None = None):
         self.config = config
         self.db = db
         self.llm = llm
+        self.memory = memory
 
         with db.connect() as conn:
             conn.executescript(SELF_IMPROVE_SCHEMA)
@@ -202,9 +215,14 @@ class SelfImprover:
                     "1. Specific and actionable\n"
                     "2. Measurable (how to verify improvement)\n"
                     "3. Within ethical bounds (NEVER suggest relaxing ethics)\n"
-                    "4. Cost-conscious (prefer free/cheap improvements)\n"
+                    "4. Cost-conscious (prefer free/cheap improvements)\n\n"
+                    "For 'prompt' type improvements: include a 'new_value' field with the "
+                    "exact improved instruction/prompt text.\n"
+                    "For 'parameter' type improvements: include a 'new_value' field with "
+                    "the new parameter value as a JSON string (e.g. {\"temperature\": 0.3}).\n"
+                    "Mark risk as 'low', 'medium', or 'high'.\n\n"
                     "Return: {\"improvements\": [{\"type\": str, \"description\": str, "
-                    "\"expected_impact\": str, \"risk\": str}]}"
+                    "\"new_value\": str, \"expected_impact\": str, \"risk\": str}]}"
                 )},
                 {"role": "user", "content": json.dumps(analysis, default=str)},
             ],
@@ -219,6 +237,7 @@ class SelfImprover:
                 agent_name,
                 imp.get("type", "strategy"),
                 imp.get("description", ""),
+                new_value=imp.get("new_value", ""),
                 performance_before=analysis.get("metrics"),
             )
 
@@ -237,6 +256,135 @@ class SelfImprover:
             "UPDATE agent_improvements SET status = 'deployed', deployed_at = ? WHERE id = ?",
             (datetime.now().isoformat(), improvement_id),
         )
+
+    def deploy_improvements(self) -> list[dict[str, Any]]:
+        """Deploy low-risk proposed improvements to agents.
+
+        - prompt improvements: stored as high-priority lessons in SharedMemory
+          so agents pick them up via context enrichment.
+        - parameter improvements: written to the agent_config table for agents
+          to read at startup / runtime.
+
+        Returns a list of dicts describing what was deployed.
+        """
+        # Find low-risk proposed improvements
+        rows = self.db.execute(
+            "SELECT * FROM agent_improvements "
+            "WHERE status = 'proposed' "
+            "ORDER BY created_at ASC",
+        )
+        proposals = [dict(r) for r in rows]
+
+        deployed: list[dict[str, Any]] = []
+        for prop in proposals:
+            # Only auto-deploy low-risk improvements
+            # Check the description for risk hints from generate_improvements
+            risk = self._assess_risk(prop)
+            if risk != "low":
+                logger.debug(
+                    "Skipping improvement %s (risk=%s): %s",
+                    prop["id"], risk, prop["description"][:80],
+                )
+                continue
+
+            try:
+                if prop["improvement_type"] == "prompt":
+                    self._deploy_prompt_improvement(prop)
+                elif prop["improvement_type"] == "parameter":
+                    self._deploy_parameter_improvement(prop)
+                else:
+                    # strategy/tool/workflow — store as a lesson so agents
+                    # can incorporate the advice via context enrichment
+                    self._deploy_prompt_improvement(prop)
+
+                # Mark as deployed
+                now = datetime.now().isoformat()
+                self.db.execute(
+                    "UPDATE agent_improvements "
+                    "SET status = 'deployed', deployed_at = ? WHERE id = ?",
+                    (now, prop["id"]),
+                )
+                deployed.append({
+                    "id": prop["id"],
+                    "agent": prop["agent_name"],
+                    "type": prop["improvement_type"],
+                    "description": prop["description"][:120],
+                })
+                logger.info(
+                    "Deployed improvement %s for %s: %s",
+                    prop["id"], prop["agent_name"], prop["description"][:80],
+                )
+            except Exception as e:
+                logger.error("Failed to deploy improvement %s: %s", prop["id"], e)
+
+        return deployed
+
+    # ── Deployment Helpers ────────────────────────────────────────
+
+    def _assess_risk(self, proposal: dict[str, Any]) -> str:
+        """Determine the risk level of a proposed improvement.
+
+        Uses the description text to look for risk signals. Returns
+        'low', 'medium', or 'high'.
+        """
+        desc_lower = (proposal.get("description", "") or "").lower()
+
+        # High-risk keywords — never auto-deploy
+        high_risk = ["ethic", "payment", "financial", "delete", "irreversible",
+                      "credentials", "secret", "api key", "production"]
+        if any(kw in desc_lower for kw in high_risk):
+            return "high"
+
+        # Medium-risk keywords — require manual approval
+        medium_risk = ["cost", "budget", "external", "third.party", "deploy"]
+        if any(kw in desc_lower for kw in medium_risk):
+            return "medium"
+
+        return "low"
+
+    def _deploy_prompt_improvement(self, prop: dict[str, Any]) -> None:
+        """Store a prompt improvement as a high-priority lesson in SharedMemory."""
+        if not self.memory:
+            raise RuntimeError("SharedMemory not available — cannot deploy prompt improvement")
+
+        content = prop.get("new_value") or prop["description"]
+        self.memory.record_lesson(
+            agent_name=prop["agent_name"],
+            category="optimization",
+            situation=f"Self-improvement analysis identified: {prop['description'][:200]}",
+            lesson=content,
+            rule=content,
+            severity="high",
+        )
+
+    def _deploy_parameter_improvement(self, prop: dict[str, Any]) -> None:
+        """Write parameter changes to the agent_config table."""
+        new_value = prop.get("new_value") or ""
+        if not new_value:
+            logger.warning(
+                "Parameter improvement %s has no new_value, skipping", prop["id"]
+            )
+            raise ValueError("Parameter improvement missing new_value")
+
+        # new_value should be a JSON dict of key-value pairs, e.g. {"temperature": 0.3}
+        try:
+            params = json.loads(new_value)
+        except (json.JSONDecodeError, TypeError):
+            # Treat the whole thing as a single config entry
+            params = {"setting": new_value}
+
+        if not isinstance(params, dict):
+            params = {"setting": str(params)}
+
+        now = datetime.now().isoformat()
+        for key, value in params.items():
+            self.db.execute(
+                "INSERT INTO agent_config (agent_name, config_key, config_value, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(agent_name, config_key) DO UPDATE "
+                "SET config_value = excluded.config_value, updated_at = excluded.updated_at",
+                (prop["agent_name"], key, json.dumps(value), now),
+            )
 
     def revert_improvement(self, improvement_id: int, reason: str = "") -> None:
         """Revert an improvement that didn't work out."""

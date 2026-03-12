@@ -86,7 +86,7 @@ class Orchestrator(BaseAgent):
         self.commercialista = Commercialista(config, db)
         self.telegram = TelegramBot(config, db)
         self.ethics_tester = EthicsTester(config, db, llm)
-        self.self_improver = SelfImprover(config, db, llm)
+        self.self_improver = SelfImprover(config, db, llm, memory=self.memory)
         self.legal = LegalAdvisorFactory(config, db, llm)
         self.collab = CollaborationHub(config, db)
         self.eng_team = EngineeringTeam(config, db, llm)
@@ -448,6 +448,11 @@ class Orchestrator(BaseAgent):
                     )
 
             if paused:
+                # Run post-mortem analysis on each paused strategy
+                for s in perf["strategies_to_pause"]:
+                    if s["name"] in paused:
+                        self._run_failure_postmortem(s)
+
                 self.notify_creator(
                     f"*Auto-paused {len(paused)} underperforming "
                     f"{'strategy' if len(paused) == 1 else 'strategies'}:*\n"
@@ -770,6 +775,51 @@ class Orchestrator(BaseAgent):
         except Exception as e:
             logger.error(f"Ko-fi sync failed: {e}")
             return {"status": "error", "error": str(e)}
+
+    def _run_failure_postmortem(self, strategy_data: dict) -> None:
+        """Analyze why a strategy failed and record prevention rules.
+
+        Runs after auto-pause to extract root causes and store them as
+        high-severity lessons so the same mistakes aren't repeated.
+        """
+        try:
+            name = strategy_data.get("name", "unknown")
+            analysis = self.think_json(
+                f"A monAI strategy was auto-paused due to poor performance.\n\n"
+                f"Strategy: {name}\n"
+                f"Net profit: €{strategy_data.get('net', 0):.2f}\n"
+                f"ROI: {strategy_data.get('roi_pct', 0)}%\n"
+                f"Revenue (7d): €{strategy_data.get('trend_7d', {}).get('revenue', 0):.2f}\n"
+                f"Expenses (7d): €{strategy_data.get('trend_7d', {}).get('expenses', 0):.2f}\n"
+                f"Budget used: {strategy_data.get('budget_used_pct', 0)}%\n\n"
+                "Analyze WHY this strategy failed. Consider:\n"
+                "1. Was the market too small or saturated?\n"
+                "2. Was the product/service quality too low?\n"
+                "3. Were costs too high relative to revenue potential?\n"
+                "4. Was the execution flawed (wrong platform, bad timing)?\n"
+                "5. Was there a technical failure?\n\n"
+                "Return: {\"root_causes\": [str], \"prevention_rules\": [str], "
+                "\"should_retry\": bool, \"retry_conditions\": str}"
+            )
+
+            # Store each prevention rule as a high-severity lesson
+            for rule in analysis.get("prevention_rules", []):
+                self.memory.store_lesson(
+                    agent=self.name,
+                    category="strategy_failure",
+                    situation=f"Strategy '{name}' auto-paused (net=€{strategy_data.get('net', 0):.2f})",
+                    lesson=rule,
+                    rule=rule,
+                    severity="high",
+                )
+
+            self.log_action(
+                "failure_postmortem",
+                f"{name}: root_causes={analysis.get('root_causes', [])}, "
+                f"should_retry={analysis.get('should_retry', False)}",
+            )
+        except Exception as e:
+            logger.warning(f"Post-mortem analysis failed for {strategy_data.get('name', '?')}: {e}")
 
     def _auto_scale_strategies(self, to_scale: list[dict]) -> list[str]:
         """Increase budget for strategies with strong growth trends.
@@ -1323,6 +1373,15 @@ class Orchestrator(BaseAgent):
                 }
             else:
                 results[name] = {"analysis": "sparse_data"}
+
+        # Deploy any low-risk proposed improvements across all agents
+        deployed = self.self_improver.deploy_improvements()
+        results["_deployed"] = deployed
+        if deployed:
+            self.log_action(
+                "self_improvement_deployed",
+                json.dumps({"count": len(deployed), "items": deployed}, default=str)[:500],
+            )
 
         return results
 
