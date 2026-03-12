@@ -45,14 +45,24 @@ class InfraSetup:
         MONAI_DIR.mkdir(parents=True, exist_ok=True)
         MONAI_BIN.mkdir(parents=True, exist_ok=True)
 
-        self.results["tor"] = self._ensure_tor()
-        self.results["monero_wallet_rpc"] = self._ensure_monero_wallet_rpc()
-        self.results["creator_wallet"] = self._ensure_creator_wallet()
-        self.results["llm"] = self._ensure_llm_access()
         self.results["config"] = self._ensure_config()
+        self.results["tor"] = self._ensure_tor()
+        self.results["llm"] = self._ensure_llm_access()
+
+        # Crypto infrastructure is OPTIONAL — only set up if explicitly configured.
+        # The primary payout flow is LLC → contractor invoice → bank transfer.
+        # Monero is only needed if the creator wants anonymous crypto payouts.
+        if self._is_crypto_configured():
+            self.results["monero_wallet_rpc"] = self._ensure_monero_wallet_rpc()
+        else:
+            self.results["monero_wallet_rpc"] = {
+                "status": "skipped",
+                "reason": "Crypto not configured. Using LLC bank transfer flow.",
+            }
 
         all_ok = all(
-            r.get("status") in ("ok", "already_running", "already_configured", "skipped")
+            r.get("status") in ("ok", "already_running", "already_configured", "skipped",
+                                 "already_exists")
             for r in self.results.values()
         )
         self.results["ready"] = all_ok
@@ -378,43 +388,6 @@ class InfraSetup:
         with open(config_file, "w") as f:
             json.dump(config, f, indent=2)
 
-    # ── Creator Wallet ───────────────────────────────────────────
-
-    def _ensure_creator_wallet(self) -> dict[str, Any]:
-        """Ensure creator has a wallet address for receiving sweeps.
-
-        If no creator wallet is configured, generate one automatically.
-        The creator can replace it later with their own address.
-        """
-        config_file = MONAI_DIR / "config.json"
-        config: dict = {}
-        if config_file.exists():
-            with open(config_file) as f:
-                config = json.load(f)
-
-        creator_wallet = config.get("creator_wallet", {})
-        if creator_wallet.get("xmr_address"):
-            return {"status": "already_configured"}
-
-        # Generate a dedicated creator wallet (separate from brand wallet)
-        logger.info(
-            "No creator wallet configured. monAI will hold funds in the brand "
-            "wallet until the creator provides their XMR address via Telegram."
-        )
-
-        # Set a flag so the sweep engine knows to hold funds
-        if "creator_wallet" not in config:
-            config["creator_wallet"] = {}
-        config["creator_wallet"]["hold_until_configured"] = True
-
-        with open(config_file, "w") as f:
-            json.dump(config, f, indent=2)
-
-        return {
-            "status": "ok",
-            "note": "Funds held until creator provides XMR address via Telegram",
-        }
-
     # ── LLM Access ───────────────────────────────────────────────
 
     def _ensure_llm_access(self) -> dict[str, Any]:
@@ -540,6 +513,34 @@ class InfraSetup:
 
         logger.info(f"Created default config at {config_file}")
         return {"status": "ok", "path": str(config_file)}
+
+    # ── Crypto detection ────────────────────────────────────────
+
+    def _is_crypto_configured(self) -> bool:
+        """Check if creator has explicitly configured crypto payouts.
+
+        Crypto (Monero) is OPTIONAL. The primary flow is:
+            Platforms → LLC bank → contractor invoice → creator bank.
+        Monero is only set up if the creator explicitly wants it.
+        """
+        config_file = MONAI_DIR / "config.json"
+        if not config_file.exists():
+            return False
+        try:
+            with open(config_file) as f:
+                config = json.load(f)
+            # Check if creator provided an XMR address or Monero RPC is custom-configured
+            creator_wallet = config.get("creator_wallet", {})
+            monero_cfg = config.get("monero", {})
+            has_xmr_address = bool(creator_wallet.get("xmr_address"))
+            has_custom_rpc = bool(
+                monero_cfg.get("wallet_rpc_url", "http://127.0.0.1:18082")
+                != "http://127.0.0.1:18082"
+                or monero_cfg.get("rpc_user")
+            )
+            return has_xmr_address or has_custom_rpc
+        except Exception:
+            return False
 
     # ── Utilities ────────────────────────────────────────────────
 

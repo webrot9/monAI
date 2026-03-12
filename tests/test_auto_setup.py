@@ -63,15 +63,31 @@ class TestInfraSetup:
         assert result["status"] == "ok"
         assert result["provider"] == "ollama"
 
-    def test_creator_wallet_already_set(self, tmp_path):
-        setup = InfraSetup()
-        config_file = tmp_path / "config.json"
-        config_file.write_text(json.dumps({
-            "creator_wallet": {"xmr_address": "4" + "A" * 94}
-        }))
-        with patch("monai.infra.auto_setup.MONAI_DIR", tmp_path):
-            result = setup._ensure_creator_wallet()
-        assert result["status"] == "already_configured"
+    def test_crypto_not_configured_skips_monero(self, tmp_path):
+        import monai.infra.auto_setup as mod
+        orig = mod.MONAI_DIR
+        try:
+            mod.MONAI_DIR = tmp_path
+            setup = InfraSetup()
+            config_file = tmp_path / "config.json"
+            config_file.write_text(json.dumps({"privacy": {"proxy_type": "tor"}}))
+            assert setup._is_crypto_configured() is False
+        finally:
+            mod.MONAI_DIR = orig
+
+    def test_crypto_configured_with_xmr_address(self, tmp_path):
+        import monai.infra.auto_setup as mod
+        orig = mod.MONAI_DIR
+        try:
+            mod.MONAI_DIR = tmp_path
+            setup = InfraSetup()
+            config_file = tmp_path / "config.json"
+            config_file.write_text(json.dumps({
+                "creator_wallet": {"xmr_address": "4" + "A" * 94}
+            }))
+            assert setup._is_crypto_configured() is True
+        finally:
+            mod.MONAI_DIR = orig
 
     def test_ensure_config_creates_default(self, tmp_path):
         setup = InfraSetup()
