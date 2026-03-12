@@ -73,6 +73,8 @@ class MicroSaaSAgent(BaseAgent):
         if statuses.get("designed", 0) > 0:
             return ["build_mvp"]
         if statuses.get("built", 0) > 0:
+            return ["review_product"]
+        if statuses.get("reviewed", 0) > 0:
             return ["deploy"]
         if statuses.get("deployed", 0) > 0:
             return ["create_landing_page"]
@@ -94,6 +96,8 @@ class MicroSaaSAgent(BaseAgent):
                 results["design"] = self._design_product()
             elif step == "build_mvp":
                 results["build"] = self._build_mvp()
+            elif step == "review_product":
+                results["review"] = self._review_product()
             elif step == "deploy":
                 results["deploy"] = self._deploy()
             elif step == "create_landing_page":
@@ -232,13 +236,52 @@ class MicroSaaSAgent(BaseAgent):
 
         return {"status": "no_products_to_build"}
 
+    def _review_product(self) -> dict[str, Any]:
+        """Quality gate: review built product before deployment."""
+        for path in self.products_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "built":
+                continue
+
+            design = data.get("design", {})
+            name = design.get("name", path.stem)
+
+            result = self.reviewer.review_product(
+                strategy=self.name,
+                product_name=name,
+                product_data=data,
+                product_type="saas",
+            )
+
+            if result.verdict == "approved":
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                if result.improved_content:
+                    data["improved_content"] = result.improved_content
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_reviewed", f"{name}: APPROVED (score={result.quality_score:.2f})")
+            elif result.verdict == "rejected":
+                data["status"] = "designed"  # Send back to redesign
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_review_rejected", f"{name}: REJECTED — {'; '.join(result.issues[:3])}")
+            else:
+                data["status"] = "reviewed"  # Proceed with notes
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_reviewed", f"{name}: PASSED WITH NOTES (score={result.quality_score:.2f})")
+
+            return result.to_dict()
+
+        return {"status": "no_products_to_review"}
+
     def _deploy(self) -> dict[str, Any]:
-        """Deploy built products to REAL hosting platforms."""
+        """Deploy reviewed products to REAL hosting platforms."""
         deployed = 0
 
         for path in self.products_dir.glob("*.json"):
             data = json.loads(path.read_text())
-            if data.get("status") != "built":
+            if data.get("status") not in ("built", "reviewed"):
                 continue
 
             design = data.get("design", {})

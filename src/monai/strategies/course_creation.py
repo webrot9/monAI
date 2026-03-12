@@ -76,6 +76,8 @@ class CourseCreationAgent(BaseAgent):
         if stats.get("scripting", 0) > 0:
             return ["write_lessons"]
         if stats.get("producing", 0) > 0:
+            return ["review_product"]
+        if stats.get("reviewed", 0) > 0:
             return ["list_course"]
         if stats.get("published", 0) > 0:
             return ["plan_marketing"]
@@ -95,6 +97,8 @@ class CourseCreationAgent(BaseAgent):
                 results["curriculum"] = self._design_curriculum()
             elif step == "write_lessons":
                 results["lessons"] = self._write_lessons()
+            elif step == "review_product":
+                results["review"] = self._review_product()
             elif step == "list_course":
                 results["listing"] = self._list_course()
 
@@ -286,6 +290,62 @@ class CourseCreationAgent(BaseAgent):
         self.log_action("lessons_written", f"{written} lessons scripted")
         return {"lessons_written": written}
 
+    def _review_product(self) -> dict[str, Any]:
+        """Quality gate: review course content before listing."""
+        courses = self.db.execute(
+            "SELECT * FROM courses WHERE status = 'producing' LIMIT 1"
+        )
+        if not courses:
+            return {"status": "no_courses_to_review"}
+
+        course = courses[0]
+        lessons = self.db.execute(
+            "SELECT * FROM course_lessons WHERE course_id = ? ORDER BY lesson_order",
+            (course["id"],),
+        )
+        # Build content for review
+        content_parts = []
+        for lesson in lessons:
+            if lesson.get("script"):
+                content_parts.append({
+                    "section": f"{lesson['section']} — {lesson['title']}",
+                    "content": lesson["script"][:2000],
+                })
+
+        product_data = {
+            "spec": {
+                "title": course["title"],
+                "description": course.get("description", ""),
+                "target_audience": course.get("target_audience", ""),
+                "features": [f"Lesson: {l['title']}" for l in lessons[:10]],
+            },
+            "content": content_parts,
+        }
+
+        result = self.reviewer.review_product(
+            strategy=self.name,
+            product_name=course["title"],
+            product_data=product_data,
+            product_type="course",
+        )
+
+        if result.verdict == "rejected":
+            self.db.execute_insert(
+                "UPDATE courses SET status = 'scripting' WHERE id = ?",
+                (course["id"],),
+            )
+            self.log_action("course_review_rejected",
+                            f"{course['title']}: {'; '.join(result.issues[:3])}")
+        else:
+            self.db.execute_insert(
+                "UPDATE courses SET status = 'reviewed' WHERE id = ?",
+                (course["id"],),
+            )
+            self.log_action("course_reviewed",
+                            f"{course['title']}: {result.verdict} (score={result.quality_score:.2f})")
+
+        return result.to_dict()
+
     def _list_course(self) -> dict[str, Any]:
         """List a completed course on its target platform using platform_action."""
         # Find courses that are fully scripted and ready to publish
@@ -293,7 +353,7 @@ class CourseCreationAgent(BaseAgent):
             "SELECT c.*, "
             "(SELECT COUNT(*) FROM course_lessons WHERE course_id = c.id AND status = 'scripted') as scripted, "
             "(SELECT COUNT(*) FROM course_lessons WHERE course_id = c.id) as total "
-            "FROM courses c WHERE c.status = 'scripting'"
+            "FROM courses c WHERE c.status IN ('scripting', 'producing', 'reviewed')"
         )
 
         listed = 0

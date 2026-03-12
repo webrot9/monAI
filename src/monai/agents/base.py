@@ -47,6 +47,7 @@ class BaseAgent(ABC):
         self._executor = None  # Lazy-loaded
         self._identity = None  # Lazy-loaded
         self._provisioner = None  # Lazy-loaded
+        self._reviewer = None  # Lazy-loaded
 
     @property
     def coder(self):
@@ -91,6 +92,18 @@ class BaseAgent(ABC):
     @provisioner.setter
     def provisioner(self, value):
         self._provisioner = value
+
+    @property
+    def reviewer(self):
+        """Lazy-load product reviewer — quality gate before listing/deploy."""
+        if self._reviewer is None:
+            from monai.agents.product_reviewer import ProductReviewer
+            self._reviewer = ProductReviewer(self.config, self.db, self.llm)
+        return self._reviewer
+
+    @reviewer.setter
+    def reviewer(self, value):
+        self._reviewer = value
 
     def write_code(self, spec: str, project_dir: str | None = None,
                    language: str = "python") -> dict:

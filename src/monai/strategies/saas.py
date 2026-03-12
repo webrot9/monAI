@@ -90,6 +90,8 @@ class SaaSAgent(BaseAgent):
         if stats.get("building", 0) > 0:
             return ["build_mvp"]
         if stats.get("beta", 0) > 0:
+            return ["review_product"]
+        if stats.get("reviewed", 0) > 0:
             return ["create_landing_page"]
         if stats.get("launched", 0) > 0:
             return ["plan_growth"]
@@ -113,6 +115,8 @@ class SaaSAgent(BaseAgent):
                 results["architecture"] = self._design_architecture()
             elif step == "build_mvp":
                 results["build"] = self._build_mvp()
+            elif step == "review_product":
+                results["review"] = self._review_product()
             elif step == "create_landing_page":
                 results["landing"] = self._create_landing_page()
             elif step == "plan_launch":
@@ -453,10 +457,58 @@ class SaaSAgent(BaseAgent):
                         build_result.get("status", "unknown"))
         return {"feature": feature["feature_name"], "build_status": build_result.get("status")}
 
+    def _review_product(self) -> dict[str, Any]:
+        """Quality gate: review SaaS product before landing page and launch."""
+        products = self.db.execute(
+            "SELECT * FROM saas_products WHERE status = 'beta' LIMIT 1"
+        )
+        if not products:
+            return {"status": "no_products_to_review"}
+
+        product = products[0]
+        features = self.db.execute(
+            "SELECT * FROM saas_features WHERE product_id = ?", (product["id"],)
+        )
+        product_data = {
+            "design": {
+                "name": product["name"],
+                "tagline": product.get("tagline", ""),
+                "problem": product["problem"],
+                "solution": product["solution"],
+                "target_market": product["target_market"],
+                "features": [{"name": f["feature_name"], "description": f.get("description", "")} for f in features],
+                "pricing": product.get("pricing_model", ""),
+            },
+        }
+
+        result = self.reviewer.review_product(
+            strategy=self.name,
+            product_name=product["name"],
+            product_data=product_data,
+            product_type="saas",
+        )
+
+        if result.verdict == "rejected":
+            self.db.execute_insert(
+                "UPDATE saas_products SET status = 'building' WHERE id = ?",
+                (product["id"],),
+            )
+            self.log_action("product_review_rejected",
+                            f"{product['name']}: {'; '.join(result.issues[:3])}")
+        else:
+            self.db.execute_insert(
+                "UPDATE saas_products SET status = 'reviewed' WHERE id = ?",
+                (product["id"],),
+            )
+            self.log_action("product_reviewed",
+                            f"{product['name']}: {result.verdict} (score={result.quality_score:.2f})")
+
+        return result.to_dict()
+
     def _create_landing_page(self) -> dict[str, Any]:
         """Create and deploy a REAL landing page for a SaaS product."""
         products = self.db.execute(
-            "SELECT * FROM saas_products WHERE status IN ('building', 'beta') LIMIT 1"
+            "SELECT * FROM saas_products WHERE status IN ('building', 'beta', 'reviewed') LIMIT 1"
         )
         if not products:
             return {"status": "no_products_need_landing"}

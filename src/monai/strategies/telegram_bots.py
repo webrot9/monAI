@@ -54,6 +54,8 @@ class TelegramBotAgent(BaseAgent):
         if statuses.get("designed", 0) > 0:
             return ["build_bot"]
         if statuses.get("built", 0) > 0:
+            return ["review_product"]
+        if statuses.get("reviewed", 0) > 0:
             return ["deploy_bot"]
         if statuses.get("build_failed", 0) > 0:
             return ["design_bot"]  # Redesign failed builds
@@ -75,6 +77,8 @@ class TelegramBotAgent(BaseAgent):
                 results["design"] = self._design_bot()
             elif step == "build_bot":
                 results["build"] = self._build_bot()
+            elif step == "review_product":
+                results["review"] = self._review_product()
             elif step == "deploy_bot":
                 results["deploy"] = self._deploy_bot()
 
@@ -258,6 +262,47 @@ class TelegramBotAgent(BaseAgent):
                 return {"bot": name, "build_status": build_result.get("status")}
 
         return {"status": "no_bots_to_build"}
+
+    def _review_product(self) -> dict[str, Any]:
+        """Quality gate: review built bot before deployment."""
+        for path in self.bots_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "built":
+                continue
+
+            design = data.get("design", {})
+            name = design.get("name", path.stem)
+
+            result = self.reviewer.review_product(
+                strategy=self.name,
+                product_name=name,
+                product_data=data,
+                product_type="bot",
+            )
+
+            if result.verdict == "approved":
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                # Apply any improved content if available
+                if result.improved_content:
+                    data["improved_content"] = result.improved_content
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("bot_reviewed", f"{name}: APPROVED (score={result.quality_score:.2f})")
+            elif result.verdict == "rejected":
+                data["status"] = "designed"  # Send back to redesign
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("bot_review_rejected", f"{name}: REJECTED — {'; '.join(result.issues[:3])}")
+            else:
+                # needs_revision — keep as built, add review notes for next pass
+                data["review"] = result.to_dict()
+                data["status"] = "reviewed"  # Let it proceed but with notes
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("bot_reviewed", f"{name}: PASSED WITH NOTES (score={result.quality_score:.2f})")
+
+            return result.to_dict()
+
+        return {"status": "no_bots_to_review"}
 
     def _deploy_bot(self) -> dict[str, Any]:
         """Deploy a built Telegram bot by registering with BotFather and hosting it."""

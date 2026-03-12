@@ -101,6 +101,8 @@ class DigitalProductsAgent(BaseAgent):
         if statuses.get("researched", 0) > 0:
             return ["create_product"]
         if statuses.get("created", 0) > 0:
+            return ["review_product"]
+        if statuses.get("reviewed", 0) > 0:
             return ["list_product"]
         if statuses.get("listed", 0) > 0:
             return ["check_sales"]
@@ -119,6 +121,8 @@ class DigitalProductsAgent(BaseAgent):
                 results["research"] = self._research_niches()
             elif step == "create_product":
                 results["create"] = self._create_product()
+            elif step == "review_product":
+                results["review"] = self._review_product()
             elif step == "list_product":
                 results["list"] = self._list_product()
             elif step == "check_sales":
@@ -251,6 +255,47 @@ class DigitalProductsAgent(BaseAgent):
         self.log_action("create_product", f"Created: {title}")
         return {"product": title, "sections": len(sections)}
 
+    def _review_product(self) -> dict[str, Any]:
+        """Quality gate: review created product before listing."""
+        for path in self.products_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "created":
+                continue
+
+            spec = data.get("spec", {})
+            name = spec.get("title", path.stem)
+
+            result = self.reviewer.review_product(
+                strategy=self.name,
+                product_name=name,
+                product_data=data,
+                product_type="digital_product",
+            )
+
+            if result.verdict == "approved":
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                # Apply humanized content if available
+                if result.improved_content.get("humanized"):
+                    # Replace content sections with humanized versions
+                    data["humanized_listing"] = result.improved_content["humanized"]
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_reviewed", f"{name}: APPROVED (score={result.quality_score:.2f})")
+            elif result.verdict == "rejected":
+                data["status"] = "researched"  # Send back to creation
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_review_rejected", f"{name}: REJECTED — {'; '.join(result.issues[:3])}")
+            else:
+                data["status"] = "reviewed"  # Proceed with notes
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_reviewed", f"{name}: PASSED WITH NOTES (score={result.quality_score:.2f})")
+
+            return result.to_dict()
+
+        return {"status": "no_products_to_review"}
+
     def _list_product(self) -> dict[str, Any]:
         """List products on REAL Gumroad marketplace."""
         # Ensure Gumroad is set up
@@ -261,7 +306,7 @@ class DigitalProductsAgent(BaseAgent):
 
         for product_path in products:
             data = json.loads(product_path.read_text())
-            if data.get("status") != "created":
+            if data.get("status") not in ("created", "reviewed"):
                 continue
 
             spec = data["spec"]
