@@ -31,15 +31,39 @@ class TelegramBotAgent(BaseAgent):
         self.bots_dir = config.data_dir / "telegram_bots"
         self.bots_dir.mkdir(parents=True, exist_ok=True)
 
+    def _get_product_statuses(self) -> dict[str, int]:
+        """Count products by status from JSON files."""
+        statuses: dict[str, int] = {}
+        for path in self.bots_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                s = data.get("status", "unknown")
+                statuses[s] = statuses.get(s, 0) + 1
+            except (json.JSONDecodeError, OSError):
+                continue
+        return statuses
+
     def plan(self) -> list[str]:
-        existing = list(self.bots_dir.glob("*.json"))
-        plan = self.think_json(
-            f"I have {len(existing)} Telegram bot products. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: research_bot_niches, design_bot, build_bot, "
-            "deploy_bot, market_bot, analyze_usage.",
-        )
-        return plan.get("steps", ["research_bot_niches"])
+        statuses = self._get_product_statuses()
+
+        # Deterministic progression — always advance the pipeline
+        if not statuses:
+            return ["research_bot_niches"]
+        if statuses.get("researched", 0) > 0:
+            return ["design_bot"]
+        if statuses.get("designed", 0) > 0:
+            return ["build_bot"]
+        if statuses.get("built", 0) > 0:
+            return ["review_product"]
+        if statuses.get("reviewed", 0) > 0:
+            return ["deploy_bot"]
+        if statuses.get("build_failed", 0) > 0:
+            return ["design_bot"]  # Redesign failed builds
+        if statuses.get("deploy_failed", 0) > 0:
+            return ["deploy_bot"]  # Retry failed deployments
+
+        # All bots deployed — start a new product cycle
+        return ["research_bot_niches"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting Telegram bots cycle")
@@ -53,6 +77,8 @@ class TelegramBotAgent(BaseAgent):
                 results["design"] = self._design_bot()
             elif step == "build_bot":
                 results["build"] = self._build_bot()
+            elif step == "review_product":
+                results["review"] = self._review_product()
             elif step == "deploy_bot":
                 results["deploy"] = self._deploy_bot()
 
@@ -142,38 +168,76 @@ class TelegramBotAgent(BaseAgent):
             "\"build_complexity\": \"low\"|\"medium\"|\"high\"}]}"
         )
 
+        # Persist top niche as actionable product file for pipeline progression
+        niches = analysis.get("niches", [])
+        saved = 0
+        for niche in niches[:2]:  # Save top 2 niches
+            name = niche.get("niche", niche.get("bot_concept", "untitled"))
+            safe_name = "".join(c if c.isalnum() or c in " -_" else "" for c in name).strip()
+            if not safe_name:
+                continue
+            path = self.bots_dir / f"{safe_name}.json"
+            if not path.exists():
+                path.write_text(json.dumps({
+                    "research": niche,
+                    "status": "researched",
+                }, indent=2))
+                saved += 1
+
         self.log_action(
             "niches_researched",
             f"Scraped {len(all_data)} data points from real sources, "
-            f"identified {len(analysis.get('niches', []))} niche opportunities"
+            f"identified {len(niches)} niche opportunities, saved {saved} for design"
         )
         return {
             "market_data_collected": len(all_data),
-            "niches": analysis.get("niches", []),
+            "niches": niches,
             "raw_market_data": all_data[:20],
         }
 
     def _design_bot(self) -> dict[str, Any]:
-        """Design a specific Telegram bot product. LLM-based planning is legitimate."""
-        spec = self.think_json(
-            "Design a Telegram bot product to build. Include:\n"
-            "- Clear value proposition\n"
-            "- Command list and interactions\n"
-            "- What data it needs/stores\n"
-            "- How users pay (subscription via Stripe, etc.)\n\n"
-            "Return: {\"name\": str, \"tagline\": str, "
-            "\"commands\": [{\"command\": str, \"description\": str}], "
-            "\"features\": [str], \"data_stored\": [str], "
-            "\"monetization\": str, \"tech_requirements\": [str]}"
-        )
+        """Design a bot from a researched niche. Uses prior research data."""
+        # Find a researched product to advance
+        for path in self.bots_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "researched":
+                continue
 
-        name = spec.get("name", "untitled_bot")
-        safe_name = "".join(c if c.isalnum() or c in " -_" else "" for c in name).strip()
-        path = self.bots_dir / f"{safe_name}.json"
-        path.write_text(json.dumps({"design": spec, "status": "designed"}, indent=2))
+            research = data.get("research", {})
+            # Inject feedback from previous review rejection if available
+            review_feedback = ""
+            if data.get("review"):
+                from monai.agents.product_reviewer import ProductReviewer
+                review_feedback = ProductReviewer.format_feedback_for_prompt(data["review"])
 
-        self.log_action("bot_designed", name)
-        return spec
+            spec = self.think_json(
+                f"Design a Telegram bot based on this market research:\n"
+                f"Niche: {research.get('niche', 'unknown')}\n"
+                f"Concept: {research.get('bot_concept', 'unknown')}\n"
+                f"Target audience: {research.get('target_audience', 'unknown')}\n"
+                f"Pricing model: {research.get('pricing_model', 'subscription')}\n"
+                f"Competition: {research.get('existing_competition', 'unknown')}\n\n"
+                "Design a specific bot product. Include:\n"
+                "- Clear value proposition\n"
+                "- Command list and interactions\n"
+                "- What data it needs/stores\n"
+                "- How users pay (subscription via Stripe, etc.)\n\n"
+                "Return: {\"name\": str, \"tagline\": str, "
+                "\"commands\": [{\"command\": str, \"description\": str}], "
+                "\"features\": [str], \"data_stored\": [str], "
+                f"\"monetization\": str, \"tech_requirements\": [str]}}"
+                f"{review_feedback}"
+            )
+
+            data["design"] = spec
+            data["status"] = "designed"
+            path.write_text(json.dumps(data, indent=2))
+
+            name = spec.get("name", path.stem)
+            self.log_action("bot_designed", name)
+            return spec
+
+        return {"status": "no_bots_to_design"}
 
     def _build_bot(self) -> dict[str, Any]:
         """Build a designed Telegram bot using the Coder agent."""
@@ -206,8 +270,54 @@ class TelegramBotAgent(BaseAgent):
 
         return {"status": "no_bots_to_build"}
 
+    def _review_product(self) -> dict[str, Any]:
+        """Quality gate: review built bot before deployment."""
+        for path in self.bots_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "built":
+                continue
+
+            design = data.get("design", {})
+            name = design.get("name", path.stem)
+
+            result = self.reviewer.review_product(
+                strategy=self.name,
+                product_name=name,
+                product_data=data,
+                product_type="bot",
+            )
+
+            if result.verdict == "approved":
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                # Apply any improved content if available
+                if result.improved_content:
+                    data["improved_content"] = result.improved_content
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("bot_reviewed", f"{name}: APPROVED (score={result.quality_score:.2f})")
+            elif result.verdict == "rejected":
+                data["status"] = "designed"  # Send back to redesign
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("bot_review_rejected", f"{name}: REJECTED — {'; '.join(result.issues[:3])}")
+            else:
+                # needs_revision — actively revise content before proceeding
+                revised = self.reviewer.revise_product(data, result, "bot")
+                data["review"] = result.to_dict()
+                data["revised_content"] = revised
+                data["status"] = "reviewed"
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("bot_revised", f"{name}: REVISED and proceeding (score={result.quality_score:.2f})")
+
+            return result.to_dict()
+
+        return {"status": "no_bots_to_review"}
+
     def _deploy_bot(self) -> dict[str, Any]:
         """Deploy a built Telegram bot by registering with BotFather and hosting it."""
+        # Ensure Stripe is set up for in-bot payments (e.g. /subscribe, /buy)
+        self.ensure_platform_account("stripe")
+
         deployed = 0
 
         for path in self.bots_dir.glob("*.json"):

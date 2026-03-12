@@ -79,14 +79,25 @@ class SaaSAgent(BaseAgent):
     def plan(self) -> list[str]:
         products = self.db.execute("SELECT status, COUNT(*) as c FROM saas_products GROUP BY status")
         stats = {r["status"]: r["c"] for r in products}
-        plan = self.think_json(
-            f"SaaS portfolio: {json.dumps(stats)}. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: discover_opportunities, validate_idea, competitor_analysis, "
-            "design_architecture, build_mvp, create_landing_page, plan_launch, "
-            "analyze_metrics, plan_growth.",
-        )
-        return plan.get("steps", ["discover_opportunities"])
+
+        # Deterministic progression — always advance the pipeline
+        if not stats:
+            return ["discover_opportunities"]
+        if stats.get("researching", 0) > 0:
+            return ["validate_idea"]
+        if stats.get("validated", 0) > 0:
+            return ["design_architecture"]
+        if stats.get("building", 0) > 0:
+            return ["build_mvp"]
+        if stats.get("beta", 0) > 0:
+            return ["review_product"]
+        if stats.get("reviewed", 0) > 0:
+            return ["create_landing_page"]
+        if stats.get("launched", 0) > 0:
+            return ["plan_growth"]
+
+        # All products at final stage — discover new ones
+        return ["discover_opportunities"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting SaaS cycle")
@@ -104,6 +115,8 @@ class SaaSAgent(BaseAgent):
                 results["architecture"] = self._design_architecture()
             elif step == "build_mvp":
                 results["build"] = self._build_mvp()
+            elif step == "review_product":
+                results["review"] = self._review_product()
             elif step == "create_landing_page":
                 results["landing"] = self._create_landing_page()
             elif step == "plan_launch":
@@ -420,6 +433,22 @@ class SaaSAgent(BaseAgent):
         feature = dict(features[0])
         tech_stack = json.loads(product.get("tech_stack", "{}"))
 
+        # Check for review feedback from previous rejection
+        review_feedback = ""
+        prev_reviews = self.db.execute(
+            "SELECT issues, suggestions FROM product_reviews "
+            "WHERE strategy = ? AND product_name = ? ORDER BY id DESC LIMIT 1",
+            (self.name, product["name"]),
+        )
+        if prev_reviews:
+            from monai.agents.product_reviewer import ProductReviewer
+            review_data = {
+                "issues": json.loads(prev_reviews[0].get("issues", "[]")),
+                "suggestions": json.loads(prev_reviews[0].get("suggestions", "[]")),
+                "quality_score": 0,
+            }
+            review_feedback = ProductReviewer.format_feedback_for_prompt(review_data)
+
         spec = (
             f"Build feature for SaaS product: {product['name']}\n"
             f"Feature: {feature['feature_name']}\n"
@@ -430,6 +459,7 @@ class SaaSAgent(BaseAgent):
             f"- Input validation\n"
             f"- Error handling\n"
             f"- Unit tests\n"
+            f"{review_feedback}"
         )
 
         build_result = self.coder.generate_module(spec)
@@ -444,10 +474,71 @@ class SaaSAgent(BaseAgent):
                         build_result.get("status", "unknown"))
         return {"feature": feature["feature_name"], "build_status": build_result.get("status")}
 
+    def _review_product(self) -> dict[str, Any]:
+        """Quality gate: review SaaS product before landing page and launch."""
+        products = self.db.execute(
+            "SELECT * FROM saas_products WHERE status = 'beta' LIMIT 1"
+        )
+        if not products:
+            return {"status": "no_products_to_review"}
+
+        product = products[0]
+        features = self.db.execute(
+            "SELECT * FROM saas_features WHERE product_id = ?", (product["id"],)
+        )
+        product_data = {
+            "design": {
+                "name": product["name"],
+                "tagline": product.get("tagline", ""),
+                "problem": product["problem"],
+                "solution": product["solution"],
+                "target_market": product["target_market"],
+                "features": [{"name": f["feature_name"], "description": f.get("description", "")} for f in features],
+                "pricing": product.get("pricing_model", ""),
+            },
+        }
+
+        result = self.reviewer.review_product(
+            strategy=self.name,
+            product_name=product["name"],
+            product_data=product_data,
+            product_type="saas",
+        )
+
+        if result.verdict == "rejected":
+            self.db.execute_insert(
+                "UPDATE saas_products SET status = 'building' WHERE id = ?",
+                (product["id"],),
+            )
+            # Feedback is stored in product_reviews table by the reviewer
+            self.log_action("product_review_rejected",
+                            f"{product['name']}: {'; '.join(result.issues[:3])}")
+        elif result.verdict == "needs_revision":
+            # Actively revise content before proceeding
+            self.reviewer.revise_product(product_data, result, "saas")
+            self.db.execute_insert(
+                "UPDATE saas_products SET status = 'reviewed' WHERE id = ?",
+                (product["id"],),
+            )
+            self.log_action("product_revised",
+                            f"{product['name']}: REVISED and proceeding (score={result.quality_score:.2f})")
+        else:
+            self.db.execute_insert(
+                "UPDATE saas_products SET status = 'reviewed' WHERE id = ?",
+                (product["id"],),
+            )
+            self.log_action("product_reviewed",
+                            f"{product['name']}: {result.verdict} (score={result.quality_score:.2f})")
+
+        return result.to_dict()
+
     def _create_landing_page(self) -> dict[str, Any]:
         """Create and deploy a REAL landing page for a SaaS product."""
+        # Ensure Stripe is set up for subscription payments
+        self.ensure_platform_account("stripe")
+
         products = self.db.execute(
-            "SELECT * FROM saas_products WHERE status IN ('building', 'beta') LIMIT 1"
+            "SELECT * FROM saas_products WHERE status IN ('building', 'beta', 'reviewed') LIMIT 1"
         )
         if not products:
             return {"status": "no_products_need_landing"}

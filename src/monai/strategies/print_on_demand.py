@@ -56,13 +56,21 @@ class PrintOnDemandAgent(BaseAgent):
     def plan(self) -> list[str]:
         designs = self.db.execute("SELECT status, COUNT(*) as c FROM pod_designs GROUP BY status")
         stats = {r["status"]: r["c"] for r in designs}
-        plan = self.think_json(
-            f"POD portfolio: {json.dumps(stats)}. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: research_niches, generate_design_concepts, create_listings, "
-            "optimize_tags, analyze_sales, find_trending.",
-        )
-        return plan.get("steps", ["research_niches"])
+
+        # Deterministic progression
+        if not stats:
+            return ["research_niches"]
+        if stats.get("concept", 0) > 0:
+            return ["generate_design_concepts"]
+        if stats.get("designed", 0) > 0:
+            return ["create_listings"]
+        if stats.get("listed", 0) > 0:
+            return ["optimize_tags"]
+        if stats.get("selling", 0) > 0:
+            return ["analyze_sales"]
+
+        # All designs at final stage — research new niches
+        return ["research_niches"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting POD cycle")

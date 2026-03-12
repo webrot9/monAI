@@ -130,17 +130,20 @@ class ExchangeRateService:
     """
 
     def __init__(self, db: Database, cache_ttl: int = 3600,
-                 rate_limiter: RateLimiter | None = None):
+                 rate_limiter: RateLimiter | None = None,
+                 anonymizer=None):
         """
         Args:
             db: Database for persistent rate storage.
             cache_ttl: Cache time-to-live in seconds (default: 1 hour).
             rate_limiter: Optional rate limiter for API calls.
+            anonymizer: Privacy anonymizer for proxied HTTP requests.
         """
         self.db = db
         self.cache_ttl = cache_ttl
         self._cache: dict[tuple[str, str], ExchangeRate] = {}
         self.rate_limiter = rate_limiter or RateLimiter()
+        self._anonymizer = anonymizer
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -320,7 +323,11 @@ class ExchangeRateService:
         url = "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A?lastNObservations=1&format=csvdata"
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            if self._anonymizer:
+                client_ctx = self._anonymizer.create_async_http_client(timeout=15.0)
+            else:
+                client_ctx = httpx.AsyncClient(timeout=15.0)
+            async with client_ctx as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
 
@@ -353,7 +360,11 @@ class ExchangeRateService:
         )
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            if self._anonymizer:
+                client_ctx = self._anonymizer.create_async_http_client(timeout=15.0)
+            else:
+                client_ctx = httpx.AsyncClient(timeout=15.0)
+            async with client_ctx as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
                 data = resp.json()

@@ -28,15 +28,31 @@ class ContentSiteAgent(BaseAgent):
         self.sites_dir = config.data_dir / "content_sites"
         self.sites_dir.mkdir(parents=True, exist_ok=True)
 
+    def _get_content_statuses(self) -> dict[str, int]:
+        """Count content pieces by status."""
+        statuses: dict[str, int] = {}
+        for path in self.sites_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                s = data.get("status", "unknown")
+                statuses[s] = statuses.get(s, 0) + 1
+            except (json.JSONDecodeError, OSError):
+                continue
+        return statuses
+
     def plan(self) -> list[str]:
-        existing = list(self.sites_dir.glob("*.json"))
-        plan = self.think_json(
-            f"I manage {len(existing)} content sites. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: research_keywords, create_article, optimize_seo, "
-            "find_affiliate_programs, analyze_performance, plan_new_site.",
-        )
-        return plan.get("steps", ["research_keywords"])
+        statuses = self._get_content_statuses()
+
+        # Deterministic progression
+        if not statuses:
+            return ["research_keywords"]
+        if statuses.get("researched", 0) > 0:
+            return ["create_article"]
+        if statuses.get("draft", 0) > 0:
+            return ["find_affiliate_programs"]
+
+        # All content published — research more keywords
+        return ["research_keywords"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting content sites cycle")

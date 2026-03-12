@@ -418,6 +418,19 @@ def main():
                 print("  3. Install Ollama: curl -fsSL https://ollama.ai/install.sh | sh")
                 sys.exit(1)
 
+    # Validate payout configuration
+    if args.command in ("daemon", "run"):
+        has_payout = (
+            config.retoswap.enabled
+            or config.creator_wallet.xmr_address
+            or config.llc.enabled
+        )
+        if not has_payout:
+            logger.warning(
+                "No payout method configured. Revenue will accumulate but NOT be swept. "
+                "Configure one of: retoswap (PayPal F&F/cash), creator_wallet.xmr_address, or LLC."
+            )
+
     if args.command == "dashboard":
         import asyncio
         from monai.dashboard.server import run_dashboard

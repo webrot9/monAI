@@ -50,15 +50,39 @@ class MicroSaaSAgent(BaseAgent):
         self.products_dir = config.data_dir / "micro_saas"
         self.products_dir.mkdir(parents=True, exist_ok=True)
 
+    def _get_product_statuses(self) -> dict[str, int]:
+        """Count products by status from JSON files."""
+        statuses: dict[str, int] = {}
+        for path in self.products_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                s = data.get("status", "unknown")
+                statuses[s] = statuses.get(s, 0) + 1
+            except (json.JSONDecodeError, OSError):
+                continue
+        return statuses
+
     def plan(self) -> list[str]:
-        existing = list(self.products_dir.glob("*.json"))
-        plan = self.think_json(
-            f"I have {len(existing)} micro-SaaS products. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: research_opportunities, design_product, build_mvp, "
-            "deploy, create_landing_page, check_usage.",
-        )
-        return plan.get("steps", ["research_opportunities"])
+        statuses = self._get_product_statuses()
+
+        # Deterministic progression — always advance the pipeline
+        if not statuses:
+            return ["research_opportunities"]
+        if statuses.get("researched", 0) > 0:
+            return ["design_product"]
+        if statuses.get("designed", 0) > 0:
+            return ["build_mvp"]
+        if statuses.get("built", 0) > 0:
+            return ["review_product"]
+        if statuses.get("reviewed", 0) > 0:
+            return ["deploy"]
+        if statuses.get("deployed", 0) > 0:
+            return ["create_landing_page"]
+        if statuses.get("build_failed", 0) > 0:
+            return ["design_product"]  # Redesign failed builds
+
+        # All products at final stage — start new cycle
+        return ["research_opportunities"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting micro-SaaS cycle")
@@ -72,6 +96,8 @@ class MicroSaaSAgent(BaseAgent):
                 results["design"] = self._design_product()
             elif step == "build_mvp":
                 results["build"] = self._build_mvp()
+            elif step == "review_product":
+                results["review"] = self._review_product()
             elif step == "deploy":
                 results["deploy"] = self._deploy()
             elif step == "create_landing_page":
@@ -122,33 +148,70 @@ class MicroSaaSAgent(BaseAgent):
             "\"solution\": str, \"tech_stack\": str, \"pricing_model\": str, "
             "\"deploy_platform\": str}]}",
         )
+        # Persist top idea as actionable product file for pipeline progression
+        ideas = opportunities.get("ideas", [])
+        saved = 0
+        for idea in ideas[:2]:
+            name = idea.get("name", "untitled")
+            safe_name = "".join(c if c.isalnum() or c in " -_" else "" for c in name).strip()
+            if not safe_name:
+                continue
+            path = self.products_dir / f"{safe_name}.json"
+            if not path.exists():
+                path.write_text(json.dumps({
+                    "research": idea,
+                    "status": "researched",
+                }, indent=2))
+                saved += 1
+
         self.share_knowledge(
             "opportunity", "micro_saas_ideas",
-            json.dumps(opportunities.get("ideas", []))[:1000],
+            json.dumps(ideas)[:1000],
             tags=["micro_saas", "product"],
         )
+        self.log_action("research_complete", f"Found {len(ideas)} ideas, saved {saved} for design")
         return opportunities
 
     def _design_product(self) -> dict[str, Any]:
-        """Design a specific micro-SaaS product."""
-        spec = self.think_json(
-            "Design a micro-SaaS product to build right now. "
-            "Create a detailed specification.\n\n"
-            "Return: {\"name\": str, \"tagline\": str, \"problem\": str, "
-            "\"features\": [{\"name\": str, \"description\": str}], "
-            "\"tech_stack\": {\"backend\": str, \"frontend\": str, \"database\": str}, "
-            "\"api_endpoints\": [{\"method\": str, \"path\": str, \"description\": str}], "
-            "\"pricing\": {\"free_tier\": str, \"paid_tier\": str, \"price\": float}, "
-            "\"deploy_target\": str}"
-        )
+        """Design a product from a researched opportunity."""
+        for path in self.products_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "researched":
+                continue
 
-        name = spec.get("name", "untitled")
-        safe_name = "".join(c if c.isalnum() or c in " -_" else "" for c in name).strip()
-        design_path = self.products_dir / f"{safe_name}.json"
-        design_path.write_text(json.dumps({"design": spec, "status": "designed"}, indent=2))
+            research = data.get("research", {})
+            # Inject feedback from previous review rejection if available
+            review_feedback = ""
+            if data.get("review"):
+                from monai.agents.product_reviewer import ProductReviewer
+                review_feedback = ProductReviewer.format_feedback_for_prompt(data["review"])
 
-        self.log_action("product_designed", name)
-        return spec
+            spec = self.think_json(
+                f"Design a micro-SaaS product based on this research:\n"
+                f"Name: {research.get('name', 'unknown')}\n"
+                f"Problem: {research.get('problem', 'unknown')}\n"
+                f"Solution: {research.get('solution', 'unknown')}\n"
+                f"Tech stack: {research.get('tech_stack', 'Python')}\n"
+                f"Pricing model: {research.get('pricing_model', 'freemium')}\n\n"
+                "Create a detailed specification.\n\n"
+                "Return: {\"name\": str, \"tagline\": str, \"problem\": str, "
+                "\"features\": [{\"name\": str, \"description\": str}], "
+                "\"tech_stack\": {\"backend\": str, \"frontend\": str, \"database\": str}, "
+                "\"api_endpoints\": [{\"method\": str, \"path\": str, \"description\": str}], "
+                "\"pricing\": {\"free_tier\": str, \"paid_tier\": str, \"price\": float}, "
+                f"\"deploy_target\": str}}"
+                f"{review_feedback}"
+            )
+
+            data["design"] = spec
+            data["status"] = "designed"
+            path.write_text(json.dumps(data, indent=2))
+
+            name = spec.get("name", path.stem)
+            self.log_action("product_designed", name)
+            return spec
+
+        return {"status": "no_products_to_design"}
 
     def _build_mvp(self) -> dict[str, Any]:
         """Build an MVP using the Coder agent."""
@@ -180,13 +243,58 @@ class MicroSaaSAgent(BaseAgent):
 
         return {"status": "no_products_to_build"}
 
+    def _review_product(self) -> dict[str, Any]:
+        """Quality gate: review built product before deployment."""
+        for path in self.products_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "built":
+                continue
+
+            design = data.get("design", {})
+            name = design.get("name", path.stem)
+
+            result = self.reviewer.review_product(
+                strategy=self.name,
+                product_name=name,
+                product_data=data,
+                product_type="saas",
+            )
+
+            if result.verdict == "approved":
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                if result.improved_content:
+                    data["improved_content"] = result.improved_content
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_reviewed", f"{name}: APPROVED (score={result.quality_score:.2f})")
+            elif result.verdict == "rejected":
+                data["status"] = "designed"  # Send back to redesign
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_review_rejected", f"{name}: REJECTED — {'; '.join(result.issues[:3])}")
+            else:
+                # needs_revision — actively revise content before proceeding
+                revised = self.reviewer.revise_product(data, result, "saas")
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                data["revised_content"] = revised
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_revised", f"{name}: REVISED and proceeding (score={result.quality_score:.2f})")
+
+            return result.to_dict()
+
+        return {"status": "no_products_to_review"}
+
     def _deploy(self) -> dict[str, Any]:
-        """Deploy built products to REAL hosting platforms."""
+        """Deploy reviewed products to REAL hosting platforms."""
+        # Ensure Stripe is set up for payments before deploying
+        self.ensure_platform_account("stripe")
+
         deployed = 0
 
         for path in self.products_dir.glob("*.json"):
             data = json.loads(path.read_text())
-            if data.get("status") != "built":
+            if data.get("status") not in ("built", "reviewed"):
                 continue
 
             design = data.get("design", {})

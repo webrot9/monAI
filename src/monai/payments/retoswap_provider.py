@@ -51,8 +51,8 @@ class PaymentMethod(str, Enum):
     SEPA_INSTANT = "SEPA_INSTANT"    # EU instant transfer
     REVOLUT = "REVOLUT"
     WISE = "WISE"
-    PAYPAL = "PAYPAL"
-    CASH_BY_MAIL = "CASH_BY_MAIL"
+    PAYPAL = "PAYPAL"              # PayPal Friends & Family (no fees, no invoice)
+    CASH_BY_MAIL = "CASH_BY_MAIL"  # Physical cash sent via registered mail
     CASH_AT_ATM = "CASH_AT_ATM"
     NATIONAL_BANK = "NATIONAL_BANK"
 
@@ -112,9 +112,10 @@ class RetoSwapClient:
         daemon_host: str = DEFAULT_DAEMON_HOST,
         daemon_port: int = DEFAULT_DAEMON_PORT,
         daemon_password: str = "",
-        preferred_payment_method: str = "SEPA",
+        preferred_payment_method: str = "PAYPAL",
         preferred_currency: str = "EUR",
         price_margin_pct: float = -1.0,  # Sell 1% below market for faster fills
+        fallback_payment_methods: list[str] | None = None,
     ):
         self.daemon_host = daemon_host
         self.daemon_port = daemon_port
@@ -122,6 +123,7 @@ class RetoSwapClient:
         self.preferred_payment_method = preferred_payment_method
         self.preferred_currency = preferred_currency
         self.price_margin_pct = price_margin_pct
+        self.fallback_payment_methods = fallback_payment_methods or ["CASH_BY_MAIL", "REVOLUT"]
         self._channel = None
         self._stubs: dict[str, Any] = {}
 
@@ -380,6 +382,9 @@ class RetoSwapClient:
     ) -> TradeResult:
         """Autonomously sell XMR for fiat.
 
+        Tries preferred payment method first (default: PayPal F&F),
+        then falls back to fallback methods (cash-by-mail, Revolut, etc.).
+
         Strategies:
             take_best: Take the best existing buy offer from orderbook
             post_offer: Post our own sell offer and wait for a taker
@@ -402,56 +407,42 @@ class RetoSwapClient:
                 error="Could not get market price",
             )
 
+        # Build method list: preferred first, then fallbacks
+        methods_to_try = [self.preferred_payment_method] + [
+            m for m in self.fallback_payment_methods
+            if m != self.preferred_payment_method
+        ]
+
         if strategy in ("take_best", "aggressive"):
             # Look for existing buy offers to take
             offers = await self.get_offers(direction="BUY", currency=currency)
 
-            # Filter offers that match our payment method and amount
-            matching = []
-            for offer in offers:
-                offer_method = offer.get("payment_method_id", "")
-                offer_min = offer.get("min_amount", 0) / 1e12
-                offer_max = offer.get("amount", 0) / 1e12
-
-                if offer_method != self.preferred_payment_method:
-                    continue
-                if amount_xmr < offer_min:
-                    continue
-
-                # Check price isn't too far from market
-                offer_price = offer.get("price", 0.0)
-                if offer_price <= 0:
-                    continue
-                deviation = (offer_price - market_price) / market_price * 100
-                max_deviation = (
-                    self.MAX_PRICE_DEVIATION_PCT * 1.5
-                    if strategy == "aggressive"
-                    else self.MAX_PRICE_DEVIATION_PCT
+            # Try each payment method in priority order
+            for method in methods_to_try:
+                matching = self._filter_offers(
+                    offers, method, amount_xmr, market_price, strategy,
                 )
-                if abs(deviation) > max_deviation:
-                    continue
+                if matching:
+                    # Take the best-priced offer (highest price = most EUR per XMR)
+                    matching.sort(key=lambda x: x[0], reverse=True)
+                    best_price, best_offer = matching[0]
 
-                matching.append((offer_price, offer))
+                    trade_amount = min(amount_xmr, best_offer.get("amount", 0) / 1e12)
+                    logger.info(
+                        f"Taking buy offer {best_offer.get('id')}: "
+                        f"{trade_amount:.4f} XMR @ {best_price:.2f} {currency}/XMR "
+                        f"via {method} (market: {market_price:.2f})"
+                    )
 
-            if matching:
-                # Take the best-priced offer (highest price for us = most EUR per XMR)
-                matching.sort(key=lambda x: x[0], reverse=True)
-                best_price, best_offer = matching[0]
+                    return await self.take_buy_offer(
+                        offer_id=best_offer["id"],
+                        amount_xmr=trade_amount,
+                        payment_account_id=payment_account_id,
+                    )
 
-                trade_amount = min(amount_xmr, best_offer.get("amount", 0) / 1e12)
-                logger.info(
-                    f"Taking buy offer {best_offer.get('id')}: "
-                    f"{trade_amount:.4f} XMR @ {best_price:.2f} {currency}/XMR "
-                    f"(market: {market_price:.2f})"
-                )
+                logger.debug(f"No matching {method} offers, trying next method...")
 
-                return await self.take_buy_offer(
-                    offer_id=best_offer["id"],
-                    amount_xmr=trade_amount,
-                    payment_account_id=payment_account_id,
-                )
-
-        # Fallback: post our own sell offer
+        # Fallback: post our own sell offer with preferred method
         logger.info(
             f"No matching offers found. Posting sell offer: "
             f"{amount_xmr:.4f} XMR via {self.preferred_payment_method}"
@@ -471,6 +462,40 @@ class RetoSwapClient:
             status=TradeStatus.FAILED,
             error="Failed to post sell offer",
         )
+
+    def _filter_offers(
+        self,
+        offers: list[dict[str, Any]],
+        payment_method: str,
+        amount_xmr: float,
+        market_price: float,
+        strategy: str,
+    ) -> list[tuple[float, dict[str, Any]]]:
+        """Filter orderbook offers by payment method, amount, and price."""
+        matching = []
+        for offer in offers:
+            offer_method = offer.get("payment_method_id", "")
+            offer_min = offer.get("min_amount", 0) / 1e12
+
+            if offer_method != payment_method:
+                continue
+            if amount_xmr < offer_min:
+                continue
+
+            offer_price = offer.get("price", 0.0)
+            if offer_price <= 0:
+                continue
+            deviation = (offer_price - market_price) / market_price * 100
+            max_deviation = (
+                self.MAX_PRICE_DEVIATION_PCT * 1.5
+                if strategy == "aggressive"
+                else self.MAX_PRICE_DEVIATION_PCT
+            )
+            if abs(deviation) > max_deviation:
+                continue
+
+            matching.append((offer_price, offer))
+        return matching
 
     # ── Health Check ─────────────────────────────────────────────
 

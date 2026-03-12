@@ -86,7 +86,7 @@ class Orchestrator(BaseAgent):
         self.commercialista = Commercialista(config, db)
         self.telegram = TelegramBot(config, db)
         self.ethics_tester = EthicsTester(config, db, llm)
-        self.self_improver = SelfImprover(config, db, llm)
+        self.self_improver = SelfImprover(config, db, llm, memory=self.memory)
         self.legal = LegalAdvisorFactory(config, db, llm)
         self.collab = CollaborationHub(config, db)
         self.eng_team = EngineeringTeam(config, db, llm)
@@ -109,7 +109,9 @@ class Orchestrator(BaseAgent):
         self.kofi_manager = KofiCampaignManager(
             config, db, llm, bootstrap_wallet=self.bootstrap_wallet,
         )
-        self.exchange_rates = ExchangeRateService(db)
+        self.exchange_rates = ExchangeRateService(
+            db, anonymizer=get_anonymizer(config),
+        )
         self.reporter = FinancialReporter(
             db, self.ledger, self.finance, bootstrap=self.bootstrap_wallet,
         )
@@ -446,6 +448,11 @@ class Orchestrator(BaseAgent):
                     )
 
             if paused:
+                # Run post-mortem analysis on each paused strategy
+                for s in perf["strategies_to_pause"]:
+                    if s["name"] in paused:
+                        self._run_failure_postmortem(s)
+
                 self.notify_creator(
                     f"*Auto-paused {len(paused)} underperforming "
                     f"{'strategy' if len(paused) == 1 else 'strategies'}:*\n"
@@ -463,6 +470,60 @@ class Orchestrator(BaseAgent):
             cycle_result["strategy_performance"]["scaled"] = len(scaled)
         except Exception as e:
             logger.error(f"Strategy performance eval failed: {e}")
+
+        # Phase 6.99: Automatic reinvestment — scale winners, cut losers
+        try:
+            reinvest_result = self.commercialista.compute_reinvestment()
+            cycle_result["reinvestment"] = reinvest_result
+
+            if reinvest_result.get("reinvest", 0) > 0:
+                # Get strategy performance for allocation
+                strat_perf = []
+                for s in self.finance.get_strategy_pnl():
+                    rev = s.get("revenue", 0)
+                    exp = s.get("expenses", 0)
+                    roi = rev / exp if exp > 0 else 0
+                    strat_perf.append({
+                        "name": s["name"],
+                        "revenue": rev,
+                        "expenses": exp,
+                        "roi": roi,
+                    })
+
+                allocations = self.commercialista.allocate_to_strategies(
+                    reinvest_result["reinvest"], strat_perf,
+                )
+
+                # Apply allocations: update strategy budgets in DB
+                for alloc in allocations:
+                    if alloc.get("amount", 0) > 0:
+                        self.db.execute(
+                            "UPDATE strategies SET allocated_budget = allocated_budget + ? "
+                            "WHERE name = ?",
+                            (alloc["amount"], alloc["strategy"]),
+                        )
+                    elif alloc.get("action") == "reduce":
+                        self.db.execute(
+                            "UPDATE strategies SET allocated_budget = MAX(0, allocated_budget * 0.5) "
+                            "WHERE name = ?",
+                            (alloc["strategy"],),
+                        )
+
+                self.commercialista.record_reinvestment(
+                    reinvest=reinvest_result["reinvest"],
+                    reserve=reinvest_result["reserve"],
+                    creator=reinvest_result["creator_sweep"],
+                    allocations=allocations,
+                )
+
+                logger.info(
+                    f"Reinvestment: €{reinvest_result['reinvest']:.2f} allocated to "
+                    f"{len([a for a in allocations if a.get('amount', 0) > 0])} strategies, "
+                    f"€{reinvest_result['reserve']:.2f} reserved, "
+                    f"€{reinvest_result['creator_sweep']:.2f} for creator sweep"
+                )
+        except Exception as e:
+            logger.error(f"Reinvestment cycle failed: {e}")
 
         # Phase 7: Commercialista report
         cycle_result["timestamp"] = datetime.now().isoformat()
@@ -682,15 +743,80 @@ class Orchestrator(BaseAgent):
                     f"Will continue next cycle."
                 )
 
-        # API key provisioning — ensure brands have payment provider keys
-        api_prov_result = self._run_api_provisioning()
+        # API key provisioning — ensure brands have payment provider keys.
+        # Force on first cycle so payment providers are set up at startup.
+        api_prov_result = self._run_api_provisioning(force=(self._cycle <= 1))
         if api_prov_result.get("provisioned"):
             result["api_keys"] = api_prov_result
+
+        # Proactively provision payment providers for active strategies.
+        # Each strategy needs at least one payment provider to sell products.
+        self._ensure_strategy_payment_providers(result)
 
         if not needs and "llc" not in result and "api_keys" not in result:
             return {"status": "infrastructure_ok", "accounts": len(accounts)}
 
         return {"provisioned": needs, "result": result}
+
+    # Map strategy types to the payment providers they need
+    STRATEGY_PAYMENT_PROVIDERS: dict[str, list[str]] = {
+        "digital_products": ["gumroad"],
+        "telegram_bots": ["stripe"],
+        "micro_saas": ["stripe", "lemonsqueezy"],
+        "saas": ["stripe"],
+        "course_creation": ["gumroad", "stripe"],
+        "print_on_demand": ["stripe"],
+        "freelance_writing": [],  # Paid via platform (Upwork, etc.)
+        "domain_flipping": [],  # Paid via marketplace (Sedo, etc.)
+    }
+
+    def _ensure_strategy_payment_providers(self, result: dict[str, Any]) -> None:
+        """Proactively provision payment providers for active strategies.
+
+        Each selling strategy needs at least one payment provider to collect
+        money. This checks active strategies and ensures their required
+        providers are set up BEFORE the strategy tries to list/deploy.
+        """
+        try:
+            active_strategies = self.db.execute(
+                "SELECT DISTINCT strategy FROM strategy_lifecycle WHERE status = 'active'"
+            )
+            if not active_strategies:
+                return
+
+            provisioned = []
+            for row in active_strategies:
+                strategy_name = row["strategy"]
+                needed_providers = self.STRATEGY_PAYMENT_PROVIDERS.get(strategy_name, [])
+                for provider in needed_providers:
+                    # Check if this provider is already set up for any brand
+                    existing = self.db.execute(
+                        "SELECT 1 FROM brand_api_keys WHERE provider = ? AND status = 'active' LIMIT 1",
+                        (provider,),
+                    )
+                    if not existing:
+                        self.log_action(
+                            "auto_provision_payment",
+                            f"Strategy '{strategy_name}' needs {provider} — provisioning now",
+                        )
+                        try:
+                            prov_result = self.api_provisioner._dispatch_provision(
+                                provider, strategy_name,
+                            )
+                            provisioned.append(f"{provider}:{strategy_name}")
+                            self.log_action(
+                                "auto_provision_result",
+                                f"{provider} for {strategy_name}: {prov_result.get('status')}",
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Auto-provision {provider} for {strategy_name} failed: {e}"
+                            )
+
+            if provisioned:
+                result["auto_provisioned_providers"] = provisioned
+        except Exception as e:
+            logger.warning(f"Strategy payment provider check failed: {e}")
 
     def _setup_kofi_campaign(self) -> dict[str, Any]:
         """Set up Ko-fi crowdfunding campaign for bootstrap funding."""
@@ -714,6 +840,51 @@ class Orchestrator(BaseAgent):
         except Exception as e:
             logger.error(f"Ko-fi sync failed: {e}")
             return {"status": "error", "error": str(e)}
+
+    def _run_failure_postmortem(self, strategy_data: dict) -> None:
+        """Analyze why a strategy failed and record prevention rules.
+
+        Runs after auto-pause to extract root causes and store them as
+        high-severity lessons so the same mistakes aren't repeated.
+        """
+        try:
+            name = strategy_data.get("name", "unknown")
+            analysis = self.think_json(
+                f"A monAI strategy was auto-paused due to poor performance.\n\n"
+                f"Strategy: {name}\n"
+                f"Net profit: €{strategy_data.get('net', 0):.2f}\n"
+                f"ROI: {strategy_data.get('roi_pct', 0)}%\n"
+                f"Revenue (7d): €{strategy_data.get('trend_7d', {}).get('revenue', 0):.2f}\n"
+                f"Expenses (7d): €{strategy_data.get('trend_7d', {}).get('expenses', 0):.2f}\n"
+                f"Budget used: {strategy_data.get('budget_used_pct', 0)}%\n\n"
+                "Analyze WHY this strategy failed. Consider:\n"
+                "1. Was the market too small or saturated?\n"
+                "2. Was the product/service quality too low?\n"
+                "3. Were costs too high relative to revenue potential?\n"
+                "4. Was the execution flawed (wrong platform, bad timing)?\n"
+                "5. Was there a technical failure?\n\n"
+                "Return: {\"root_causes\": [str], \"prevention_rules\": [str], "
+                "\"should_retry\": bool, \"retry_conditions\": str}"
+            )
+
+            # Store each prevention rule as a high-severity lesson
+            for rule in analysis.get("prevention_rules", []):
+                self.memory.store_lesson(
+                    agent=self.name,
+                    category="strategy_failure",
+                    situation=f"Strategy '{name}' auto-paused (net=€{strategy_data.get('net', 0):.2f})",
+                    lesson=rule,
+                    rule=rule,
+                    severity="high",
+                )
+
+            self.log_action(
+                "failure_postmortem",
+                f"{name}: root_causes={analysis.get('root_causes', [])}, "
+                f"should_retry={analysis.get('should_retry', False)}",
+            )
+        except Exception as e:
+            logger.warning(f"Post-mortem analysis failed for {strategy_data.get('name', '?')}: {e}")
 
     def _auto_scale_strategies(self, to_scale: list[dict]) -> list[str]:
         """Increase budget for strategies with strong growth trends.
@@ -830,14 +1001,15 @@ class Orchestrator(BaseAgent):
         except Exception as e:
             logger.error(f"Financial reporting failed: {e}")
 
-    def _run_api_provisioning(self) -> dict[str, Any]:
+    def _run_api_provisioning(self, force: bool = False) -> dict[str, Any]:
         """Run API key provisioning for brands that need payment provider keys.
 
         Checks all active brands and provisions missing API keys
         (Stripe, Gumroad, LemonSqueezy, BTCPay) via the APIProvisioner agent.
-        Runs every 5 cycles to avoid excessive provisioning attempts.
+        Always runs on first cycle; then every 5 cycles to avoid excess attempts.
+        Pass force=True to skip the cycle gate (e.g. during bootstrap).
         """
-        if self._cycle % 5 != 1:
+        if not force and self._cycle > 1 and self._cycle % 5 != 1:
             return {"status": "skipped", "reason": "not_provisioning_cycle"}
 
         try:
@@ -1268,6 +1440,15 @@ class Orchestrator(BaseAgent):
             else:
                 results[name] = {"analysis": "sparse_data"}
 
+        # Deploy any low-risk proposed improvements across all agents
+        deployed = self.self_improver.deploy_improvements()
+        results["_deployed"] = deployed
+        if deployed:
+            self.log_action(
+                "self_improvement_deployed",
+                json.dumps({"count": len(deployed), "items": deployed}, default=str)[:500],
+            )
+
         return results
 
     def _run_engineering_team(self) -> dict[str, Any]:
@@ -1542,8 +1723,10 @@ class Orchestrator(BaseAgent):
                 if self.ethics_tester.is_quarantined(name):
                     results[name] = {"status": "quarantined", "reason": "ethics_failure"}
                     continue
+                t0 = datetime.now()
                 try:
                     result = agent.run()
+                    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
                     results[name] = {"status": "ok", "result": result}
                     # Share success insights
                     agent.share_knowledge(
@@ -1552,9 +1735,18 @@ class Orchestrator(BaseAgent):
                         content=json.dumps(result, default=str)[:500],
                         tags=[name, "strategy_result"],
                     )
+                    # Update task router with success feedback
+                    self.task_router.update_performance(
+                        name, "strategy_execution", True, duration_ms,
+                    )
                 except Exception as e:
+                    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
                     logger.error(f"Strategy {name} failed: {e}")
                     results[name] = {"status": "error", "error": str(e)}
                     # Auto-learn from failure
                     agent.learn_from_error(e, context=f"Running strategy {name}")
+                    # Update task router with failure feedback
+                    self.task_router.update_performance(
+                        name, "strategy_execution", False, duration_ms,
+                    )
         return results

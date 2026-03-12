@@ -79,18 +79,37 @@ class DigitalProductsAgent(BaseAgent):
         self.log_action("gumroad_setup_failed", "Could not set up Gumroad API access")
         return False
 
+    def _get_product_statuses(self) -> dict[str, int]:
+        """Count products by status from JSON files."""
+        statuses: dict[str, int] = {}
+        for path in self.products_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                s = data.get("status", "unknown")
+                statuses[s] = statuses.get(s, 0) + 1
+            except (json.JSONDecodeError, OSError):
+                continue
+        return statuses
+
     def plan(self) -> list[str]:
-        """Plan product creation and listing cycle."""
-        existing = list(self.products_dir.glob("*.json"))
-        plan = self.think_json(
-            f"I have {len(existing)} digital products. Plan my next actions. "
-            "Return: {\"steps\": [str]}. "
-            "Possible: research_niches, create_product, list_product, check_sales, "
-            "optimize_listings, create_bundle.",
-        )
-        steps = plan.get("steps", ["research_niches"])
-        self.log_action("plan", f"Planned {len(steps)} steps")
-        return steps
+        """Deterministic product pipeline progression."""
+        statuses = self._get_product_statuses()
+
+        # Always advance the pipeline
+        if not statuses:
+            return ["research_niches"]
+        if statuses.get("researched", 0) > 0:
+            return ["create_product"]
+        if statuses.get("created", 0) > 0:
+            return ["review_product"]
+        if statuses.get("reviewed", 0) > 0:
+            return ["list_product"]
+        if statuses.get("listed", 0) > 0:
+            return ["check_sales"]
+
+        # All products listed/sold — start new cycle
+        self.log_action("plan", "All products at final stage, researching new niches")
+        return ["research_niches"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting digital products cycle")
@@ -102,6 +121,8 @@ class DigitalProductsAgent(BaseAgent):
                 results["research"] = self._research_niches()
             elif step == "create_product":
                 results["create"] = self._create_product()
+            elif step == "review_product":
+                results["review"] = self._review_product()
             elif step == "list_product":
                 results["list"] = self._list_product()
             elif step == "check_sales":
@@ -146,16 +167,53 @@ class DigitalProductsAgent(BaseAgent):
             "Return: {\"niches\": [{\"niche\": str, \"product_type\": str, "
             "\"estimated_price\": float, \"reasoning\": str}]}",
         )
-        self.log_action("research_niches", json.dumps(niches.get("niches", []))[:500])
+        # Persist top niche as actionable product file for pipeline progression
+        niche_list = niches.get("niches", [])
+        saved = 0
+        for niche in niche_list[:2]:
+            name = niche.get("niche", niche.get("product_type", "untitled"))
+            safe_name = "".join(c if c.isalnum() or c in " -_" else "" for c in name).strip()
+            if not safe_name:
+                continue
+            path = self.products_dir / f"{safe_name}.json"
+            if not path.exists():
+                path.write_text(json.dumps({
+                    "research": niche,
+                    "status": "researched",
+                }, indent=2))
+                saved += 1
+
+        self.log_action("research_niches",
+                        f"Found {len(niche_list)} niches, saved {saved} for creation")
         return niches
 
     def _create_product(self) -> dict[str, Any]:
-        """Create a digital product based on research."""
+        """Create a digital product from a researched niche."""
+        # Find a researched niche to advance
+        research_data = {}
+        review_feedback = ""
+        product_path = None
+        for path in self.products_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") == "researched":
+                research_data = data.get("research", {})
+                # If this was previously rejected, grab the review feedback
+                if data.get("review"):
+                    from monai.agents.product_reviewer import ProductReviewer
+                    review_feedback = ProductReviewer.format_feedback_for_prompt(data["review"])
+                product_path = path
+                break
+
         product_spec = self.think_json(
-            "Design a specific digital product to create right now. "
-            "It should be something I can generate with AI and sell immediately. "
+            f"Design a specific digital product based on this research:\n"
+            f"Niche: {research_data.get('niche', 'unknown')}\n"
+            f"Product type: {research_data.get('product_type', 'ebook')}\n"
+            f"Estimated price: ${research_data.get('estimated_price', 9.99)}\n"
+            f"Reasoning: {research_data.get('reasoning', '')}\n\n"
+            "Create something I can generate with AI and sell immediately. "
             "Return: {\"title\": str, \"type\": str, \"description\": str, "
-            "\"target_audience\": str, \"price\": float, \"sections\": [str]}"
+            f"\"target_audience\": str, \"price\": float, \"sections\": [str]}}"
+            f"{review_feedback}"
         )
 
         title = product_spec.get("title", "Untitled Product")
@@ -180,21 +238,70 @@ class DigitalProductsAgent(BaseAgent):
             )
             content_parts.append({"section": section, "content": part})
 
-        # Save product locally
-        safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title).strip()
-        product_path = self.products_dir / f"{safe_title}.json"
-        product_data = {
-            "spec": product_spec,
-            "content": content_parts,
-            "status": "created",
-        }
-        product_path.write_text(json.dumps(product_data, indent=2))
+        # Save product — update existing research file or create new
+        if product_path and product_path.exists():
+            existing_data = json.loads(product_path.read_text())
+            existing_data["spec"] = product_spec
+            existing_data["content"] = content_parts
+            existing_data["status"] = "created"
+            product_path.write_text(json.dumps(existing_data, indent=2))
+        else:
+            safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title).strip()
+            product_path = self.products_dir / f"{safe_title}.json"
+            product_data = {
+                "spec": product_spec,
+                "content": content_parts,
+                "status": "created",
+            }
+            product_path.write_text(json.dumps(product_data, indent=2))
 
         self.record_expense(
             0.10, "api_cost", f"Created product: {title}",
         )
         self.log_action("create_product", f"Created: {title}")
         return {"product": title, "sections": len(sections)}
+
+    def _review_product(self) -> dict[str, Any]:
+        """Quality gate: review created product before listing."""
+        for path in self.products_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "created":
+                continue
+
+            spec = data.get("spec", {})
+            name = spec.get("title", path.stem)
+
+            result = self.reviewer.review_product(
+                strategy=self.name,
+                product_name=name,
+                product_data=data,
+                product_type="digital_product",
+            )
+
+            if result.verdict == "approved":
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                if result.improved_content.get("humanized"):
+                    data["humanized_listing"] = result.improved_content["humanized"]
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_reviewed", f"{name}: APPROVED (score={result.quality_score:.2f})")
+            elif result.verdict == "rejected":
+                data["status"] = "researched"  # Send back to creation with feedback
+                data["review"] = result.to_dict()
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_review_rejected", f"{name}: REJECTED — {'; '.join(result.issues[:3])}")
+            else:
+                # needs_revision — actively revise content before proceeding
+                revised = self.reviewer.revise_product(data, result, "digital_product")
+                data["status"] = "reviewed"
+                data["review"] = result.to_dict()
+                data["revised_content"] = revised
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action("product_revised", f"{name}: REVISED and proceeding (score={result.quality_score:.2f})")
+
+            return result.to_dict()
+
+        return {"status": "no_products_to_review"}
 
     def _list_product(self) -> dict[str, Any]:
         """List products on REAL Gumroad marketplace."""
@@ -206,7 +313,7 @@ class DigitalProductsAgent(BaseAgent):
 
         for product_path in products:
             data = json.loads(product_path.read_text())
-            if data.get("status") != "created":
+            if data.get("status") not in ("created", "reviewed"):
                 continue
 
             spec = data["spec"]

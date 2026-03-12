@@ -129,7 +129,9 @@ class MoneroProvider(CryptoProvider):
         if label:
             params["label"] = label
         result = await self._rpc_call("create_address", params)
-        address = result["address"]
+        address = result.get("address")
+        if not address:
+            raise MoneroRPCError(-1, "RPC response missing 'address' field")
         logger.info(f"Generated XMR subaddress: {address[:12]}... (label: {label})")
         return address
 
@@ -155,7 +157,9 @@ class MoneroProvider(CryptoProvider):
 
         # Use a dummy address to estimate — we won't actually send
         result = await self._rpc_call("get_address", {"account_index": 0})
-        own_address = result["address"]
+        own_address = result.get("address")
+        if not own_address:
+            raise MoneroRPCError(-1, "RPC response missing 'address' field")
 
         try:
             result = await self._rpc_call("transfer", {
@@ -411,15 +415,18 @@ class MoneroProvider(CryptoProvider):
     async def get_primary_address(self) -> str:
         """Get the wallet's primary address."""
         result = await self._rpc_call("get_address", {"account_index": 0})
-        return result["address"]
+        address = result.get("address")
+        if not address:
+            raise MoneroRPCError(-1, "RPC response missing 'address' field")
+        return address
 
     async def get_all_subaddresses(self) -> list[dict[str, Any]]:
         """List all subaddresses in the wallet."""
         result = await self._rpc_call("get_address", {"account_index": 0})
         return [
             {
-                "index": addr["address_index"],
-                "address": addr["address"],
+                "index": addr.get("address_index", 0),
+                "address": addr.get("address", ""),
                 "label": addr.get("label", ""),
                 "used": addr.get("used", False),
             }

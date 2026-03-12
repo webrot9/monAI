@@ -109,13 +109,19 @@ class LeadGenAgent(BaseAgent):
     def plan(self) -> list[str]:
         lists = self.db.execute("SELECT status, COUNT(*) as c FROM lead_lists GROUP BY status")
         stats = {r["status"]: r["c"] for r in lists}
-        plan = self.think_json(
-            f"Lead list stats: {json.dumps(stats)}. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: research_niches, build_list, enrich_leads, qualify_leads, "
-            "package_for_sale, find_buyers, analyze_performance.",
-        )
-        return plan.get("steps", ["research_niches"])
+
+        # Deterministic progression
+        if not stats:
+            return ["research_niches"]
+        if stats.get("building", 0) > 0:
+            return ["enrich_leads"]
+        if stats.get("qualifying", 0) > 0:
+            return ["qualify_leads"]
+        if stats.get("ready", 0) > 0:
+            return ["find_buyers"]
+
+        # All lists sold — research new niches
+        return ["research_niches"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting lead gen cycle")

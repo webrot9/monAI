@@ -28,15 +28,31 @@ class AffiliateAgent(BaseAgent):
         self.content_dir = config.data_dir / "affiliate_content"
         self.content_dir.mkdir(parents=True, exist_ok=True)
 
+    def _get_content_statuses(self) -> dict[str, int]:
+        """Count content pieces by status."""
+        statuses: dict[str, int] = {}
+        for path in self.content_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                s = data.get("status", "unknown")
+                statuses[s] = statuses.get(s, 0) + 1
+            except (json.JSONDecodeError, OSError):
+                continue
+        return statuses
+
     def plan(self) -> list[str]:
-        existing = list(self.content_dir.glob("*.json"))
-        plan = self.think_json(
-            f"I have {len(existing)} affiliate content pieces. Plan next actions.\n"
-            "Return: {\"steps\": [str]}.\n"
-            "Options: research_programs, research_products, write_review, "
-            "write_comparison, optimize_existing, analyze_performance.",
-        )
-        return plan.get("steps", ["research_programs"])
+        statuses = self._get_content_statuses()
+
+        # Deterministic progression
+        if not statuses:
+            return ["research_programs"]
+        if statuses.get("researched", 0) > 0:
+            return ["write_review"]
+        if statuses.get("draft", 0) > 0:
+            return ["write_comparison"]  # Create more content types
+
+        # All content published — research new programs
+        return ["research_programs"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         self.log_action("run_start", "Starting affiliate cycle")

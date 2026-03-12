@@ -32,7 +32,8 @@ class TestRetoSwapClient:
         c = RetoSwapClient()
         assert c.daemon_host == "127.0.0.1"
         assert c.daemon_port == 9999
-        assert c.preferred_payment_method == "SEPA"
+        assert c.preferred_payment_method == "PAYPAL"
+        assert c.fallback_payment_methods == ["CASH_BY_MAIL", "REVOLUT"]
         assert c.preferred_currency == "EUR"
         assert c.price_margin_pct == -1.0
 

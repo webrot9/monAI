@@ -385,8 +385,11 @@ class InfraSetup:
         config["monero"]["rpc_password"] = password
         config["monero"]["wallet_rpc_url"] = "http://127.0.0.1:18082"
 
-        with open(config_file, "w") as f:
+        # Atomic write: write to temp file, then rename
+        tmp_file = config_file.with_suffix(".tmp")
+        with open(tmp_file, "w") as f:
             json.dump(config, f, indent=2)
+        tmp_file.replace(config_file)
 
     # ── LLM Access ───────────────────────────────────────────────
 
@@ -479,8 +482,11 @@ class InfraSetup:
         # Set a dummy key so the startup check passes
         config["llm"]["api_key"] = "ollama-local"
 
-        with open(config_file, "w") as f:
+        # Atomic write: write to temp file, then rename
+        tmp_file = config_file.with_suffix(".tmp")
+        with open(tmp_file, "w") as f:
             json.dump(config, f, indent=2)
+        tmp_file.replace(config_file)
 
     # ── Config ───────────────────────────────────────────────────
 

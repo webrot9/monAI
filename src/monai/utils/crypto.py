@@ -29,6 +29,10 @@ _SENSITIVE_PATTERNS: tuple[str, ...] = (
     "*card_number*",
     "*card_cvv*",
     "*rpc_password*",
+    "*xmr_address*",
+    "*btc_address*",
+    "*chat_id*",
+    "*creator_username*",
 )
 
 _KEY_DIR = Path.home() / ".monai"
