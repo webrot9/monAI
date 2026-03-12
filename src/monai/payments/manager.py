@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from decimal import Decimal
 from typing import Any
 
 from monai.business.brand_payments import BrandPayments
@@ -62,8 +63,26 @@ class UnifiedPaymentManager:
         # Register webhook event handler
         self.webhook_server.on_event(self._handle_webhook_event)
 
-        # Init webhook log schema
+        # Init webhook log schema + deficit tracking
         self._init_schema()
+        self._ensure_deficit_table()
+
+    def _ensure_deficit_table(self) -> None:
+        """Create sweep_deficits table for tracking refund-after-sweep gaps."""
+        with self.db.connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS sweep_deficits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    brand TEXT NOT NULL,
+                    payment_ref TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    currency TEXT DEFAULT 'EUR',
+                    sweep_id INTEGER,
+                    status TEXT DEFAULT 'outstanding',
+                    resolved_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
 
     def _init_schema(self):
         with self.db.connect() as conn:
@@ -288,8 +307,15 @@ class UnifiedPaymentManager:
         if event.amount < 0:
             logger.error(f"Webhook with negative amount rejected: {event.amount}")
             return
+        if event.amount == 0 and event.event_type == WebhookEventType.PAYMENT_COMPLETED:
+            logger.error("Webhook with zero amount rejected for payment.completed")
+            return
         if event.amount > 1_000_000:  # €1M safety cap per single webhook
             logger.error(f"Webhook with suspicious amount rejected: {event.amount}")
+            return
+        # NaN check
+        if event.amount != event.amount:
+            logger.error("Webhook with NaN amount rejected")
             return
 
         # ATOMIC: idempotency check + event log in single transaction
@@ -354,6 +380,18 @@ class UnifiedPaymentManager:
             except (ValueError, TypeError):
                 lead_id = None
 
+        # Use Decimal for precise fee calculation, round to 2 decimals before storage
+        gross_dec = Decimal(str(event.amount))
+        rates = self.brand_payments.PLATFORM_FEE_RATES.get(event.provider)
+        if rates:
+            fee_dec = gross_dec * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"]))
+        else:
+            fee_dec = Decimal("0")
+        # Round to 2 decimal places for storage (avoids floating-point drift)
+        amount_rounded = float(gross_dec.quantize(Decimal("0.01")))
+        fee_amount = float(fee_dec.quantize(Decimal("0.01")))
+        fee_currency = event.currency  # Fee in same currency as payment
+
         # Record payment + fee atomically in a single transaction
         with self.db.transaction() as conn:
             cursor = conn.execute(
@@ -361,29 +399,16 @@ class UnifiedPaymentManager:
                 "(brand, account_id, lead_id, amount, currency, product, "
                 "customer_email, payment_ref) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (brand, account_id, lead_id, event.amount, event.currency,
+                (brand, account_id, lead_id, amount_rounded, event.currency,
                  event.product, event.customer_email, event.payment_ref),
             )
             pay_id = cursor.lastrowid
-
-            # Auto-record platform fees in same transaction
-            rates = self.brand_payments.PLATFORM_FEE_RATES.get(event.provider)
-            if rates:
-                from decimal import Decimal
-                gross = Decimal(str(event.amount))
-                fee_amount = float(
-                    gross * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"]))
-                )
-                fee_currency = event.currency  # Fee in same currency as payment
-            else:
-                fee_amount = 0.0
-                fee_currency = event.currency
 
             conn.execute(
                 "INSERT INTO platform_fees "
                 "(brand, provider, payment_id, gross_amount, fee_amount, fee_currency) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (brand, event.provider, pay_id, event.amount, fee_amount, fee_currency),
+                (brand, event.provider, pay_id, amount_rounded, fee_amount, fee_currency),
             )
 
         logger.info(
@@ -472,11 +497,25 @@ class UnifiedPaymentManager:
             (payment["brand"],),
         )
         if swept:
+            # Track the deficit so it can be recovered from future sweeps
+            try:
+                self._ensure_deficit_table()
+                self.db.execute_insert(
+                    "INSERT INTO sweep_deficits "
+                    "(brand, payment_ref, amount, currency, sweep_id, status) "
+                    "VALUES (?, ?, ?, ?, ?, 'outstanding')",
+                    (payment["brand"], event.payment_ref,
+                     payment["amount"], payment["currency"],
+                     swept[0]["id"]),
+                )
+            except Exception as e:
+                logger.error(f"Failed to record sweep deficit: {e}")
+
             logger.critical(
                 f"REFUND AFTER SWEEP: Payment {event.payment_ref} for "
                 f"{payment['amount']} {payment['currency']} was already swept. "
                 f"Brand {payment['brand']} has NEGATIVE sweepable balance. "
-                f"Manual intervention required."
+                f"Deficit tracked for recovery."
             )
 
         # Record refund in GL (reverse the original entry)
@@ -508,10 +547,16 @@ class UnifiedPaymentManager:
     async def _handle_payment_disputed(self, event: WebhookEvent) -> None:
         """Handle a dispute — mark and alert."""
         payments = self.db.execute(
-            "SELECT id, brand, amount, currency FROM brand_payments_received "
+            "SELECT id, brand, amount, currency, status FROM brand_payments_received "
             "WHERE payment_ref = ? LIMIT 1",
             (event.payment_ref,),
         )
+
+        # Defense-in-depth: skip if already disputed
+        if payments and dict(payments[0]).get("status") == "disputed":
+            logger.info(f"Payment {event.payment_ref} already disputed — skipping")
+            return
+
         with self.db.transaction() as conn:
             conn.execute(
                 "UPDATE brand_payments_received SET status = 'disputed' "
@@ -563,3 +608,101 @@ class UnifiedPaymentManager:
             },
             "sweep_summary": self.sweep_engine.get_sweep_summary(),
         }
+
+    # ── Webhook Replay ─────────────────────────────────────────
+
+    async def replay_webhook(self, event_id: int) -> dict[str, Any]:
+        """Replay a single webhook event by its ID from the webhook_events table.
+
+        Re-processes the stored raw_payload through the normal handler pipeline.
+        Idempotency is bypassed by removing the processed_webhooks entry first.
+        """
+        rows = self.db.execute(
+            "SELECT * FROM webhook_events WHERE id = ?", (event_id,)
+        )
+        if not rows:
+            return {"success": False, "error": f"Event {event_id} not found"}
+
+        row = dict(rows[0])
+        raw_payload = row.get("raw_payload")
+        if not raw_payload:
+            return {"success": False, "error": "No raw_payload stored for this event"}
+
+        try:
+            raw = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+        except json.JSONDecodeError:
+            return {"success": False, "error": "Corrupted raw_payload"}
+
+        # Remove idempotency lock so re-processing can proceed
+        idem_id = f"{row['payment_ref']}:{row['event_type']}"
+        self.db.execute(
+            "DELETE FROM processed_webhooks WHERE provider = ? AND event_id = ?",
+            (row["provider"], idem_id),
+        )
+        # Remove original webhook_events entry (handler will re-insert)
+        self.db.execute("DELETE FROM webhook_events WHERE id = ?", (event_id,))
+
+        # Reconstruct the WebhookEvent
+        try:
+            event_type = WebhookEventType(row["event_type"])
+        except ValueError:
+            return {"success": False, "error": f"Unknown event type: {row['event_type']}"}
+
+        event = WebhookEvent(
+            event_type=event_type,
+            provider=row["provider"],
+            payment_ref=row["payment_ref"],
+            amount=float(row.get("amount", 0)),
+            currency=row.get("currency", "EUR"),
+            metadata={"brand": row.get("brand", "")},
+            raw=raw,
+        )
+
+        try:
+            await self._handle_webhook_event(event)
+            logger.info(f"Webhook replayed: event_id={event_id} ref={row['payment_ref']}")
+            return {"success": True, "payment_ref": row["payment_ref"]}
+        except Exception as e:
+            logger.error(f"Webhook replay failed for event_id={event_id}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def replay_failed_webhooks(
+        self, since_hours: int = 24, limit: int = 100
+    ) -> dict[str, Any]:
+        """Replay webhook events that have errors recorded.
+
+        Returns summary of replay results.
+        """
+        rows = self.db.execute(
+            "SELECT id FROM webhook_events "
+            "WHERE error IS NOT NULL AND error != '' "
+            "AND created_at >= datetime('now', ?) "
+            "ORDER BY created_at ASC LIMIT ?",
+            (f"-{since_hours} hours", limit),
+        )
+
+        results = {"total": len(rows), "succeeded": 0, "failed": 0, "errors": []}
+        for row in rows:
+            result = await self.replay_webhook(row["id"])
+            if result["success"]:
+                results["succeeded"] += 1
+            else:
+                results["failed"] += 1
+                results["errors"].append(
+                    {"event_id": row["id"], "error": result.get("error", "")}
+                )
+
+        logger.info(
+            f"Webhook replay batch: {results['succeeded']}/{results['total']} succeeded"
+        )
+        return results
+
+    def get_replayable_webhooks(self, limit: int = 50) -> list[dict]:
+        """List webhook events available for replay."""
+        rows = self.db.execute(
+            "SELECT id, provider, event_type, payment_ref, amount, currency, "
+            "brand, status, error, created_at FROM webhook_events "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in rows]

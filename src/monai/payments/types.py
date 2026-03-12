@@ -65,6 +65,9 @@ class PaymentIntent:
             raise ValueError(f"Payment amount must be a number, got {type(self.amount).__name__}")
         if self.amount != self.amount:  # NaN check
             raise ValueError("Payment amount cannot be NaN")
+        import math
+        if math.isinf(self.amount):
+            raise ValueError("Payment amount cannot be infinite")
         if self.amount < MIN_PAYMENT_AMOUNT:
             raise ValueError(
                 f"Payment amount {self.amount} below minimum {MIN_PAYMENT_AMOUNT}"

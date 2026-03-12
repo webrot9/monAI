@@ -120,3 +120,8 @@
 - **Mistake**: Assumed the creator would provide API credentials for platforms (Gumroad, Stripe, Twitter, etc.)
 - **Root cause**: Traditional developer mindset — someone hands you the keys
 - **Rule**: The ONLY API key the creator provides is OpenAI. Everything else — Gumroad, social media, hosting, domain registrars, payment processors — the agents figure out themselves. They use browser automation to sign up, get API keys, and store credentials via IdentityManager. Full autonomy means full self-provisioning.
+
+### 2026-03-11 - sqlite3.Row does not have .get() method
+- **Mistake**: Used `row.get("column")` on `sqlite3.Row` objects returned by `db.execute()`, which raises `AttributeError`
+- **Root cause**: Treating `sqlite3.Row` as `dict` — it supports bracket access (`row["col"]`) but NOT `.get()`
+- **Rule**: Always use `row["column"]` for `sqlite3.Row` objects. If you need `.get()` behavior, convert to `dict(row)` first. When checking for NULL, use `row["col"]` in a truthiness check, not `.get()`. Found 3 instances in `api_provisioner.py`.

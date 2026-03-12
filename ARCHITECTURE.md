@@ -215,6 +215,8 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 | `tax_estimation.py` | Quarterly tax estimation (Italian forfettario + US federal, SE tax, brackets) |
 | `audit.py` | Audit trail (queryable activity log, risk assessment, per-agent summaries, Telegram reports) |
 | `backup.py` | Automated backup & restore (SQLite online backup, config backup, rotation, integrity verification) |
+| `alerting.py` | Alerting rules engine (configurable threshold-based alerts, cooldown dedup, severity levels, Telegram integration) |
+| `spending_guard.py` | Spending cap enforcement (daily, per-transaction, per-strategy limits with approval thresholds) |
 | ~~`payments.py`~~ | **REMOVED** — superseded by `payments/manager.py` + `business/brand_payments.py` |
 | `brand_payments.py` | Per-brand payment accounts |
 | `comms.py` | Email engine (SMTP/IMAP) |
@@ -236,7 +238,7 @@ Content Generation → FactChecker → Humanizer → Publish/Revise/Block
 ### Dashboard (`src/monai/dashboard/`)
 | Module | Purpose |
 |--------|---------|
-| `server.py` | Real-time web UI (SSE, financial overview, strategies, audit trail, brand P&L, backup status) |
+| `server.py` | Real-time web UI (SSE, financial overview, strategies, audit trail, brand P&L, backup status, alerts, webhook replay) |
 
 ### Strategies (`src/monai/strategies/`)
 13 strategy agents, each implementing a FULLY FUNCTIONAL autonomous revenue channel.
@@ -310,23 +312,32 @@ All strategies use real browser automation and APIs — zero simulation:
 
 ## Test Suite
 
-- **1216 tests** across 62 test files
+- **1520 tests** across 70+ test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
 
 ## Session Continuity Notes
 
-### What's Been Built (as of 2026-03-10)
+### What's Been Built (as of 2026-03-11)
 Everything listed above is implemented, tested, and passing. The codebase is functional from config through to payment sweep.
 
 **Major refactor completed 2026-03-10**: All 13 strategy agents rewired from simulated/hallucinated operations to REAL browser automation and API integrations. BaseAgent now provides `execute_task()`, `browse_and_extract()`, `search_web()`, `ensure_platform_account()`, and `platform_action()` to all agents. Zero simulation remaining.
 
+**Sprint 1+2 bug fixes completed 2026-03-11**: Decimal precision for all financial amounts, PaymentIntent/webhook amount validation (NaN/inf/zero/negative/bounds), Gumroad parsing robustness, currency-aware sweepable balances, refund-after-sweep deficit tracking, reconciliation webhook-only filter, rate limiter memory protection, spending cap enforcement.
+
+**Half-done features completed 2026-03-11**: Dashboard HTML enhancements (audit trail panel, brand P&L table, backup status widget), alerting rules engine (configurable thresholds, cooldown dedup, severity levels), webhook replay (single/batch replay, replayable event listing), spending guard module.
+
+**Sprint 4 completed 2026-03-11**: Team agents enhanced with real data-driven logic — GrowthHacker experiment insights (win rates by type, winning patterns), ContentMarketer SEO validation (word count, keyword density with word-boundary regex, readability, heading structure), OutreachSpecialist prospect segmentation (channel routing, deduplication, follow-up templates), AgentSpawner structured task decomposition (numbered/bullet/and-separated lists, topological sort dependency resolution).
+
+**Sprint 5 completed 2026-03-11**: Crowdfunding landing page enhancements — client-side QR code generation for Monero payment modal (pure JS, canvas-based), crowdfunding campaign management with atomic contribution recording and auto-funded status, fixed DB API calls (fetch_all→execute, positional→dict-key row access).
+
+**Sprint 6 completed 2026-03-11**: ProxyFallbackChain already fully implemented — 22 tests added covering Tor→residential→datacenter proxy fallback, per-domain blocking, block page content detection (≥2 pattern matches), thread safety, preferred proxy after success.
+
+**Sprint 7 completed 2026-03-11**: APIProvisioner already fully implemented — 49 tests added covering schema init, plan generation, encrypted key storage/retrieval, key rotation, provider dispatching, webhook URL building, brand email resolution, result key parsing, BTCPay provisioning, provision_all orchestration. Fixed 3 production bugs (sqlite3.Row .get() → bracket access).
+
 ### What's Next
-1. ~~**Crowdfunding landing page**~~ — DONE: `src/monai/web/landing/` (static page + generator + deploy helper)
-2. **Ko-fi campaign setup** — automated campaign creation and monitoring
-3. **End-to-end integration tests** — full payment flow from Stripe webhook to creator wallet
-4. **More platform integrations** — LemonSqueezy, Stripe connect, etc.
+1. **First real deployment test** (end-to-end with a real Ko-fi page)
 
 ### Key Design Decisions Made
 - **OpenAI, not Claude**: All LLM calls use OpenAI SDK (gpt-4o / gpt-4o-mini / gpt-4.1-nano)

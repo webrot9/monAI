@@ -103,6 +103,9 @@ class GrowthHacker(BaseAgent):
         # Get funnel metrics from DB
         funnel_stats = self._get_funnel_stats(campaign)
 
+        # Get data-driven suggestions from historical experiment performance
+        historical_insights = self._get_experiment_insights()
+
         experiments = self.think_json(
             f"Design growth experiments for:\n"
             f"Strategy: {strategy}\n"
@@ -110,8 +113,10 @@ class GrowthHacker(BaseAgent):
             f"Target audience: {campaign.get('target_audience', '')}\n\n"
             f"Current funnel data:\n{json.dumps(funnel_stats, default=str)}\n"
             f"Platform metrics:\n{json.dumps(metrics_collected, default=str)[:500]}\n"
-            f"Recently concluded experiments:\n{json.dumps(concluded, default=str)[:500]}\n\n"
+            f"Recently concluded experiments:\n{json.dumps(concluded, default=str)[:500]}\n"
+            f"Historical insights (what worked before):\n{json.dumps(historical_insights, default=str)[:500]}\n\n"
             "Think like a growth hacker. Design experiments with clear A/B variants. "
+            "Prioritize experiment types that historically performed well. "
             "Each experiment needs: specific hypothesis, two variants, measurable success metric.\n\n"
             "Return JSON: {{\"experiments\": [{{\"name\": str, "
             "\"hypothesis\": str, \"type\": \"viral_loop\"|\"referral\"|"
@@ -319,6 +324,73 @@ class GrowthHacker(BaseAgent):
         except Exception as e:
             logger.warning(f"Experiment implementation failed: {e}")
             return {"status": "error", "error": str(e)}
+
+    # ── Data-driven experiment design ─────────────────────────────
+
+    def _get_experiment_insights(self) -> dict[str, Any]:
+        """Analyze past experiment performance to inform new experiment design.
+
+        Computes win rates by type, best-performing hypotheses, and identifies
+        the funnel stage where improvements had the biggest impact.
+        """
+        # Win rates by experiment type
+        type_stats = self.db.execute(
+            "SELECT experiment_type, "
+            "COUNT(*) as total, "
+            "SUM(CASE WHEN winner IS NOT NULL AND winner != 'inconclusive' THEN 1 ELSE 0 END) as wins, "
+            "AVG(confidence_level) as avg_confidence "
+            "FROM growth_experiments WHERE status = 'concluded' "
+            "GROUP BY experiment_type ORDER BY wins DESC"
+        )
+        type_performance = []
+        for row in type_stats:
+            r = dict(row)
+            r["win_rate"] = round(r["wins"] / r["total"], 2) if r["total"] > 0 else 0
+            type_performance.append(r)
+
+        # Top winning experiments (highest lift)
+        top_winners = self.db.execute(
+            "SELECT name, experiment_type, hypothesis, winner, "
+            "variant_a_views, variant_a_conversions, variant_b_views, variant_b_conversions, "
+            "confidence_level "
+            "FROM growth_experiments WHERE status = 'concluded' AND winner IN ('a', 'b') "
+            "ORDER BY confidence_level DESC LIMIT 5"
+        )
+        winning_patterns = []
+        for w in top_winners:
+            w = dict(w)
+            rate_a = w["variant_a_conversions"] / w["variant_a_views"] if w["variant_a_views"] > 0 else 0
+            rate_b = w["variant_b_conversions"] / w["variant_b_views"] if w["variant_b_views"] > 0 else 0
+            lift = abs(rate_a - rate_b) / max(min(rate_a, rate_b), 0.001) * 100
+            winning_patterns.append({
+                "name": w["name"],
+                "type": w["experiment_type"],
+                "hypothesis": w["hypothesis"][:100],
+                "lift_pct": round(lift, 1),
+                "confidence": round(w["confidence_level"] or 0, 3),
+            })
+
+        # Failed experiments to avoid repeating
+        failed_types = self.db.execute(
+            "SELECT experiment_type, COUNT(*) as failures "
+            "FROM growth_experiments WHERE status = 'concluded' AND winner = 'inconclusive' "
+            "GROUP BY experiment_type ORDER BY failures DESC LIMIT 3"
+        )
+
+        # Minimum sample size estimate based on past experiments
+        sample_sizes = self.db.execute(
+            "SELECT AVG(variant_a_views + variant_b_views) as avg_total_views, "
+            "MIN(variant_a_views + variant_b_views) as min_views "
+            "FROM growth_experiments WHERE status = 'concluded'"
+        )
+
+        return {
+            "type_performance": type_performance,
+            "best_types": [t["experiment_type"] for t in type_performance if t["win_rate"] >= 0.5],
+            "winning_patterns": winning_patterns,
+            "inconclusive_types": [dict(r) for r in failed_types],
+            "avg_sample_needed": dict(sample_sizes[0]) if sample_sizes else {},
+        }
 
     # ── Experiment data recording (called externally) ──────────────
 

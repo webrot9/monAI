@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
+from monai.business.alerting import AlertingEngine
 from monai.business.audit import AuditTrail
 from monai.business.backup import BackupManager
 from monai.business.commercialista import Commercialista
@@ -68,6 +69,7 @@ class DashboardServer:
             db, config.data_dir / "backups",
             max_backups=config.backup.max_backups,
         )
+        self.alerting = AlertingEngine(db)
 
     async def start(self):
         """Start the dashboard server."""
@@ -159,6 +161,19 @@ class DashboardServer:
                 await self._serve_json(writer, self._get_brand_pnl(params))
             elif route == "/api/backups":
                 await self._serve_json(writer, self._get_backups())
+            elif route == "/api/alerts":
+                params = parse_qs(parsed.query)
+                await self._serve_json(writer, self._get_alerts(params))
+            elif route == "/api/alerts/rules":
+                await self._serve_json(writer, self.alerting.get_rules())
+            elif route == "/api/alerts/summary":
+                params = parse_qs(parsed.query)
+                days = int(params.get("days", ["7"])[0])
+                await self._serve_json(writer, self.alerting.get_summary(days))
+            elif route == "/api/webhooks":
+                params = parse_qs(parsed.query)
+                limit = int(params.get("limit", ["50"])[0])
+                await self._serve_json(writer, self._get_webhooks(limit))
             elif route == "/events":
                 await self._serve_sse(writer)
             else:
@@ -303,6 +318,27 @@ class DashboardServer:
             "latest_db": self.backup_manager.get_latest_backup("database"),
             "latest_config": self.backup_manager.get_latest_backup("config"),
         }
+
+    def _get_alerts(self, params: dict[str, list[str]]) -> dict[str, Any]:
+        """Get recent alerts with optional limit."""
+        limit = int(params.get("limit", ["50"])[0])
+        return {
+            "alerts": self.alerting.get_recent_alerts(limit),
+            "rules": self.alerting.get_rules(),
+        }
+
+    def _get_webhooks(self, limit: int = 50) -> list[dict]:
+        """Get webhook events for replay UI."""
+        try:
+            rows = self.db.execute(
+                "SELECT id, provider, event_type, payment_ref, amount, currency, "
+                "brand, status, error, created_at FROM webhook_events "
+                "ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
 
     # ── HTTP Helpers ─────────────────────────────────────────────
 
@@ -625,6 +661,41 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Brand P&L + Backup Status -->
+<div class="two-col" style="margin-top:12px">
+  <div class="card">
+    <h2>Brand P&L</h2>
+    <table>
+      <thead><tr><th>Brand</th><th>Revenue</th><th>Expenses</th><th>Net</th></tr></thead>
+      <tbody id="brand-pnl-body"></tbody>
+    </table>
+    <div id="brand-pnl-empty" style="color:var(--dim);font-size:12px;padding:8px 0">Loading...</div>
+  </div>
+  <div class="card">
+    <h2>Backup Status</h2>
+    <div id="backup-content">
+      <div class="stat"><span class="label">Latest DB Backup</span><span class="value" id="backup-db-latest">--</span></div>
+      <div class="stat"><span class="label">DB Backup Count</span><span class="value" id="backup-db-count">--</span></div>
+      <div class="stat"><span class="label">Latest Config Backup</span><span class="value" id="backup-cfg-latest">--</span></div>
+      <div class="stat"><span class="label">Config Backup Count</span><span class="value" id="backup-cfg-count">--</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- Audit Trail -->
+<div class="card wide" style="margin-top:12px">
+  <h2>Audit Trail <span id="audit-total" style="color:var(--dim);font-weight:400;font-size:10px;text-transform:none"></span></h2>
+  <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+    <div class="stat" style="gap:6px"><span class="label">High-Risk Events (7d):</span><span class="value warning" id="audit-high-risk">--</span></div>
+    <div class="stat" style="gap:6px"><span class="label">Failures (7d):</span><span class="value negative" id="audit-failures">--</span></div>
+  </div>
+  <table>
+    <thead><tr><th>Time</th><th>Agent</th><th>Action</th><th>Risk</th><th>Brand</th><th>Details</th></tr></thead>
+    <tbody id="audit-body"></tbody>
+  </table>
+  <div id="audit-empty" style="color:var(--dim);font-size:12px;padding:8px 0">Loading...</div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 const eur = v => typeof v === 'number' ? '€' + v.toFixed(2) : '--';
@@ -750,6 +821,77 @@ function connect() {
     setTimeout(connect, Math.min(retries * 2000, 30000));
   };
 }
+
+// Fetch auxiliary panels (not in SSE stream)
+function fetchAudit() {
+  fetch('/api/audit?limit=20').then(r => r.json()).then(entries => {
+    $('audit-empty').style.display = entries.length ? 'none' : 'block';
+    $('audit-body').innerHTML = entries.map(e => {
+      const t = (e.created_at || '').replace('T', ' ').substring(0, 19);
+      const riskCls = e.risk_level === 'high' ? 'negative' :
+        e.risk_level === 'medium' ? 'warning' : '';
+      return '<tr>' +
+        '<td style="color:var(--dim);white-space:nowrap">' + t + '</td>' +
+        '<td style="color:var(--purple)">' + (e.agent_name || '') + '</td>' +
+        '<td style="color:var(--cyan)">' + (e.action_type || '') + '</td>' +
+        '<td class="' + riskCls + '">' + (e.risk_level || 'low') + '</td>' +
+        '<td>' + (e.brand || '') + '</td>' +
+        '<td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+          (e.details || '').substring(0, 120) + '</td>' +
+        '</tr>';
+    }).join('');
+  }).catch(() => {});
+
+  fetch('/api/audit/summary?days=7').then(r => r.json()).then(s => {
+    $('audit-total').textContent = '(' + (s.total_actions || 0) + ' actions in 7d)';
+    $('audit-high-risk').textContent = (s.high_risk || []).length;
+    $('audit-failures').textContent = (s.failures || []).length;
+  }).catch(() => {});
+}
+
+function fetchBrandPnl() {
+  fetch('/api/brands').then(r => r.json()).then(data => {
+    const brands = data.brands || [];
+    $('brand-pnl-empty').style.display = brands.length ? 'none' : 'block';
+    if (!brands.length) { $('brand-pnl-empty').textContent = 'No brand data'; return; }
+    $('brand-pnl-body').innerHTML = brands.map(b => {
+      const net = (b.revenue || 0) - (b.expenses || 0);
+      const netCls = net >= 0 ? 'positive' : 'negative';
+      return '<tr>' +
+        '<td>' + (b.brand || b.name || '') + '</td>' +
+        '<td class="positive">' + eur(b.revenue) + '</td>' +
+        '<td class="negative">' + eur(b.expenses) + '</td>' +
+        '<td class="' + netCls + '">' + eur(net) + '</td>' +
+        '</tr>';
+    }).join('');
+  }).catch(() => { $('brand-pnl-empty').textContent = 'Failed to load'; });
+}
+
+function fetchBackups() {
+  fetch('/api/backups').then(r => r.json()).then(data => {
+    const dbList = data.database || [];
+    const cfgList = data.config || [];
+    $('backup-db-count').textContent = dbList.length;
+    $('backup-cfg-count').textContent = cfgList.length;
+
+    const latestDb = data.latest_db;
+    if (latestDb && latestDb.created_at) {
+      $('backup-db-latest').textContent = latestDb.created_at.replace('T', ' ').substring(0, 19);
+    } else {
+      $('backup-db-latest').textContent = dbList.length ? 'Available' : 'None';
+    }
+    const latestCfg = data.latest_config;
+    if (latestCfg && latestCfg.created_at) {
+      $('backup-cfg-latest').textContent = latestCfg.created_at.replace('T', ' ').substring(0, 19);
+    } else {
+      $('backup-cfg-latest').textContent = cfgList.length ? 'Available' : 'None';
+    }
+  }).catch(() => {});
+}
+
+// Refresh auxiliary panels every 30s
+fetchAudit(); fetchBrandPnl(); fetchBackups();
+setInterval(() => { fetchAudit(); fetchBrandPnl(); fetchBackups(); }, 30000);
 
 // Initial fetch + SSE
 fetch('/api/data').then(r => r.json()).then(update).catch(() => {});

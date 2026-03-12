@@ -102,7 +102,7 @@ class ReconciliationEngine:
         if not end_date:
             end_date = datetime.now().strftime("%Y-%m-%d")
 
-        # Get GL entries with payment references (these should match webhooks)
+        # Get GL entries from webhook source (only these should match webhook events)
         gl_entries = self._get_gl_entries(start_date, end_date)
 
         # Get webhook events
@@ -260,6 +260,7 @@ class ReconciliationEngine:
             "FROM gl_journal_entries e "
             "JOIN gl_journal_lines l ON l.entry_id = e.id "
             "WHERE e.reference IS NOT NULL AND e.reference != '' "
+            "AND e.source IN ('webhook', 'webhook_refund') "
             "AND e.entry_date <= ? "
         )
         params: list = [end_date]

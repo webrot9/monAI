@@ -812,7 +812,7 @@ class APIProvisioner(BaseAgent):
             "WHERE brand = ? AND identity_id IS NOT NULL LIMIT 1",
             (brand,),
         )
-        if rows and rows[0].get("identity_id"):
+        if rows and rows[0]["identity_id"]:
             identity_rows = self.db.execute(
                 "SELECT * FROM identities WHERE identifier = ? LIMIT 1",
                 (rows[0]["identity_id"],),
@@ -1132,7 +1132,7 @@ class APIProvisioner(BaseAgent):
             "LIMIT 1",
             (brand, provider, key_type),
         )
-        if rows and rows[0].get("key_value"):
+        if rows and rows[0]["key_value"]:
             return decrypt_value(rows[0]["key_value"])
         return None
 
@@ -1144,7 +1144,7 @@ class APIProvisioner(BaseAgent):
             "AND webhook_secret IS NOT NULL LIMIT 1",
             (brand, provider),
         )
-        if rows and rows[0].get("webhook_secret"):
+        if rows and rows[0]["webhook_secret"]:
             return decrypt_value(rows[0]["webhook_secret"])
         return None
 

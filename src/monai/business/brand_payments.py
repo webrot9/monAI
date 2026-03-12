@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from monai.db.database import Database
@@ -251,16 +252,18 @@ class BrandPayments:
                        currency: str = "EUR",
                        metadata: dict | None = None) -> int:
         """Record an incoming payment for a brand."""
+        # Round to 2 decimal places to avoid floating-point drift in SQLite REAL
+        amount_rounded = float(Decimal(str(amount)).quantize(Decimal("0.01")))
         pay_id = self.db.execute_insert(
             "INSERT INTO brand_payments_received "
             "(brand, account_id, lead_id, amount, currency, product, "
             "customer_email, payment_ref, metadata) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (brand, account_id, lead_id, amount, currency, product,
+            (brand, account_id, lead_id, amount_rounded, currency, product,
              customer_email, payment_ref,
              json.dumps(metadata) if metadata else None),
         )
-        logger.info(f"Payment received: {brand} — {currency} {amount:.2f} for {product}")
+        logger.info(f"Payment received: {brand} — {currency} {amount_rounded:.2f} for {product}")
         return pay_id
 
     def get_payments(self, brand: str,
@@ -301,25 +304,74 @@ class BrandPayments:
 
     # ── Profit Sweeping ───────────────────────────────────────
 
-    def get_sweepable_balance(self, brand: str) -> float:
-        """Calculate how much can be swept from a brand's accounts."""
-        rows = self.db.execute(
-            "SELECT COALESCE(SUM(amount), 0) as received "
-            "FROM brand_payments_received "
-            "WHERE brand = ? AND status = 'completed'",
-            (brand,),
-        )
+    def get_sweepable_balance(self, brand: str, currency: str | None = None) -> float:
+        """Calculate how much can be swept from a brand's accounts.
+
+        Args:
+            brand: Brand name.
+            currency: If provided, only count payments in this currency.
+        """
+        if currency:
+            rows = self.db.execute(
+                "SELECT COALESCE(SUM(amount), 0) as received "
+                "FROM brand_payments_received "
+                "WHERE brand = ? AND status = 'completed' AND currency = ?",
+                (brand, currency),
+            )
+        else:
+            rows = self.db.execute(
+                "SELECT COALESCE(SUM(amount), 0) as received "
+                "FROM brand_payments_received "
+                "WHERE brand = ? AND status = 'completed'",
+                (brand,),
+            )
         received = rows[0]["received"] if rows else 0
 
-        rows = self.db.execute(
-            "SELECT COALESCE(SUM(amount), 0) as swept "
-            "FROM brand_profit_sweeps "
-            "WHERE brand = ? AND status IN ('completed', 'pending', 'mixing')",
-            (brand,),
-        )
+        if currency:
+            rows = self.db.execute(
+                "SELECT COALESCE(SUM(amount), 0) as swept "
+                "FROM brand_profit_sweeps "
+                "WHERE brand = ? AND status IN ('completed', 'pending', 'mixing') "
+                "AND currency = ?",
+                (brand, currency),
+            )
+        else:
+            rows = self.db.execute(
+                "SELECT COALESCE(SUM(amount), 0) as swept "
+                "FROM brand_profit_sweeps "
+                "WHERE brand = ? AND status IN ('completed', 'pending', 'mixing')",
+                (brand,),
+            )
         swept = rows[0]["swept"] if rows else 0
 
         return max(0.0, received - swept)
+
+    def get_sweepable_by_currency(self, brand: str) -> dict[str, float]:
+        """Get sweepable balance per currency for a brand."""
+        rows = self.db.execute(
+            "SELECT currency, COALESCE(SUM(amount), 0) as received "
+            "FROM brand_payments_received "
+            "WHERE brand = ? AND status = 'completed' "
+            "GROUP BY currency",
+            (brand,),
+        )
+        received = {r["currency"]: r["received"] for r in rows}
+
+        rows = self.db.execute(
+            "SELECT currency, COALESCE(SUM(amount), 0) as swept "
+            "FROM brand_profit_sweeps "
+            "WHERE brand = ? AND status IN ('completed', 'pending', 'mixing') "
+            "GROUP BY currency",
+            (brand,),
+        )
+        swept = {r["currency"]: r["swept"] for r in rows}
+
+        result = {}
+        for cur in set(received) | set(swept):
+            bal = received.get(cur, 0) - swept.get(cur, 0)
+            if bal > 0:
+                result[cur] = bal
+        return result
 
     def initiate_sweep(self, brand: str, from_account_id: int,
                        to_account_id: int, amount: float,
@@ -444,18 +496,24 @@ class BrandPayments:
         if fee_amount is None:
             rates = self.PLATFORM_FEE_RATES.get(provider)
             if rates:
-                from decimal import Decimal
                 gross = Decimal(str(gross_amount))
-                fee_amount = float(gross * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"])))
-                # fee_currency stays as passed in — matches the payment currency
+                fee_amount = float(
+                    (gross * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"])))
+                    .quantize(Decimal("0.01"))
+                )
             else:
                 fee_amount = 0.0
+        else:
+            # Round provided fee to 2 decimals
+            fee_amount = float(Decimal(str(fee_amount)).quantize(Decimal("0.01")))
+
+        gross_rounded = float(Decimal(str(gross_amount)).quantize(Decimal("0.01")))
 
         return self.db.execute_insert(
             "INSERT INTO platform_fees "
             "(brand, provider, payment_id, gross_amount, fee_amount, fee_currency) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (brand, provider, payment_id, gross_amount, fee_amount, fee_currency),
+            (brand, provider, payment_id, gross_rounded, fee_amount, fee_currency),
         )
 
     def get_total_fees(self, brand: str | None = None) -> float:

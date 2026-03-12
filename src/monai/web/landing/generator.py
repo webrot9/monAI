@@ -19,6 +19,37 @@ logger = logging.getLogger(__name__)
 TEMPLATE_PATH = Path(__file__).parent / "index.html"
 OUTPUT_DIR = Path(__file__).parent
 
+CROWDFUNDING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS crowdfunding_campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    goal_amount REAL NOT NULL DEFAULT 500,
+    raised_amount REAL NOT NULL DEFAULT 0,
+    backer_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS crowdfunding_contributions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER REFERENCES crowdfunding_campaigns(id),
+    amount REAL NOT NULL,
+    currency TEXT DEFAULT 'EUR',
+    payment_ref TEXT,
+    backer_email TEXT,
+    tier TEXT,
+    status TEXT DEFAULT 'completed',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+def ensure_crowdfunding_schema(db: Database) -> None:
+    """Create crowdfunding tables if they don't exist."""
+    with db.connect() as conn:
+        conn.executescript(CROWDFUNDING_SCHEMA)
+
 
 def _get_funding_progress(db: Database) -> dict[str, Any]:
     """Pull live funding data from the crowdfunding tables.
@@ -29,7 +60,7 @@ def _get_funding_progress(db: Database) -> dict[str, Any]:
 
     try:
         # Get the active campaign
-        campaigns = db.fetch_all(
+        campaigns = db.execute(
             "SELECT goal_amount, raised_amount, backer_count "
             "FROM crowdfunding_campaigns "
             "WHERE status IN ('active', 'funded') "
@@ -38,22 +69,22 @@ def _get_funding_progress(db: Database) -> dict[str, Any]:
         if campaigns:
             row = campaigns[0]
             return {
-                "raised": row[1] or 0,
-                "goal": row[0] or 500,
-                "backers": row[2] or 0,
+                "raised": row["raised_amount"] or 0,
+                "goal": row["goal_amount"] or 500,
+                "backers": row["backer_count"] or 0,
             }
 
         # Fallback: sum contributions directly
-        totals = db.fetch_all(
-            "SELECT COALESCE(SUM(amount), 0), COUNT(*) "
+        totals = db.execute(
+            "SELECT COALESCE(SUM(amount), 0) as total, COUNT(*) as cnt "
             "FROM crowdfunding_contributions "
             "WHERE status = 'completed'"
         )
-        if totals and totals[0][0] > 0:
+        if totals and totals[0]["total"] > 0:
             return {
-                "raised": totals[0][0],
+                "raised": totals[0]["total"],
                 "goal": 500,
-                "backers": totals[0][1],
+                "backers": totals[0]["cnt"],
             }
     except Exception as e:
         logger.warning("Could not fetch funding progress: %s", e)
@@ -122,6 +153,7 @@ def generate(
     # Get funding progress
     progress = {"raised": 0, "goal": 500, "backers": 0}
     if db is not None:
+        ensure_crowdfunding_schema(db)
         progress = _get_funding_progress(db)
 
     # Resolve payment links
@@ -163,6 +195,67 @@ def generate(
     logger.info("Generated landing page at %s", output_path)
 
     return output_path
+
+
+def record_contribution(
+    db: Database,
+    amount: float,
+    currency: str = "EUR",
+    payment_ref: str = "",
+    backer_email: str = "",
+    tier: str = "",
+) -> int:
+    """Record a crowdfunding contribution and update campaign totals.
+
+    Creates the default campaign if none exists. Returns contribution ID.
+    """
+    ensure_crowdfunding_schema(db)
+
+    # Ensure at least one active campaign exists
+    campaigns = db.execute(
+        "SELECT id FROM crowdfunding_campaigns WHERE status = 'active' LIMIT 1"
+    )
+    if not campaigns:
+        db.execute_insert(
+            "INSERT INTO crowdfunding_campaigns (name, goal_amount, status) "
+            "VALUES ('monAI Launch', 500, 'active')"
+        )
+        campaigns = db.execute(
+            "SELECT id FROM crowdfunding_campaigns WHERE status = 'active' LIMIT 1"
+        )
+
+    campaign_id = campaigns[0]["id"]
+
+    # Record contribution
+    contrib_id = db.execute_insert(
+        "INSERT INTO crowdfunding_contributions "
+        "(campaign_id, amount, currency, payment_ref, backer_email, tier, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'completed')",
+        (campaign_id, amount, currency, payment_ref, backer_email, tier),
+    )
+
+    # Update campaign totals atomically
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE crowdfunding_campaigns SET "
+            "raised_amount = raised_amount + ?, "
+            "backer_count = backer_count + 1, "
+            "updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (amount, campaign_id),
+        )
+        # Check if campaign goal is reached
+        conn.execute(
+            "UPDATE crowdfunding_campaigns SET status = 'funded' "
+            "WHERE id = ? AND raised_amount >= goal_amount AND status = 'active'",
+            (campaign_id,),
+        )
+
+    logger.info(
+        "Crowdfunding contribution: €%.2f from %s (ref: %s)",
+        amount, backer_email or "anonymous", payment_ref,
+    )
+    return contrib_id
 
 
 def generate_preview(output_path: Optional[Path] = None) -> Path:

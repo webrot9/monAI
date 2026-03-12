@@ -10,13 +10,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import asyncio
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
 
 from monai.agents.identity import IdentityManager
 from monai.agents.orchestrator import Orchestrator
+from monai.payments.webhook_server import WebhookServer
 from monai.business.commercialista import Commercialista
 from monai.business.finance import Finance
 from monai.business.risk import RiskManager
@@ -161,8 +164,40 @@ def create_orchestrator(config: Config) -> tuple[Orchestrator, Database]:
     return orchestrator, db
 
 
+def _start_webhook_server(orchestrator, webhook_port: int = 8420):
+    """Start webhook server in a background thread with its own event loop.
+
+    Registers all payment providers from the orchestrator's payment manager
+    and routes events through _handle_webhook_event.
+    """
+    webhook_server = WebhookServer(host="0.0.0.0", port=webhook_port)
+
+    # Register all providers from the payment manager
+    pm = orchestrator.payment_manager
+    for name, provider in pm._providers.items():
+        webhook_server.register_provider(name, provider)
+
+    # Wire events to the payment manager's handler
+    webhook_server.on_event(pm._handle_webhook_event)
+
+    loop = asyncio.new_event_loop()
+
+    def _run():
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(webhook_server.start())
+        loop.run_until_complete(webhook_server._server.serve_forever())
+
+    thread = threading.Thread(target=_run, daemon=True, name="webhook-server")
+    thread.start()
+    logger.info(f"Webhook server started on port {webhook_port}")
+    return webhook_server, loop
+
+
 def run_daemon(config: Config, cycle_interval: int = 300):
     """Run monAI as a continuous daemon.
+
+    Starts the webhook server in a background thread to receive payments,
+    then runs orchestration cycles in the main thread.
 
     Args:
         cycle_interval: Seconds between cycles (default 5 min)
@@ -175,6 +210,14 @@ def run_daemon(config: Config, cycle_interval: int = 300):
     logger.info(f"  {agent_name} starting in autonomous daemon mode")
     logger.info(f"  Cycle interval: {cycle_interval}s")
     logger.info(f"{'='*60}")
+
+    # Start webhook server in background thread
+    webhook_port = getattr(config, "webhook_port", 8420)
+    try:
+        _start_webhook_server(orchestrator, webhook_port)
+    except Exception as e:
+        logger.error(f"Webhook server failed to start: {e}")
+        logger.warning("Continuing without webhook server — payments will NOT be received")
 
     cycle = 0
     while not _shutdown:

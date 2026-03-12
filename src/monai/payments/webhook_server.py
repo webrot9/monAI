@@ -54,30 +54,43 @@ CREATE TABLE IF NOT EXISTS webhook_events (
 
 
 class _RateLimiter:
-    """Simple in-memory rate limiter for webhook endpoints."""
+    """Simple in-memory rate limiter for webhook endpoints.
+
+    Tracks per-IP request counts within second and minute windows.
+    Includes memory protection to prevent unbounded dict growth from many IPs.
+    """
+
+    MAX_TRACKED_IPS = 10_000  # Memory cap: max unique IPs to track
 
     def __init__(self, max_per_second: int = 10, max_per_minute: int = 200):
         self._max_per_second = max_per_second
         self._max_per_minute = max_per_minute
-        self._second_counts: dict[str, int] = {}  # ip -> count
-        self._minute_counts: dict[str, int] = {}  # ip -> count
-        self._last_second: float = 0.0
-        self._last_minute: float = 0.0
+        self._second_counts: dict[str, int] = {}
+        self._minute_counts: dict[str, int] = {}
+        self._current_second: int = 0
+        self._current_minute: int = 0
 
     def is_allowed(self, client_ip: str) -> bool:
         import time
         now = time.time()
-        current_second = int(now)
-        current_minute = int(now / 60)
+        second = int(now)
+        minute = int(now / 60)
 
-        # Reset per-second counters
-        if current_second != int(self._last_second):
+        # Reset per-second counters on new second
+        if second != self._current_second:
             self._second_counts.clear()
-            self._last_second = now
-        # Reset per-minute counters
-        if current_minute != int(self._last_minute / 60):
+            self._current_second = second
+
+        # Reset per-minute counters on new minute
+        if minute != self._current_minute:
             self._minute_counts.clear()
-            self._last_minute = now
+            self._current_minute = minute
+
+        # Memory protection: clear if too many unique IPs
+        if len(self._second_counts) >= self.MAX_TRACKED_IPS:
+            self._second_counts.clear()
+        if len(self._minute_counts) >= self.MAX_TRACKED_IPS:
+            self._minute_counts.clear()
 
         sec_count = self._second_counts.get(client_ip, 0)
         min_count = self._minute_counts.get(client_ip, 0)

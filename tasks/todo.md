@@ -69,8 +69,19 @@
 - [x] Dashboard API: /api/audit, /api/audit/summary, /api/brands, /api/backups endpoints
 - [x] Total: 1334 tests, all passing
 
+- [x] Sprint 1 bug fixes (PaymentIntent validation, Decimal precision, Gumroad parsing, webhook amount validation)
+- [x] Sprint 2 bug fixes (reconciliation filter, currency-aware sweepable, refund-after-sweep deficit, rate limiter memory, spending guard)
+- [x] Dashboard HTML enhancements (audit trail panel, brand P&L table, backup status widget)
+- [x] Alerting rules engine (configurable thresholds, cooldown dedup, severity levels, default rules)
+- [x] Webhook replay (single event replay, batch failed replay, replayable event listing)
+- [x] Spending guard module (daily/per-transaction/per-strategy caps with approval thresholds)
+- [x] Total: 1398 tests, all passing
+
+- [x] Sprint 4: Team agents with real data-driven logic (GrowthHacker insights, ContentMarketer SEO validation, OutreachSpecialist segmentation, AgentSpawner structured decomposition)
+- [x] Sprint 5: Crowdfunding landing page enhancements (QR codes, campaign management, DB fixes)
+- [x] Sprint 6: Tor detection fallback tests (22 tests for ProxyFallbackChain)
+- [x] Sprint 7: API key self-provisioning tests (49 tests for APIProvisioner, 3 production bug fixes)
+- [x] Total: 1520 tests, all passing
+
 ## Next Up
 - [ ] First real deployment test (end-to-end with a real Ko-fi page)
-- [ ] Dashboard HTML enhancements (audit trail panel, brand P&L chart, backup status widget)
-- [ ] Alerting rules engine (configurable alert thresholds for revenue, budget, errors)
-- [ ] Webhook replay (re-process failed webhooks from the event log)
