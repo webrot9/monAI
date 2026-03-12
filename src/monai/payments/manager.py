@@ -547,10 +547,16 @@ class UnifiedPaymentManager:
     async def _handle_payment_disputed(self, event: WebhookEvent) -> None:
         """Handle a dispute — mark and alert."""
         payments = self.db.execute(
-            "SELECT id, brand, amount, currency FROM brand_payments_received "
+            "SELECT id, brand, amount, currency, status FROM brand_payments_received "
             "WHERE payment_ref = ? LIMIT 1",
             (event.payment_ref,),
         )
+
+        # Defense-in-depth: skip if already disputed
+        if payments and dict(payments[0]).get("status") == "disputed":
+            logger.info(f"Payment {event.payment_ref} already disputed — skipping")
+            return
+
         with self.db.transaction() as conn:
             conn.execute(
                 "UPDATE brand_payments_received SET status = 'disputed' "

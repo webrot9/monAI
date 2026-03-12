@@ -60,6 +60,7 @@ from monai.utils.sandbox import PROJECT_ROOT
 from monai.business.alerting import AlertingEngine
 from monai.business.audit import AuditTrail
 from monai.business.backup import BackupManager
+from monai.business.spending_guard import SpendingGuard
 from monai.utils.telegram import TelegramBot
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,7 @@ class Orchestrator(BaseAgent):
         self.email_marketing = EmailMarketing(db)
         self.brand_payments = BrandPayments(db)
         self.payment_manager = UnifiedPaymentManager(config, db, ledger=self.ledger)
+        self.spending_guard = SpendingGuard(db, config)
         self.corporate = CorporateManager(db)
         self.bootstrap_wallet = BootstrapWallet(config, db, ledger=self.ledger)
         self.kofi_manager = KofiCampaignManager(
@@ -377,6 +379,21 @@ class Orchestrator(BaseAgent):
                 cycle_result["exchange_rates_refreshed"] = len(fetched)
             except Exception as e:
                 logger.warning(f"Exchange rate refresh failed: {e}")
+
+        # Phase 6.85b: Mid-cycle anonymity re-verification
+        if self.config.privacy.verify_anonymity and self.config.privacy.proxy_type != "none":
+            anon_recheck = get_anonymizer(self.config).startup_check()
+            cycle_result["anonymity_recheck"] = anon_recheck
+            if not anon_recheck.get("anonymous"):
+                logger.critical(
+                    f"MID-CYCLE ANONYMITY LOST: {anon_recheck}. "
+                    "Aborting remaining phases to protect creator."
+                )
+                self.audit.log("orchestrator", "system", "anonymity_lost_mid_cycle",
+                               details=anon_recheck, success=False, risk_level="critical")
+                cycle_result["status"] = "partial"
+                cycle_result["reason"] = "anonymity_lost_mid_cycle"
+                return cycle_result
 
         # Phase 6.9: Payment processing — sweep profits to creator
         cycle_result["payments"] = self._run_payment_cycle()
@@ -732,6 +749,18 @@ class Orchestrator(BaseAgent):
             # Calculate boost (20% of current, capped)
             boost = min(current_budget * 0.2, max_boost)
             new_budget = current_budget + boost
+
+            # Check spending guard before scaling
+            guard_result = self.spending_guard.check_and_record(
+                amount=boost,
+                category="strategy_auto_scale",
+                description=f"Auto-scale strategy '{s['name']}' by €{boost:.2f}",
+            )
+            if not guard_result["allowed"]:
+                logger.info(
+                    f"SpendingGuard blocked scaling '{s['name']}': {guard_result['reason']}"
+                )
+                continue
 
             # Check allocation limit
             if total_active_budget > 0:

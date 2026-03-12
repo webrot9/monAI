@@ -95,7 +95,7 @@ class TelegramConfig:
     """Telegram bot for creator communication."""
     bot_token: str = ""  # Acquired autonomously via BotFather
     creator_chat_id: str = ""  # Discovered after creator sends /start
-    creator_username: str = "Cristal89"  # The creator's Telegram username
+    creator_username: str = ""  # The creator's Telegram username (set via config/env)
     enabled: bool = True
 
 

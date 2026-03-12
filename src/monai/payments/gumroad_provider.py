@@ -129,18 +129,39 @@ class GumroadProvider(PaymentProvider):
         )
 
     async def get_balance(self, account_id: str = "") -> ProviderBalance:
-        """Get total sales balance (Gumroad doesn't expose wallet balance directly)."""
+        """Get unpaid balance from Gumroad sales.
+
+        Gumroad doesn't expose wallet balance directly, so we calculate:
+        unpaid = total non-refunded sales revenue - total payouts received.
+        Uses 'gumroad_fee' field when available to get net seller amount.
+        """
         try:
             result = await self._api_call("GET", "sales")
             sales = result.get("sales", [])
 
-            total = sum(
-                float(s.get("price", 0)) / 100
+            total_sales = sum(
+                float(s.get("seller_price", s.get("price", 0))) / 100
                 for s in sales
                 if not s.get("refunded", False)
             )
+
+            # Subtract payouts already received (tracked in local DB or via API)
+            total_payouts = 0.0
+            try:
+                # Gumroad doesn't have a payouts API; use locally tracked payouts
+                if hasattr(self, "db") and self.db:
+                    rows = self.db.execute(
+                        "SELECT COALESCE(SUM(amount), 0) as total "
+                        "FROM provider_payouts WHERE provider = 'gumroad'"
+                    )
+                    total_payouts = float(rows[0]["total"]) if rows else 0.0
+            except Exception:
+                logger.debug("Could not fetch payout history for Gumroad balance calc")
+
+            available = max(total_sales - total_payouts, 0.0)
+
             return ProviderBalance(
-                available=total,
+                available=available,
                 pending=0,
                 currency="USD",
                 provider=self.provider_name,
