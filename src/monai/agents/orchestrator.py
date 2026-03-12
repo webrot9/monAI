@@ -466,6 +466,60 @@ class Orchestrator(BaseAgent):
         except Exception as e:
             logger.error(f"Strategy performance eval failed: {e}")
 
+        # Phase 6.99: Automatic reinvestment — scale winners, cut losers
+        try:
+            reinvest_result = self.commercialista.compute_reinvestment()
+            cycle_result["reinvestment"] = reinvest_result
+
+            if reinvest_result.get("reinvest", 0) > 0:
+                # Get strategy performance for allocation
+                strat_perf = []
+                for s in self.finance.get_strategy_pnl():
+                    rev = s.get("revenue", 0)
+                    exp = s.get("expenses", 0)
+                    roi = rev / exp if exp > 0 else 0
+                    strat_perf.append({
+                        "name": s["name"],
+                        "revenue": rev,
+                        "expenses": exp,
+                        "roi": roi,
+                    })
+
+                allocations = self.commercialista.allocate_to_strategies(
+                    reinvest_result["reinvest"], strat_perf,
+                )
+
+                # Apply allocations: update strategy budgets in DB
+                for alloc in allocations:
+                    if alloc.get("amount", 0) > 0:
+                        self.db.execute(
+                            "UPDATE strategies SET allocated_budget = allocated_budget + ? "
+                            "WHERE name = ?",
+                            (alloc["amount"], alloc["strategy"]),
+                        )
+                    elif alloc.get("action") == "reduce":
+                        self.db.execute(
+                            "UPDATE strategies SET allocated_budget = MAX(0, allocated_budget * 0.5) "
+                            "WHERE name = ?",
+                            (alloc["strategy"],),
+                        )
+
+                self.commercialista.record_reinvestment(
+                    reinvest=reinvest_result["reinvest"],
+                    reserve=reinvest_result["reserve"],
+                    creator=reinvest_result["creator_sweep"],
+                    allocations=allocations,
+                )
+
+                logger.info(
+                    f"Reinvestment: €{reinvest_result['reinvest']:.2f} allocated to "
+                    f"{len([a for a in allocations if a.get('amount', 0) > 0])} strategies, "
+                    f"€{reinvest_result['reserve']:.2f} reserved, "
+                    f"€{reinvest_result['creator_sweep']:.2f} for creator sweep"
+                )
+        except Exception as e:
+            logger.error(f"Reinvestment cycle failed: {e}")
+
         # Phase 7: Commercialista report
         cycle_result["timestamp"] = datetime.now().isoformat()
         cycle_result["net_profit"] = self.finance.get_net_profit()
@@ -1544,8 +1598,10 @@ class Orchestrator(BaseAgent):
                 if self.ethics_tester.is_quarantined(name):
                     results[name] = {"status": "quarantined", "reason": "ethics_failure"}
                     continue
+                t0 = datetime.now()
                 try:
                     result = agent.run()
+                    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
                     results[name] = {"status": "ok", "result": result}
                     # Share success insights
                     agent.share_knowledge(
@@ -1554,9 +1610,18 @@ class Orchestrator(BaseAgent):
                         content=json.dumps(result, default=str)[:500],
                         tags=[name, "strategy_result"],
                     )
+                    # Update task router with success feedback
+                    self.task_router.update_performance(
+                        name, "strategy_execution", True, duration_ms,
+                    )
                 except Exception as e:
+                    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
                     logger.error(f"Strategy {name} failed: {e}")
                     results[name] = {"status": "error", "error": str(e)}
                     # Auto-learn from failure
                     agent.learn_from_error(e, context=f"Running strategy {name}")
+                    # Update task router with failure feedback
+                    self.task_router.update_performance(
+                        name, "strategy_execution", False, duration_ms,
+                    )
         return results
