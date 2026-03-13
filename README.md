@@ -25,8 +25,9 @@ Orchestrator (brain)
 ## Requirements
 
 - Python 3.11+
-- OpenAI API key (GPT-4o)
-- Tor (for anonymous networking — optional but strongly recommended)
+- OpenAI API key (GPT-4o) — or nothing, Ollama is auto-installed as fallback
+
+Everything else is auto-installed by `monai init`.
 
 ## Quick Start
 
@@ -43,92 +44,96 @@ pip install -e ".[dev]"
 ```
 
 > **Troubleshooting**: If `pip install -e .` fails with a `build_editable` error,
-> your setuptools is too old. Run `pip install --upgrade setuptools>=68.0` first.
-> If that's blocked by a system-managed Python, use a virtualenv:
+> your setuptools is too old. Use a virtualenv:
 > ```bash
 > python3 -m venv .venv && source .venv/bin/activate
 > pip install -e ".[dev]"
 > ```
 
-### 2. Set your OpenAI API key
+### 2. Set your OpenAI API key (optional)
 
 ```bash
 export OPENAI_API_KEY=sk-...
 ```
 
-### 3. Initialize
+If not set, monAI auto-installs Ollama with llama3.1:8b as a free local LLM.
+
+### 3. Initialize and run
 
 ```bash
+# First time — installs all deps and creates config
 monai init
-```
 
-This creates:
-- `~/.monai/config.json` — all configuration
-- `~/.monai/monai.db` — SQLite database
-- Seeds the 14 default revenue strategies
-
-### 4. (Optional) Configure Tor for anonymity
-
-Install and start Tor:
-
-```bash
-# Ubuntu/Debian
-sudo apt install tor
-sudo systemctl start tor
-
-# macOS
-brew install tor
-tor &
-```
-
-Tor runs on `127.0.0.1:9050` (SOCKS5) and `127.0.0.1:9051` (control) by default.
-monAI routes ALL external traffic through it.
-
-To disable anonymity checks (not recommended):
-
-```bash
-# Edit ~/.monai/config.json and set:
-# "privacy": { "proxy_type": "none", "verify_anonymity": false }
-```
-
-### 5. Run
-
-```bash
-# Continuous autonomous daemon (default: 5-min cycles)
+# Start the autonomous daemon (runs forever, 5-min cycles)
 monai daemon
-
-# Single cycle
-monai run
-
-# Custom interval (e.g. 10 minutes)
-monai daemon --interval 600
 ```
 
-### 6. Monitor
+That's it. `monai init` auto-provisions everything:
 
-```bash
-monai status
-```
-
-Shows: budget, net profit, strategy P&L, API costs by agent/model, active accounts, daily summary.
-
-### 7. Discover new opportunities
-
-```bash
-monai discover
-```
+| Component | What it does |
+|-----------|-------------|
+| **bubblewrap** | OS-level sandbox (mount namespace isolation) |
+| **util-linux** | Sandbox fallback (unshare) |
+| **Tor** | Anonymity layer (SOCKS5 proxy on :9050) |
+| **Playwright + Chromium** | Browser automation for agents |
+| **WeasyPrint libs** | PDF invoice generation (libpango, libcairo) |
+| **Node.js + npm** | Web deployment CLIs (Netlify, Vercel, Wrangler) |
+| **Ollama** | Free local LLM (if no API key provided) |
+| **Config** | `~/.monai/config.json` with sane defaults |
+| **Database** | `~/.monai/monai.db` (SQLite) |
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `monai daemon` | Start monAI. Runs orchestration cycles in a loop (every 5 min by default). This is the main command. |
-| `monai run` | Run a single orchestration cycle and exit. Useful for testing/debugging. |
-| `monai status` | Display financial reports and strategy health (read-only, no cycle). |
-| `monai init` | Initialize config and database. Run once before first use. |
-| `monai discover` | Manual shortcut to preview opportunity discovery. Not required — discovery already runs automatically inside each daemon cycle. |
+| `monai init` | Initialize config, database, and auto-install all dependencies. Run once. |
+| `monai daemon` | Start monAI. Runs orchestration cycles in a loop (every 5 min). **This is the main command.** |
+| `monai run` | Run a single orchestration cycle and exit. Useful for testing. |
+| `monai status` | Display financial reports and strategy health (read-only). |
+| `monai dashboard` | Start the web dashboard on http://localhost:8421 |
+| `monai dashboard --port 9000` | Dashboard on a custom port. |
+| `monai discover` | Preview opportunity discovery (runs automatically in daemon). |
 
-In practice, you only need: `monai init` (once), then `monai daemon` (forever).
+In practice: `monai init` (once), then `monai daemon` (forever).
+
+## Dashboard
+
+Real-time web UI with live updates via Server-Sent Events (SSE).
+
+```bash
+monai dashboard
+# Open http://localhost:8421
+```
+
+Shows:
+- **KPIs**: balance, net profit, today's P&L, burn rate, days until broke
+- **Strategy table**: all 14 strategies with status, budget, net P&L, 30d ROI
+- **Financial overview**: revenue, expenses, self-sustaining status, reinvestment engine
+- **API costs**: per-agent and per-model breakdown
+- **Brand P&L**: per-brand revenue/expenses segmentation
+- **Audit trail**: all agent actions with risk levels, filterable
+- **Backup status**: latest DB and config backups
+- **Activity log**: live-streaming agent actions
+
+The dashboard runs on its own async HTTP server (zero external dependencies). Data refreshes every 5 seconds via SSE.
+
+### Dashboard API
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/data` | Full dashboard data (budget, health, strategies, costs) |
+| `GET /api/audit?limit=50&agent=X&type=Y` | Audit trail with filters |
+| `GET /api/audit/summary?days=7` | Audit summary (high-risk events, failures) |
+| `GET /api/brands?brand=X` | Brand P&L segmentation |
+| `GET /api/backups` | Backup listing and status |
+| `GET /api/alerts?limit=50` | Recent alerts |
+| `GET /api/alerts/rules` | Alerting rules configuration |
+| `GET /api/alerts/summary?days=7` | Alert summary |
+| `GET /api/webhooks?limit=50` | Webhook events (for replay) |
+| `GET /api/logs?limit=50` | Agent activity logs |
+| `GET /api/accounts` | Active platform accounts |
+| `GET /api/reinvestment` | Reinvestment engine status |
+| `GET /events` | SSE stream (live updates every 5s) |
 
 ## Configuration
 
@@ -169,7 +174,7 @@ All config lives in `~/.monai/config.json`. Created automatically on `monai init
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENAI_API_KEY` | Yes | OpenAI API key for GPT-4o |
+| `OPENAI_API_KEY` | No | OpenAI API key. If not set, Ollama is auto-installed as free fallback. |
 
 ## The 14 Revenue Strategies
 
@@ -199,7 +204,7 @@ Every strategy automatically gets:
 - **Social media accounts** — Twitter, LinkedIn, Reddit, Indie Hackers (via SocialPresence agent)
 - **Website** — Domain registration, LLM-generated landing pages, SEO, analytics (via WebPresence agent)
 - **Email marketing** — Subscriber lists, campaigns, drip sequences, open/click tracking (via EmailMarketing)
-- **Payment collection** — Monero/Bitcoin/Stripe/PayPal/Gumroad + anonymous profit sweeping to creator (via BrandPayments)
+- **Payment collection** — Monero/Bitcoin/Stripe/Gumroad + anonymous profit sweeping to creator (via BrandPayments)
 - **Conversion pipeline** — Full CRM funnel: impression > click > lead > prospect > customer > repeat (via Pipeline)
 
 ## Payment & Anonymity
@@ -246,6 +251,20 @@ monAI auto-provisions a Telegram bot for creator communication:
 
 Set your Telegram username in `~/.monai/config.json` under `telegram.creator_username`. Then send `/start` to the bot after it self-provisions.
 
+## Security & Sandbox
+
+monAI runs agents in a multi-layer sandbox:
+
+| Layer | Mechanism | What it prevents |
+|-------|-----------|-----------------|
+| **Filesystem** | Path whitelist + symlink resolution | Agents can only access `monAI/`, `~/.monai/`, `/tmp/monai-*` |
+| **Process** | bubblewrap (mount namespace) | Child processes cannot see files outside bind-mounts |
+| **Fallback** | unshare (user namespace) | If bwrap unavailable, prevents privilege escalation |
+| **Environment** | Env var whitelist | API keys and secrets stripped from child processes |
+| **Commands** | Whitelist of ~30 safe commands | No `rm -rf`, no `eval`, no shell injection |
+| **Resources** | systemd + app limits | 2GB RAM cap, 5GB disk cap, cycle aborts on violation |
+| **Ethics** | 12-scenario test battery | Failed agents quarantined, dangerous actions blocked |
+
 ## Development
 
 ### Run tests
@@ -268,7 +287,9 @@ src/monai/
   social/          # Platform API clients (Twitter, LinkedIn, Reddit)
   workflows/       # Workflow engine, pipelines, task router
   utils/           # LLM wrapper, privacy/anonymizer, Telegram, resources
+  dashboard/       # Web dashboard (async HTTP + SSE)
   db/              # SQLite database layer
+  infra/           # Auto-setup (installs all system deps)
   main.py          # CLI entry point
 ```
 
@@ -280,6 +301,7 @@ src/monai/
 | `~/.monai/monai.db` | SQLite database (all state) |
 | `~/.monai/monai.log` | Application logs |
 | `~/.monai/verify.txt` | Telegram verification token |
+| `~/.monai/backups/` | Automated DB + config backups |
 
 ## Stopping
 
@@ -299,3 +321,4 @@ kill -TERM <pid>
 - All API costs are tracked and budgeted
 - Stop-loss halts losing strategies automatically
 - Everything is logged and auditable
+- All agent processes sandboxed via bubblewrap
