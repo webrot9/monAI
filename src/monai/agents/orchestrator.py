@@ -27,6 +27,7 @@ from monai.agents.social_presence import SocialPresence
 from monai.agents.web_presence import WebPresence
 from monai.agents.identity import IdentityManager
 from monai.agents.legal import LegalAdvisorFactory
+from monai.agents.asset_aware import AssetManager
 from monai.agents.api_provisioner import APIProvisioner
 from monai.agents.llc_provisioner import LLCProvisioner
 from monai.agents.phone_provisioner import PhoneProvisioner
@@ -720,11 +721,13 @@ class Orchestrator(BaseAgent):
     def _ensure_infrastructure(self) -> dict[str, Any]:
         """Check and provision any missing infrastructure."""
         identity = self.identity.get_identity()
-        accounts = self.identity.get_all_accounts()
-        account_types = {a["platform"] for a in accounts}
+        inventory = AssetManager(self.db).get_inventory()
+
+        # Log the full asset summary for visibility
+        logger.info(f"Asset inventory:\n{inventory.summary()}")
 
         needs = []
-        if "email" not in account_types:
+        if not inventory.has_email:
             needs.append("email")
         if not identity:
             needs.append("identity")
