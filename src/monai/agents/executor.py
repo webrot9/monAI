@@ -50,8 +50,9 @@ Available tools:
 13. write_code(spec, filename) — Generate a tested code module from a specification
 14. run_tests(path) — Run tests for a code file
 15. wait(seconds) — Wait for a specified time
-16. done(result) — Signal task completion with a result
-17. fail(reason) — Signal task failure with a reason
+16. wait_for(selector, timeout) — Wait for an element to appear on the page (timeout in seconds, default 10)
+17. done(result) — Signal task completion with a result
+18. fail(reason) — Signal task failure with a reason
 """
 
 
@@ -77,6 +78,7 @@ class AutonomousExecutor:
         # HTTP client routed through proxy — no direct connections
         self.http_client = self._anonymizer.create_http_client(timeout=30)
         self.action_history: list[dict] = []
+        self._reflection_count = 0  # Cap reflections per task
         self.memory = SharedMemory(db)
 
         # Use BrowserLearner (adaptive) instead of raw Browser.
@@ -101,6 +103,7 @@ class AutonomousExecutor:
         """
         logger.info(f"Starting autonomous task: {task[:100]}")
         self.action_history = []
+        self._reflection_count = 0
         start_time = time.time()
         consecutive_failures = 0
         total_failures = 0
@@ -156,13 +159,12 @@ class AutonomousExecutor:
                         "history": self.action_history,
                     }
 
-                # Mid-task reflection: when accumulating failures, pause
-                # and ask LLM to analyze what's wrong before continuing
+                # Mid-task reflection: max 2 per task, at failures 3 and 6
                 if (total_failures >= 3 and total_failures % 3 == 0
-                        and step > 0):
+                        and step > 0 and self._reflection_count < 2):
                     reflection = self._reflect_on_failures(task, context)
                     if reflection:
-                        # Inject reflection into context for next _think call
+                        self._reflection_count += 1
                         context = f"{context}\n\nREFLECTION: {reflection}"
 
                 # THINK: Decide next action
@@ -436,7 +438,33 @@ class AutonomousExecutor:
                     return f"Filled {len(fields)} fields"
 
             elif tool == "submit":
-                await self.browser.submit_form(args.get("selector", "form"))
+                selector = args.get("selector", "form")
+                page = await self.browser._get_page()
+                # Try clicking submit/button inside the form first (more reliable)
+                submit_clicked = False
+                for btn_sel in [
+                    f'{selector} [type="submit"]',
+                    f'{selector} button[type="submit"]',
+                    f'{selector} input[type="submit"]',
+                    f'{selector} button:not([type="button"])',
+                ]:
+                    try:
+                        btn = page.locator(btn_sel).first
+                        if await btn.count() > 0:
+                            await btn.click()
+                            submit_clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not submit_clicked:
+                    # Fallback: JS submit — but check element exists first
+                    try:
+                        await page.evaluate(
+                            f'(() => {{ const f = document.querySelector("{selector}"); '
+                            f'if (f) f.submit(); else throw new Error("Form not found: {selector}"); }})()'
+                        )
+                    except Exception as e:
+                        return f"ERROR: Submit failed: {e}"
                 await asyncio.sleep(2)
                 return await self.browser.get_page_info()
 
@@ -529,6 +557,12 @@ class AutonomousExecutor:
                 await asyncio.sleep(seconds)
                 return f"Waited {seconds}s"
 
+            elif tool == "wait_for":
+                selector = args.get("selector", "")
+                timeout_s = min(args.get("timeout", 10), 30)
+                await self.browser.wait_for(selector, timeout=timeout_s * 1000)
+                return f"Element '{selector}' appeared"
+
             elif tool == "done":
                 return args.get("result", "Task completed")
 
@@ -568,9 +602,21 @@ class AutonomousExecutor:
                 f"TASK: {task}\n\n"
                 f"REPEATED FAILURES ({len(failures)} total):\n{failure_summary}\n\n"
                 "Analyze the pattern. Why do these keep failing? "
-                "What fundamentally different approach should be tried? "
-                "Be specific and actionable. Max 3 sentences.",
-                system="You analyze task execution failures and suggest alternative strategies.",
+                "What fundamentally different approach should be tried?\n\n"
+                "AVAILABLE TOOLS you can suggest:\n"
+                "- browse(url): navigate to a page\n"
+                "- click(selector): click an element\n"
+                "- type(selector, text): type into a field\n"
+                "- fill_form(fields): fill multiple fields at once\n"
+                "- submit(selector): submit a form (clicks submit button)\n"
+                "- wait_for(selector, timeout): wait for element to appear\n"
+                "- wait(seconds): pause execution\n"
+                "- screenshot(name): capture current page state\n"
+                "- read_page(): get page text\n"
+                "- http_get/http_post: direct API calls\n"
+                "- shell(command): run shell commands\n\n"
+                "Be specific and actionable — reference actual tools above. Max 3 sentences.",
+                system="You analyze task execution failures and suggest alternative strategies using the available tools.",
             )
             logger.info(f"Mid-task reflection: {reflection[:200]}")
             return reflection
