@@ -13,11 +13,15 @@ from typing import Any
 from monai.agents.base import BaseAgent
 from monai.agents.executor import AutonomousExecutor
 from monai.agents.identity import IdentityManager
+from monai.agents.playbooks import get_playbook
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.llm import LLM
 
 logger = logging.getLogger(__name__)
+
+# Maximum retries per provisioning task before giving up
+MAX_RETRIES = 2
 
 
 class Provisioner(BaseAgent):
@@ -72,6 +76,10 @@ class Provisioner(BaseAgent):
             result = self._execute_provisioning(step)
             results[step] = result
 
+            # If the step failed, log analysis for future improvement
+            if isinstance(result, dict) and result.get("status") == "failed":
+                self._analyze_failure(step, result)
+
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results
 
@@ -83,16 +91,8 @@ class Provisioner(BaseAgent):
         identity = self.identity.get_identity()
         password = self.identity.generate_password()
 
-        task = (
-            f"Register a new account on {platform}. "
-            f"Use these details:\n"
-            f"- Name/Company: {identity.get('name', 'monAI')}\n"
-            f"- Username: {identity.get('preferred_username', 'monai')}\n"
-            f"- Password: {password}\n"
-            f"- Description: {identity.get('description', 'AI-powered digital services')}\n"
-            f"Go to the {platform} registration page, fill in the form, and complete signup. "
-            f"Take a screenshot after registration for verification."
-        )
+        # Build a rich task description with playbook knowledge
+        task = self._build_registration_task(platform, identity, password)
 
         result = await self.executor.execute_task(task, json.dumps(identity, default=str))
 
@@ -107,30 +107,125 @@ class Provisioner(BaseAgent):
 
         return result
 
+    def _build_registration_task(self, platform: str, identity: dict, password: str) -> str:
+        """Build a detailed task description using playbook knowledge."""
+        playbook = get_playbook(platform)
+
+        # Base task info
+        parts = [
+            f"Register a new account on {platform}.",
+            f"Identity details:",
+            f"  - Name: {identity.get('name', 'Nexify Digital')}",
+            f"  - Username: {identity.get('preferred_username', 'nexifydigital')}",
+            f"  - Password: {password}",
+            f"  - Description: {identity.get('description', 'AI-powered digital services')}",
+        ]
+
+        if playbook:
+            # Add specific URL
+            if playbook.get("signup_url"):
+                parts.append(f"\nSTART HERE: Navigate to {playbook['signup_url']}")
+            elif playbook.get("note"):
+                parts.append(f"\nIMPORTANT: {playbook['note']}")
+
+            # Add step-by-step instructions
+            if playbook.get("steps"):
+                parts.append("\nFOLLOW THESE STEPS:")
+                for i, step in enumerate(playbook["steps"], 1):
+                    parts.append(f"  {i}. {step}")
+
+            # Add error recovery guidance
+            if playbook.get("error_recovery"):
+                parts.append("\nIF YOU ENCOUNTER ERRORS:")
+                for error, fix in playbook["error_recovery"].items():
+                    parts.append(f"  - '{error}': {fix}")
+        else:
+            # Generic fallback — at least provide basic guidance
+            parts.extend([
+                f"\nSTEPS:",
+                f"1. First use create_temp_email() to get an email for signup",
+                f"2. Navigate to {platform}'s registration/signup page",
+                f"3. Use read_page() to understand the form",
+                f"4. Use fill_form() to fill in all fields",
+                f"5. Submit the form",
+                f"6. Check for verification requirements (email/phone)",
+                f"7. Complete verification if needed",
+                f"8. Take a screenshot for proof",
+            ])
+
+        parts.append(
+            "\nWhen done, call done() with a summary of what was created "
+            "(username, email used, etc.)."
+        )
+        return "\n".join(parts)
+
     async def setup_email(self) -> dict[str, Any]:
         """Set up an email account for the agent."""
         if self.identity.has_account("email"):
             return {"status": "already_exists"}
 
         identity = self.identity.get_identity()
-        task = (
-            "Create a free email account for business use. "
-            "Options: Gmail, Outlook, ProtonMail. "
-            f"Preferred username: {identity.get('preferred_username', 'monai')}\n"
-            "Complete the full registration process."
+        playbook = get_playbook("protonmail")
+
+        task_parts = [
+            "Create a ProtonMail email account for business use.",
+            f"Preferred username: {identity.get('preferred_username', 'nexifydigital')}",
+        ]
+
+        if playbook:
+            task_parts.append(f"\nSTART HERE: Navigate to {playbook.get('signup_url', '')}")
+            if playbook.get("steps"):
+                task_parts.append("\nFOLLOW THESE STEPS:")
+                for i, step in enumerate(playbook["steps"], 1):
+                    task_parts.append(f"  {i}. {step}")
+
+        task_parts.append(
+            "\nALTERNATIVE: If ProtonMail signup is blocked or requires phone, "
+            "use create_temp_email() to get an instant disposable email via API. "
+            "This is faster and doesn't require browser signup."
+        )
+        task_parts.append(
+            "\nWhen done, call done() with the email address that was created."
         )
 
+        task = "\n".join(task_parts)
         result = await self.executor.execute_task(task, json.dumps(identity, default=str))
         return result
 
     async def register_domain(self, domain: str, registrar: str = "namecheap") -> dict[str, Any]:
         """Register a domain name."""
-        task = (
-            f"Register the domain '{domain}' on {registrar}. "
-            "Navigate to the registrar, search for the domain, "
-            "add to cart, and complete purchase. "
-            "Take screenshots of each step."
+        playbook = get_playbook(registrar)
+
+        task_parts = [
+            f"Register the domain '{domain}' on {registrar}.",
+        ]
+
+        if playbook:
+            search_url = playbook.get("search_url", "")
+            if search_url:
+                task_parts.append(f"\nSTART HERE: Navigate to {search_url}{domain}")
+            if playbook.get("steps"):
+                task_parts.append("\nFOLLOW THESE STEPS:")
+                for i, step in enumerate(playbook["steps"], 1):
+                    # Replace {domain} placeholder in steps
+                    task_parts.append(f"  {i}. {step.replace('{domain}', domain)}")
+            if playbook.get("error_recovery"):
+                task_parts.append("\nIF YOU ENCOUNTER ERRORS:")
+                for error, fix in playbook["error_recovery"].items():
+                    task_parts.append(f"  - '{error}': {fix}")
+        else:
+            task_parts.extend([
+                f"1. Navigate to {registrar}'s website",
+                f"2. Search for the domain '{domain}'",
+                f"3. If available, add to cart and purchase",
+                f"4. Take screenshots of each step",
+            ])
+
+        task_parts.append(
+            "\nWhen done, call done() with confirmation that the domain was registered."
         )
+
+        task = "\n".join(task_parts)
         identity = self.identity.get_identity()
         result = await self.executor.execute_task(task, json.dumps(identity, default=str))
 
@@ -148,9 +243,13 @@ class Provisioner(BaseAgent):
 
         task = (
             f"Get an API key for {service}. "
-            "Go to their developer portal, register if needed, "
-            "create a new API key, and copy it. "
-            "Return the API key in the final result."
+            "Steps:\n"
+            "1. Use create_temp_email() to get an email for signup\n"
+            "2. Go to their developer portal / API signup page\n"
+            "3. Register an account if needed\n"
+            "4. Navigate to the API keys section\n"
+            "5. Create a new API key\n"
+            "6. Call done() with the API key value\n"
         )
 
         identity = self.identity.get_identity()
@@ -158,7 +257,22 @@ class Provisioner(BaseAgent):
         return result
 
     def _execute_provisioning(self, step: str) -> dict[str, Any]:
-        """Execute a provisioning step (sync wrapper for async operations)."""
+        """Execute a provisioning step with retry logic."""
+        for attempt in range(MAX_RETRIES + 1):
+            result = self._execute_single(step)
+
+            if isinstance(result, dict) and result.get("status") in ("completed", "already_registered", "already_exists", "already_have"):
+                return result
+
+            if attempt < MAX_RETRIES:
+                logger.info(f"Provisioning step failed (attempt {attempt + 1}/{MAX_RETRIES + 1}), retrying: {step[:80]}")
+            else:
+                logger.warning(f"Provisioning step failed after {MAX_RETRIES + 1} attempts: {step[:80]}")
+
+        return result
+
+    def _execute_single(self, step: str) -> dict[str, Any]:
+        """Execute a single provisioning step."""
         if "register" in step.lower() and "platform" in step.lower():
             platform = self.think(
                 f"Extract just the platform name from this step: '{step}'. "
@@ -181,3 +295,46 @@ class Provisioner(BaseAgent):
             return self._run_async(
                 self.executor.execute_task(step, json.dumps(self.identity.get_identity(), default=str))
             )
+
+    def _analyze_failure(self, step: str, result: dict) -> None:
+        """Analyze why a provisioning step failed and log insights."""
+        reason = result.get("reason", "unknown")
+        history = result.get("history", [])
+
+        # Categorize failure
+        if "circuit breaker" in reason.lower():
+            category = "too_many_errors"
+        elif "max_steps" in result.get("status", ""):
+            category = "ran_out_of_steps"
+        elif "timeout" in result.get("status", ""):
+            category = "timeout"
+        else:
+            category = "task_failed"
+
+        # Extract common error patterns from history
+        error_types = set()
+        for action in history:
+            r = action.get("result", "")
+            if "BLOCKED" in r:
+                error_types.add("blocked_by_guardrails")
+            if "Timeout" in r:
+                error_types.add("page_timeout")
+            if "proxy" in r.lower():
+                error_types.add("proxy_issues")
+            if "captcha" in r.lower():
+                error_types.add("captcha_required")
+
+        analysis = {
+            "step": step,
+            "category": category,
+            "reason": reason,
+            "error_types": list(error_types),
+            "steps_taken": result.get("steps", 0),
+        }
+
+        logger.warning(
+            f"PROVISIONING FAILURE ANALYSIS: {step[:60]} — "
+            f"category={category}, errors={error_types}, "
+            f"steps={result.get('steps', 0)}"
+        )
+        self.log_action("failure_analysis", json.dumps(analysis, default=str)[:500])

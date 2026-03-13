@@ -336,11 +336,22 @@ class Browser:
         'input[name="firstName"]'. Detect this and fix it.
         """
         s = selector.strip()
-        # Already a CSS selector (starts with #, ., [, or contains tag names)
-        if s.startswith(("#", ".", "[", "input", "textarea", "select", "button")):
+        # Already a CSS selector — contains structural characters
+        if any(c in s for c in ("#", ".", "[", ">", ":", "~", "+")):
             return s
-        # Looks like a CSS combinator or pseudo-selector
-        if " " in s or ":" in s or ">" in s:
+        # Starts with an HTML tag name (a, div, span, form, etc.)
+        tag = s.split(" ")[0].split(".")[0].split("#")[0].lower()
+        _HTML_TAGS = {
+            "a", "div", "span", "form", "label", "p", "li", "ul", "ol",
+            "nav", "header", "footer", "section", "article", "main",
+            "aside", "h1", "h2", "h3", "h4", "h5", "h6", "table", "tr",
+            "td", "th", "img", "input", "textarea", "select", "button",
+            "fieldset", "legend", "details", "summary", "dialog",
+        }
+        if tag in _HTML_TAGS:
+            return s
+        # Contains whitespace — likely a CSS combinator
+        if " " in s:
             return s
         # Bare field name — wrap as attribute selector
         return f'[name="{s}"], #{s}'

@@ -133,11 +133,17 @@ class ProxyFallbackChain:
     Thread-safe: all state mutations are guarded by a lock.
     """
 
+    # Blocked entries expire after this many seconds — Tor exit nodes rotate,
+    # so a domain that blocked us 5 minutes ago may work on a new circuit.
+    BLOCK_TTL_SECONDS = 300
+
     def __init__(self, privacy_config: PrivacyConfig):
         self._privacy = privacy_config
         self._lock = threading.Lock()
         # domain → set of blocked proxy types
         self._blocked: dict[str, set[str]] = {}
+        # domain → timestamp when block was recorded
+        self._blocked_at: dict[str, float] = {}
         # domain → proxy type that last succeeded
         self._preferred: dict[str, str] = {}
 
@@ -179,6 +185,9 @@ class ProxyFallbackChain:
             raise AnonymityError("No proxy configured and fallback is disabled")
 
         with self._lock:
+            # Expire stale blocks — Tor exit nodes rotate, retry after TTL
+            self._expire_blocks(domain)
+
             blocked = self._blocked.get(domain, set())
             preferred = self._preferred.get(domain)
 
@@ -207,6 +216,7 @@ class ProxyFallbackChain:
             if domain not in self._blocked:
                 self._blocked[domain] = set()
             self._blocked[domain].add(proxy_type)
+            self._blocked_at[domain] = time.time()
             # Clear preferred if it was the one that got blocked
             if self._preferred.get(domain) == proxy_type:
                 del self._preferred[domain]
@@ -214,6 +224,19 @@ class ProxyFallbackChain:
             f"PROXY FALLBACK: {proxy_type} blocked on {domain} — "
             f"blocked set: {self._blocked[domain]}"
         )
+
+    def _expire_blocks(self, domain: str) -> None:
+        """Remove stale block entries (must be called under self._lock)."""
+        if domain not in self._blocked_at:
+            return
+        age = time.time() - self._blocked_at[domain]
+        if age >= self.BLOCK_TTL_SECONDS:
+            self._blocked.pop(domain, None)
+            self._blocked_at.pop(domain, None)
+            logger.info(
+                f"PROXY FALLBACK: block expired for {domain} "
+                f"(after {int(age)}s) — retrying"
+            )
 
     def report_success(self, domain: str, proxy_type: str) -> None:
         """Mark a proxy type as working for a domain."""

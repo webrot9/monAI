@@ -5,6 +5,7 @@ This is the core capability layer. The executor can:
 - Run shell commands
 - Read/write files
 - Make HTTP API calls
+- Coordinate with other agents (email, phone, verification)
 - Reason about what to do next using LLM
 
 Think of it as AutoGPT's action loop: Think → Plan → Act → Observe → Repeat.
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from monai.agents.ethics import CORE_DIRECTIVES, is_action_blocked, requires_risk_check
+from monai.agents.playbooks import detect_platforms_in_task, get_playbook_prompt
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.browser import Browser
@@ -34,31 +36,70 @@ logger = logging.getLogger(__name__)
 # Tools the executor can use — described for the LLM
 TOOL_DESCRIPTIONS = """
 Available tools:
+
+BROWSER TOOLS:
 1. browse(url) — Navigate to a URL and return page content + interactive elements
-2. click(selector) — Click an element on the page
+2. click(selector) — Click an element on the page. Use CSS selectors.
 3. type(selector, text) — Type text into an input field
 4. screenshot(name) — Take a screenshot of the current page
-5. fill_form(fields) — Fill multiple form fields: {"selector": "value", ...}
-6. submit(selector) — Submit a form
-7. read_page() — Get full text content of the current page
+5. fill_form(fields) — Fill multiple form fields at once: {"selector": "value", ...}
+   PREFER this over individual type() calls for forms.
+6. submit(selector) — Submit a form (default selector: "form")
+7. read_page() — Get full text content of the current page. Use this to understand
+   what's on the page before acting.
+
+API TOOLS:
 8. http_get(url, headers) — Make an HTTP GET request
 9. http_post(url, data, headers) — Make an HTTP POST request
-10. shell(command) — Run a shell command and return output
-11. write_file(path, content) — Write content to a file
-12. read_file(path) — Read a file's content
-13. write_code(spec, filename) — Generate a tested code module from a specification
-14. run_tests(path) — Run tests for a code file
-15. wait(seconds) — Wait for a specified time
-16. done(result) — Signal task completion with a result
-17. fail(reason) — Signal task failure with a reason
+
+AGENT COORDINATION TOOLS:
+10. create_temp_email() — Create a disposable email address instantly (via mail.tm API).
+    Returns {"address": "...", "password": "..."}. Use this for signups.
+11. check_email_verification(email, platform) — Check if a verification email arrived.
+    Returns the verification code or link if found.
+12. get_phone(platform) — Get a virtual phone number for SMS verification.
+    Returns {"phone_number": "...", "phone_id": N}
+13. check_phone_code(phone_id) — Check if an SMS verification code was received.
+    Returns the code if found.
+
+FILE & CODE TOOLS:
+14. shell(command) — Run a shell command (only whitelisted commands)
+15. write_file(path, content) — Write content to a file
+16. read_file(path) — Read a file's content
+17. write_code(spec, filename) — Generate a tested code module from a specification
+18. run_tests(path) — Run tests for a code file
+
+CONTROL TOOLS:
+19. wait(seconds) — Wait for a specified time (max 30s)
+20. done(result) — Signal task completion with a result summary
+21. fail(reason) — Signal task failure with a reason
+"""
+
+# Anti-patterns the LLM must avoid
+ANTI_PATTERNS = """
+CRITICAL RULES — AVOID THESE MISTAKES:
+- Do NOT navigate to made-up URLs (api.example.com, api.businessinfo.com don't exist)
+- Do NOT try the same failed action twice — if it failed, change your approach
+- Do NOT use screenshot/read_page as busywork — only when you need to see the page
+- Do NOT try to register on Instagram/Facebook for a business directory — use actual
+  freelance platforms (Upwork, Fiverr, Freelancer)
+- Do NOT try random API endpoints that you haven't verified exist
+- ALWAYS use read_page() after navigating to understand the page before clicking
+- ALWAYS use create_temp_email() for signups — don't try to create Gmail/Yahoo manually
+- ALWAYS use fill_form() instead of many individual type() calls
+- If you get "BLOCKED" or "ERROR" more than twice for the same action, STOP and try
+  a completely different approach or call fail() with a clear reason
+- If a site requires phone verification, use get_phone() — don't skip it
 """
 
 
 class AutonomousExecutor:
     """Executes complex multi-step tasks autonomously using an LLM-driven action loop."""
 
-    # Circuit breaker: abort task after this many consecutive tool failures
-    MAX_CONSECUTIVE_FAILURES = 5
+    # Circuit breaker thresholds
+    MAX_CONSECUTIVE_FAILURES = 5  # Abort after N consecutive tool errors
+    MAX_FAILURE_RATE = 0.6  # Abort if >60% of steps have failed (after 8+ steps)
+    MIN_STEPS_FOR_RATE_CHECK = 8  # Don't check failure rate until this many steps
 
     def __init__(self, config: Config, db: Database, llm: LLM,
                  max_steps: int = 30, headless: bool = True,
@@ -73,6 +114,21 @@ class AutonomousExecutor:
         # HTTP client routed through proxy — no direct connections
         self.http_client = self._anonymizer.create_http_client(timeout=30)
         self.action_history: list[dict] = []
+        # Lazy-loaded agent collaborators
+        self._email_verifier = None
+        self._phone_provisioner = None
+
+    def _get_email_verifier(self):
+        if self._email_verifier is None:
+            from monai.agents.email_verifier import EmailVerifier
+            self._email_verifier = EmailVerifier(self.config, self.db)
+        return self._email_verifier
+
+    def _get_phone_provisioner(self):
+        if self._phone_provisioner is None:
+            from monai.agents.phone_provisioner import PhoneProvisioner
+            self._phone_provisioner = PhoneProvisioner(self.config, self.db, self.llm)
+        return self._phone_provisioner
 
     async def execute_task(self, task: str, context: str = "") -> dict[str, Any]:
         """Execute a task autonomously using think-act-observe loop.
@@ -88,6 +144,10 @@ class AutonomousExecutor:
         self.action_history = []
         start_time = time.time()
         consecutive_failures = 0
+        total_failures = 0
+
+        # Detect platforms and inject playbook knowledge
+        playbook_prompts = self._build_playbook_context(task)
 
         try:
             await self.browser.start()
@@ -104,7 +164,7 @@ class AutonomousExecutor:
                         "history": self.action_history,
                     }
 
-                # Circuit breaker: abort after too many consecutive failures
+                # Circuit breaker: consecutive failures
                 if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
                     reason = (
                         f"Circuit breaker: {consecutive_failures} consecutive tool "
@@ -119,8 +179,24 @@ class AutonomousExecutor:
                         "history": self.action_history,
                     }
 
+                # Circuit breaker: high total failure rate
+                if (step >= self.MIN_STEPS_FOR_RATE_CHECK
+                        and total_failures / step > self.MAX_FAILURE_RATE):
+                    reason = (
+                        f"Circuit breaker: {total_failures}/{step} steps failed "
+                        f"({total_failures/step:.0%}) — task is not making progress"
+                    )
+                    logger.warning(reason)
+                    self._log_task(task, "circuit_breaker", reason)
+                    return {
+                        "status": "failed",
+                        "reason": reason,
+                        "steps": step,
+                        "history": self.action_history,
+                    }
+
                 # THINK: Decide next action
-                action = self._think(task, context, step)
+                action = self._think(task, context, step, playbook_prompts)
 
                 if not action:
                     return {"status": "error", "reason": "LLM returned no action"}
@@ -134,15 +210,11 @@ class AutonomousExecutor:
                 result = await self._act(tool, args)
                 result_str = str(result)
 
-                # Track consecutive failures for circuit breaker
-                is_failure = (
-                    result_str.startswith("ERROR:")
-                    or result_str.startswith("BLOCKED")
-                    or "Timeout" in result_str
-                    or "timed out" in result_str.lower()
-                )
+                # Track failures for circuit breaker
+                is_failure = self._is_failure_result(result_str)
                 if is_failure:
                     consecutive_failures += 1
+                    total_failures += 1
                 else:
                     consecutive_failures = 0
 
@@ -151,7 +223,8 @@ class AutonomousExecutor:
                     "step": step + 1,
                     "tool": tool,
                     "args": args,
-                    "result": result_str[:1000],
+                    "result": result_str[:2000],
+                    "failed": is_failure,
                 })
 
                 # Check if task is done
@@ -177,37 +250,108 @@ class AutonomousExecutor:
             except Exception as e:
                 logger.warning(f"Error closing HTTP client: {e}")
 
-    def _think(self, task: str, context: str, step: int) -> dict[str, Any]:
-        """Use LLM to decide the next action."""
-        history_summary = ""
-        if self.action_history:
-            recent = self.action_history[-10:]  # Last 10 actions for context
-            history_summary = "\n".join(
-                f"Step {a['step']}: {a['tool']}({json.dumps(a['args'])[:150]}) → {a['result'][:200]}"
-                for a in recent
+    @staticmethod
+    def _is_failure_result(result_str: str) -> bool:
+        """Determine if a tool result indicates failure."""
+        return (
+            result_str.startswith("ERROR:")
+            or result_str.startswith("BLOCKED")
+            or "Timeout" in result_str
+            or "timed out" in result_str.lower()
+        )
+
+    def _build_playbook_context(self, task: str) -> str:
+        """Detect platforms in the task and build playbook context."""
+        platforms = detect_platforms_in_task(task)
+        if not platforms:
+            return ""
+        parts = []
+        for platform in platforms:
+            prompt = get_playbook_prompt(platform)
+            if prompt:
+                parts.append(prompt)
+        return "\n".join(parts)
+
+    def _format_history(self, max_actions: int = 20) -> str:
+        """Format action history for the LLM with richer context."""
+        if not self.action_history:
+            return "None yet"
+
+        recent = self.action_history[-max_actions:]
+        lines = []
+        for a in recent:
+            status = "FAILED" if a.get("failed") else "OK"
+            # Show more of the result for failures (to help LLM understand what went wrong)
+            max_result_len = 500 if a.get("failed") else 300
+            result_preview = a["result"][:max_result_len]
+            args_str = json.dumps(a["args"])[:300]
+            lines.append(
+                f"Step {a['step']} [{status}]: {a['tool']}({args_str}) → {result_preview}"
             )
 
-        prompt = (
-            f"TASK: {task}\n\n"
-            f"CONTEXT: {context}\n\n"
-            f"STEP: {step + 1}/{self.max_steps}\n\n"
-            f"PREVIOUS ACTIONS:\n{history_summary or 'None yet'}\n\n"
-            f"{TOOL_DESCRIPTIONS}\n\n"
-            "Decide the next action. Return JSON: "
-            '{"reasoning": "why this action", "tool": "tool_name", "args": {...}}\n\n'
-            "Be efficient. Don't repeat failed actions. If stuck, try a different approach."
-        )
+        # Add summary stats
+        total = len(self.action_history)
+        failed = sum(1 for a in self.action_history if a.get("failed"))
+        lines.append(f"\n--- Stats: {total} steps total, {failed} failed ---")
+
+        # Highlight repeated failures (anti-loop detection)
+        failed_actions = [
+            f"{a['tool']}({json.dumps(a['args'])[:100]})"
+            for a in self.action_history if a.get("failed")
+        ]
+        if failed_actions:
+            from collections import Counter
+            repeats = Counter(failed_actions)
+            repeated = [f"  {action} (failed {count}x)" for action, count in repeats.items() if count >= 2]
+            if repeated:
+                lines.append("REPEATED FAILURES (do NOT retry these):")
+                lines.extend(repeated)
+
+        return "\n".join(lines)
+
+    def _think(self, task: str, context: str, step: int,
+               playbook_context: str = "") -> dict[str, Any]:
+        """Use LLM to decide the next action."""
+        history_summary = self._format_history()
+
+        prompt_parts = [
+            f"TASK: {task}",
+            f"\nCONTEXT: {context}" if context else "",
+            f"\nSTEP: {step + 1}/{self.max_steps}",
+            f"\nPREVIOUS ACTIONS:\n{history_summary}",
+        ]
+
+        # Inject playbook knowledge if available
+        if playbook_context:
+            prompt_parts.append(f"\n{playbook_context}")
+
+        prompt_parts.extend([
+            f"\n{TOOL_DESCRIPTIONS}",
+            f"\n{ANTI_PATTERNS}",
+            "\nDecide the next action. Return JSON: "
+            '{"reasoning": "why this action", "tool": "tool_name", "args": {...}}',
+        ])
+
+        prompt = "\n".join(prompt_parts)
 
         response = self.llm.chat_json(
             [
                 {"role": "system", "content": (
                     f"{CORE_DIRECTIVES}\n\n"
-                    "You are an autonomous AI executor. You complete tasks by using tools. "
-                    "Think step by step. Be resourceful and creative. "
-                    "When registering on platforms, use the provided identity info. "
-                    "Always check results before proceeding. Take screenshots when unsure. "
-                    "When writing code, use write_code tool — it generates AND tests code. "
-                    "NEVER produce sloppy work. Everything must be production quality."
+                    "You are an autonomous AI executor. You complete tasks by using tools.\n"
+                    "STRATEGY:\n"
+                    "1. Read the playbook steps if provided — follow them in order.\n"
+                    "2. After navigating to a page, ALWAYS use read_page() to understand "
+                    "what's on the page before clicking or filling forms.\n"
+                    "3. Use fill_form() to fill multiple fields at once — it's more reliable "
+                    "than individual type() calls.\n"
+                    "4. For signups that need email, use create_temp_email() first.\n"
+                    "5. If a site asks for phone verification, use get_phone() and check_phone_code().\n"
+                    "6. After submitting a form, use read_page() to check the result.\n"
+                    "7. If something fails, read the error carefully and try a DIFFERENT approach.\n"
+                    "8. Call done() with a summary as soon as the task is complete.\n"
+                    "9. Call fail() with a clear reason if the task cannot be completed.\n"
+                    "10. NEVER waste steps on actions that already failed.\n"
                 )},
                 {"role": "user", "content": prompt},
             ],
@@ -257,6 +401,35 @@ class AutonomousExecutor:
             elif tool == "read_page":
                 return await self.browser.get_text()
 
+            # ── Agent Coordination Tools ─────────────────────────────
+
+            elif tool == "create_temp_email":
+                verifier = self._get_email_verifier()
+                return verifier.create_temp_email()
+
+            elif tool == "check_email_verification":
+                verifier = self._get_email_verifier()
+                email_addr = args.get("email", "")
+                platform = args.get("platform", "unknown")
+                return verifier.wait_for_verification(
+                    email_addr, platform, timeout=60, poll_interval=5,
+                )
+
+            elif tool == "get_phone":
+                phone_prov = self._get_phone_provisioner()
+                platform = args.get("platform", "unknown")
+                return phone_prov.get_number(
+                    platform=platform,
+                    requesting_agent="executor",
+                )
+
+            elif tool == "check_phone_code":
+                phone_prov = self._get_phone_provisioner()
+                phone_id = args.get("phone_id", 0)
+                return phone_prov.wait_for_code(phone_id, timeout=60)
+
+            # ── API Tools ────────────────────────────────────────────
+
             elif tool == "http_get":
                 url = args.get("url", "")
                 if not url.startswith(("http://", "https://")):
@@ -283,6 +456,8 @@ class AutonomousExecutor:
                     return {"status": resp.status_code, "body": resp.text[:2000]}
                 except Exception as e:
                     return {"status": 0, "error": str(e)[:200]}
+
+            # ── File & Code Tools ────────────────────────────────────
 
             elif tool == "shell":
                 cmd = args.get("command", "")
