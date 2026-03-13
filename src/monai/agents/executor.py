@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from monai.agents.ethics import CORE_DIRECTIVES, is_action_blocked, requires_risk_check
+from monai.agents.memory import SharedMemory
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.browser import Browser
@@ -72,11 +73,21 @@ class AutonomousExecutor:
         self.llm = llm
         self.max_steps = max_steps
         self.timeout_seconds = timeout_seconds
-        self.browser = Browser(config, headless=headless)
         self._anonymizer = get_anonymizer(config)
         # HTTP client routed through proxy — no direct connections
         self.http_client = self._anonymizer.create_http_client(timeout=30)
         self.action_history: list[dict] = []
+        self.memory = SharedMemory(db)
+
+        # Use BrowserLearner (adaptive) instead of raw Browser.
+        # Falls back to raw Browser if BrowserLearner can't be created.
+        try:
+            from monai.agents.browser_learner import BrowserLearner
+            self._learner = BrowserLearner(config, db, llm, headless=headless)
+            self.browser = self._learner.browser
+        except Exception:
+            self._learner = None
+            self.browser = Browser(config, headless=headless)
 
     async def execute_task(self, task: str, context: str = "") -> dict[str, Any]:
         """Execute a task autonomously using think-act-observe loop.
@@ -95,7 +106,10 @@ class AutonomousExecutor:
         total_failures = 0
 
         try:
-            await self.browser.start()
+            if self._learner:
+                await self._learner.start()
+            else:
+                await self.browser.start()
 
             for step in range(self.max_steps):
                 # Enforce time limit
@@ -141,6 +155,15 @@ class AutonomousExecutor:
                         "steps": step,
                         "history": self.action_history,
                     }
+
+                # Mid-task reflection: when accumulating failures, pause
+                # and ask LLM to analyze what's wrong before continuing
+                if (total_failures >= 3 and total_failures % 3 == 0
+                        and step > 0):
+                    reflection = self._reflect_on_failures(task, context)
+                    if reflection:
+                        # Inject reflection into context for next _think call
+                        context = f"{context}\n\nREFLECTION: {reflection}"
 
                 # THINK: Decide next action
                 action = self._think(task, context, step)
@@ -191,8 +214,17 @@ class AutonomousExecutor:
                     "history": self.action_history}
 
         finally:
+            # Post-task learning: analyze what happened and store lessons
             try:
-                await self.browser.stop()
+                self._post_task_learn(task, self.action_history)
+            except Exception as e:
+                logger.debug(f"Post-task learning error (non-fatal): {e}")
+
+            try:
+                if self._learner:
+                    await self._learner.stop()
+                else:
+                    await self.browser.stop()
             except Exception as e:
                 logger.warning(f"Error stopping browser: {e}")
             try:
@@ -202,7 +234,7 @@ class AutonomousExecutor:
                 logger.warning(f"Error closing HTTP client: {e}")
 
     def _think(self, task: str, context: str, step: int) -> dict[str, Any]:
-        """Use LLM to decide the next action."""
+        """Use LLM to decide the next action, enriched with learned context."""
         history_summary = ""
         if self.action_history:
             recent = self.action_history[-10:]  # Last 10 actions for context
@@ -211,15 +243,24 @@ class AutonomousExecutor:
                 for a in recent
             )
 
+        # Inject learned context: domain playbooks, past failures, lessons
+        learned_context = self._get_learned_context(task)
+
         prompt = (
             f"TASK: {task}\n\n"
             f"CONTEXT: {context}\n\n"
             f"STEP: {step + 1}/{self.max_steps}\n\n"
             f"PREVIOUS ACTIONS:\n{history_summary or 'None yet'}\n\n"
+            f"{learned_context}"
             f"{TOOL_DESCRIPTIONS}\n\n"
             "Decide the next action. Return JSON: "
             '{"reasoning": "why this action", "tool": "tool_name", "args": {...}}\n\n'
-            "Be efficient. Don't repeat failed actions. If stuck, try a different approach."
+            "CRITICAL RULES:\n"
+            "- NEVER repeat a failed action with the same arguments\n"
+            "- If a domain is blocked, try a DIFFERENT domain or approach\n"
+            "- If 3+ actions have failed, call done() or fail() instead of burning more steps\n"
+            "- read_page/screenshot do NOT count as progress — only use them when genuinely needed\n"
+            "- Be efficient. Change strategy when things aren't working."
         )
 
         response = self.llm.chat_json(
@@ -231,13 +272,72 @@ class AutonomousExecutor:
                     "When registering on platforms, use the provided identity info. "
                     "Always check results before proceeding. Take screenshots when unsure. "
                     "When writing code, use write_code tool — it generates AND tests code. "
-                    "NEVER produce sloppy work. Everything must be production quality."
+                    "NEVER produce sloppy work. Everything must be production quality.\n\n"
+                    "LEARN FROM FAILURES: When an action fails, analyze WHY and try a "
+                    "fundamentally different approach. Do NOT just retry the same thing."
                 )},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
         )
         return response
+
+    def _get_learned_context(self, task: str) -> str:
+        """Pull relevant learned context for the current task."""
+        parts = []
+
+        # 1. Domain playbooks — if we know patterns for target sites
+        if self._learner:
+            # Extract domain hints from the task
+            import re
+            urls = re.findall(r'https?://([^\s/]+)', task)
+            for domain in urls[:3]:  # Cap at 3 domains
+                playbook = self._learner.get_playbook(domain)
+                if playbook:
+                    parts.append(
+                        f"KNOWN PATTERNS for {domain}: "
+                        f"Success rate: {playbook.get('success_rate', 0):.0%}, "
+                        f"Anti-bot: {playbook.get('anti_bot_measures', 'unknown')}, "
+                        f"Selectors: {playbook.get('known_selectors', '{}')}"
+                    )
+                # Check past failure rates
+                rates = self._learner.get_success_rate(domain)
+                if rates:
+                    rate_summary = ", ".join(
+                        f"{k}: {v.get('rate', 0)}%"
+                        for k, v in rates.items()
+                    )
+                    parts.append(f"PAST SUCCESS RATES on {domain}: {rate_summary}")
+
+        # 2. Lessons from shared memory — what other agents learned
+        try:
+            lessons = self.memory.get_lessons("executor", include_shared=True)
+            if lessons:
+                recent_lessons = lessons[:5]
+                lesson_text = "\n".join(
+                    f"- {l['lesson']}" + (f" RULE: {l['rule']}" if l.get('rule') else "")
+                    for l in recent_lessons
+                )
+                parts.append(f"LESSONS FROM PAST TASKS:\n{lesson_text}")
+        except Exception:
+            pass
+
+        # 3. Blocked domains — tell the LLM what's already known to be blocked
+        try:
+            fallback = self._anonymizer.fallback_chain
+            status = fallback.get_domain_status()
+            blocked = status.get("blocked", {})
+            if blocked:
+                blocked_text = ", ".join(
+                    f"{d} ({', '.join(types)})" for d, types in blocked.items()
+                )
+                parts.append(f"CURRENTLY BLOCKED DOMAINS: {blocked_text}")
+        except Exception:
+            pass
+
+        if parts:
+            return "LEARNED CONTEXT:\n" + "\n".join(parts) + "\n\n"
+        return ""
 
     async def _act(self, tool: str, args: dict) -> Any:
         """Execute a tool action with ethics guardrails."""
@@ -252,17 +352,63 @@ class AutonomousExecutor:
 
         try:
             if tool == "browse":
-                await self.browser.navigate(args.get("url", ""))
-                return await self.browser.get_page_info()
+                if self._learner:
+                    result = await self._learner.navigate(args.get("url", ""))
+                    if not result.get("success"):
+                        failure = result.get("failure", "unknown")
+                        error = result.get("error", "")
+                        return f"ERROR: Navigation failed ({failure}): {error}"
+                    return result.get("page_info", await self.browser.get_page_info())
+                else:
+                    await self.browser.navigate(args.get("url", ""))
+                    return await self.browser.get_page_info()
 
             elif tool == "click":
-                await self.browser.click(args.get("selector", ""))
-                await asyncio.sleep(1)  # Wait for page reaction
-                return await self.browser.get_page_info()
+                if self._learner:
+                    url = ""
+                    try:
+                        page = await self.browser._get_page()
+                        url = page.url
+                    except Exception:
+                        pass
+                    from urllib.parse import urlparse
+                    domain = urlparse(url).netloc if url else ""
+                    result = await self._learner.smart_click(
+                        args.get("selector", ""),
+                        domain=domain,
+                        fallback_text=args.get("text", ""),
+                    )
+                    if not result.get("success"):
+                        return f"ERROR: Click failed: {result.get('error', 'unknown')}"
+                    await asyncio.sleep(1)
+                    return await self.browser.get_page_info()
+                else:
+                    await self.browser.click(args.get("selector", ""))
+                    await asyncio.sleep(1)
+                    return await self.browser.get_page_info()
 
             elif tool == "type":
-                await self.browser.type_text(args.get("selector", ""), args.get("text", ""))
-                return "typed"
+                if self._learner:
+                    url = ""
+                    try:
+                        page = await self.browser._get_page()
+                        url = page.url
+                    except Exception:
+                        pass
+                    from urllib.parse import urlparse
+                    domain = urlparse(url).netloc if url else ""
+                    result = await self._learner.smart_type(
+                        args.get("selector", ""),
+                        args.get("text", ""),
+                        domain=domain,
+                        human_like=True,
+                    )
+                    if not result.get("success"):
+                        return f"ERROR: Type failed: {result.get('error', 'unknown')}"
+                    return "typed"
+                else:
+                    await self.browser.type_text(args.get("selector", ""), args.get("text", ""))
+                    return "typed"
 
             elif tool == "screenshot":
                 path = await self.browser.screenshot(args.get("name", "page"))
@@ -270,8 +416,24 @@ class AutonomousExecutor:
 
             elif tool == "fill_form":
                 fields = args.get("fields", {})
-                await self.browser.fill_form(fields)
-                return f"Filled {len(fields)} fields"
+                if self._learner:
+                    url = ""
+                    try:
+                        page = await self.browser._get_page()
+                        url = page.url
+                    except Exception:
+                        pass
+                    from urllib.parse import urlparse
+                    domain = urlparse(url).netloc if url else ""
+                    result = await self._learner.smart_fill_form(fields, domain=domain)
+                    if not result.get("success"):
+                        failed = [k for k, v in result.get("fields", {}).items()
+                                  if not v.get("success")]
+                        return f"ERROR: Fill form failed on: {', '.join(failed)}"
+                    return f"Filled {len(fields)} fields"
+                else:
+                    await self.browser.fill_form(fields)
+                    return f"Filled {len(fields)} fields"
 
             elif tool == "submit":
                 await self.browser.submit_form(args.get("selector", "form"))
@@ -379,6 +541,109 @@ class AutonomousExecutor:
         except Exception as e:
             logger.error(f"Tool {tool} failed: {e}")
             return f"ERROR: {e}"
+
+    def _reflect_on_failures(self, task: str, context: str) -> str | None:
+        """When hitting repeated failures, pause and analyze what's going wrong.
+
+        Uses a cheap LLM call to reason about the pattern of failures and
+        suggest a fundamentally different approach.
+        """
+        if not self.action_history:
+            return None
+
+        failures = [
+            a for a in self.action_history
+            if a["result"].startswith("ERROR:") or a["result"].startswith("BLOCKED")
+        ]
+        if len(failures) < 3:
+            return None
+
+        failure_summary = "\n".join(
+            f"- {a['tool']}({json.dumps(a['args'])[:100]}) → {a['result'][:150]}"
+            for a in failures[-5:]
+        )
+
+        try:
+            reflection = self.llm.quick(
+                f"TASK: {task}\n\n"
+                f"REPEATED FAILURES ({len(failures)} total):\n{failure_summary}\n\n"
+                "Analyze the pattern. Why do these keep failing? "
+                "What fundamentally different approach should be tried? "
+                "Be specific and actionable. Max 3 sentences.",
+                system="You analyze task execution failures and suggest alternative strategies.",
+            )
+            logger.info(f"Mid-task reflection: {reflection[:200]}")
+            return reflection
+        except Exception as e:
+            logger.debug(f"Reflection failed (non-fatal): {e}")
+            return None
+
+    def _post_task_learn(self, task: str, history: list[dict]) -> None:
+        """After task completion/failure, analyze what happened and store lessons.
+
+        This is how the executor builds knowledge across tasks.
+        """
+        if not history or len(history) < 3:
+            return
+
+        failures = [a for a in history if a["result"].startswith("ERROR:")
+                     or a["result"].startswith("BLOCKED")]
+        successes = [a for a in history if not a["result"].startswith("ERROR:")
+                      and not a["result"].startswith("BLOCKED")]
+        failure_rate = len(failures) / len(history) if history else 0
+
+        # Only learn from tasks with significant failures
+        if failure_rate < 0.3:
+            return
+
+        # Extract domains from failures to learn site-specific patterns
+        failed_domains = set()
+        for a in failures:
+            url = a.get("args", {}).get("url", "")
+            if url:
+                from urllib.parse import urlparse
+                domain = urlparse(url).netloc
+                if domain:
+                    failed_domains.add(domain)
+
+        # Build failure summary
+        failure_types = {}
+        for a in failures:
+            result = a["result"][:100]
+            failure_types[result] = failure_types.get(result, 0) + 1
+
+        top_failures = sorted(failure_types.items(), key=lambda x: -x[1])[:3]
+        failure_text = "; ".join(f"{msg} (x{n})" for msg, n in top_failures)
+
+        # Use cheap LLM to extract a lesson
+        try:
+            lesson_response = self.llm.quick(
+                f"Task: {task[:200]}\n"
+                f"Steps: {len(history)}, Failures: {len(failures)} ({failure_rate:.0%})\n"
+                f"Top failures: {failure_text}\n"
+                f"Failed domains: {', '.join(failed_domains) or 'N/A'}\n\n"
+                "Extract a CONCISE lesson (1 sentence) and a CONCRETE rule "
+                "(1 sentence, actionable) to prevent this in future.\n"
+                "Format: LESSON: ...\nRULE: ...",
+                system="You analyze task execution outcomes and extract actionable lessons.",
+            )
+
+            # Parse response
+            lesson = lesson_response.split("RULE:")[0].replace("LESSON:", "").strip()
+            rule = lesson_response.split("RULE:")[-1].strip() if "RULE:" in lesson_response else ""
+
+            if lesson:
+                self.memory.record_lesson(
+                    agent_name="executor",
+                    category="pattern",
+                    situation=f"Task: {task[:200]}. {len(failures)}/{len(history)} failed.",
+                    lesson=lesson[:300],
+                    rule=rule[:300],
+                    severity="high" if failure_rate > 0.7 else "medium",
+                )
+                logger.info(f"Post-task lesson stored: {lesson[:100]}")
+        except Exception as e:
+            logger.debug(f"Post-task learning failed (non-fatal): {e}")
 
     def _log_task(self, task: str, status: str, result: Any):
         self.db.execute_insert(

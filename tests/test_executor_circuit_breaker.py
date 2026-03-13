@@ -18,9 +18,16 @@ class TestCircuitBreaker:
         config.data_dir = MagicMock()
         config.data_dir.__truediv__ = lambda s, x: MagicMock()
         db = MagicMock()
+        # Mock db.connect() context manager for SharedMemory schema init
+        db.connect.return_value.__enter__ = MagicMock()
+        db.connect.return_value.__exit__ = MagicMock()
         llm = MagicMock()
-        with patch("monai.agents.executor.get_anonymizer"):
+        with patch("monai.agents.executor.get_anonymizer"), \
+             patch("monai.agents.executor.SharedMemory"), \
+             patch("monai.agents.browser_learner.BrowserLearner", side_effect=Exception("no browser")):
             executor = AutonomousExecutor(config, db, llm, max_steps=max_steps)
+        # Ensure _learner is None so tests control browser directly
+        executor._learner = None
         return executor
 
     def test_default_max_steps_is_30(self):
