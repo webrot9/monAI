@@ -339,8 +339,8 @@ class Browser:
         # Already a CSS selector (starts with #, ., [, or contains tag names)
         if s.startswith(("#", ".", "[", "input", "textarea", "select", "button")):
             return s
-        # Looks like a CSS combinator or pseudo-selector
-        if " " in s or ":" in s or ">" in s:
+        # Contains CSS syntax characters — already a selector
+        if "[" in s or ":" in s or " " in s or ">" in s or "+" in s or "~" in s:
             return s
         # Bare field name — wrap as attribute selector
         return f'[name="{s}"], #{s}'

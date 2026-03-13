@@ -155,3 +155,23 @@
 - **Mistake**: Hard-exited with error if OPENAI_API_KEY was not set
 - **Root cause**: Assumed paid API is the only option
 - **Rule**: monAI must support local LLM via Ollama as a zero-cost fallback. Auto-install Ollama + pull model if no API key found. This extends runway from ~2.8 months to 8+ months. Track local model costs as €0.00.
+
+### 2026-03-13 - Three executor bugs that waste API calls in loops
+- **Mistake 1**: `_normalize_selector` broke valid CSS like `a[href='...']` — treated it as a bare field name because `[` wasn't at position 0. LLM kept retrying the same click with the same broken selector.
+- **Mistake 2**: Proxy blocked set was permanent — once `google.com` got blocked via Tor, it stayed blocked for ALL subsequent tasks in the same process. New browser sessions with fresh Tor circuits couldn't retry.
+- **Mistake 3**: Circuit breaker only tracked *consecutive* failures. The LLM gamed it by inserting `read_page`/`screenshot` between actual failures, resetting the counter and burning 30 steps of API calls.
+- **Root cause**: Each bug alone was survivable, but together they created a doom loop: selectors break → pages fail → blocks accumulate → LLM flails → circuit breaker doesn't fire → 30 wasted steps × 3 tasks.
+- **Rules**:
+  1. `_normalize_selector` must check for `[` *anywhere* in the string, not just at position 0. Any string containing CSS syntax chars (`[`, `:`, `>`, `+`, `~`) is already a selector.
+  2. Proxy blocks must have a TTL (5 min). Fresh browser sessions get fresh Tor circuits — stale blocks waste opportunities.
+  3. Circuit breaker must track both consecutive failures AND total failure ratio. If >70% of steps are failures (after ≥6 steps), abort — regardless of interleaved successes.
+
+### 2026-03-13 - Executor must use existing learning infrastructure
+- **Mistake**: Executor used raw `Browser` instead of `BrowserLearner`. Had no access to `SharedMemory`. Never called `learn_from_error()`. Every task started from zero with no memory of what worked or failed before.
+- **Root cause**: The learning infrastructure (BrowserLearner, SharedMemory, lessons) was built but never wired into the executor. Classic "built it but forgot to plug it in."
+- **Rules**:
+  1. Executor MUST use BrowserLearner (not raw Browser) — it gets CAPTCHA solving, self-healing selectors, human-like behavior, and site playbooks for free.
+  2. `_think()` MUST inject learned context: domain playbooks, past failure rates, lessons from SharedMemory, and currently blocked domains.
+  3. After every task, analyze failures and store lessons in SharedMemory — visible to ALL agents.
+  4. When hitting 3+ failures mid-task, PAUSE and reflect: ask the LLM to analyze WHY things are failing and suggest a different approach before continuing.
+  5. NEVER build new capabilities without wiring them into the components that need them. A feature that isn't connected is the same as no feature.

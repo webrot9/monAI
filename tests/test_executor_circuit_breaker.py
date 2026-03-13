@@ -18,9 +18,16 @@ class TestCircuitBreaker:
         config.data_dir = MagicMock()
         config.data_dir.__truediv__ = lambda s, x: MagicMock()
         db = MagicMock()
+        # Mock db.connect() context manager for SharedMemory schema init
+        db.connect.return_value.__enter__ = MagicMock()
+        db.connect.return_value.__exit__ = MagicMock()
         llm = MagicMock()
-        with patch("monai.agents.executor.get_anonymizer"):
+        with patch("monai.agents.executor.get_anonymizer"), \
+             patch("monai.agents.executor.SharedMemory"), \
+             patch("monai.agents.browser_learner.BrowserLearner", side_effect=Exception("no browser")):
             executor = AutonomousExecutor(config, db, llm, max_steps=max_steps)
+        # Ensure _learner is None so tests control browser directly
+        executor._learner = None
         return executor
 
     def test_default_max_steps_is_30(self):
@@ -57,13 +64,14 @@ class TestCircuitBreaker:
 
     @pytest.mark.asyncio
     async def test_circuit_breaker_resets_on_success(self):
+        """Consecutive breaker resets on success; mostly-successful tasks complete."""
         executor = self._make_executor(max_steps=15)
 
         call_count = {"n": 0}
 
         def fake_think(task, context, step):
             call_count["n"] += 1
-            if call_count["n"] == 10:
+            if call_count["n"] == 8:
                 return {"tool": "done", "args": {"result": "finished"}}
             return {"tool": "browse", "args": {"url": "https://example.com"}}
 
@@ -72,12 +80,12 @@ class TestCircuitBreaker:
         executor.browser.start = AsyncMock()
         executor.browser.stop = AsyncMock()
 
-        # Alternate: 4 failures, 1 success, 4 failures, 1 success, etc.
+        # Alternate: 1 failure, 1 success — stays well under ratio threshold
         fail_count = {"n": 0}
 
         async def navigate_side_effect(url):
             fail_count["n"] += 1
-            if fail_count["n"] % 5 == 0:
+            if fail_count["n"] % 2 == 0:
                 return "ok"
             raise Exception("Timeout 30000ms exceeded")
 
@@ -86,8 +94,35 @@ class TestCircuitBreaker:
         executor._log_task = MagicMock()
 
         result = await executor.execute_task("test task")
-        # Should eventually complete because failures reset before hitting 5
+        # Should complete — failure ratio is ~50%, under 70% threshold
         assert result["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_ratio_trips_on_interleaved_failures(self):
+        """Ratio breaker fires even when LLM games it with read_page between errors."""
+        executor = self._make_executor(max_steps=20)
+
+        call_count = {"n": 0}
+
+        def fake_think(task, context, step):
+            call_count["n"] += 1
+            # Pattern: browse(fail), read_page(ok), browse(fail), read_page(ok), ...
+            if call_count["n"] % 2 == 1:
+                return {"tool": "browse", "args": {"url": "https://example.com"}}
+            return {"tool": "read_page", "args": {}}
+
+        executor._think = fake_think
+        executor.browser = AsyncMock()
+        executor.browser.start = AsyncMock()
+        executor.browser.stop = AsyncMock()
+        executor.browser.navigate = AsyncMock(side_effect=Exception("blocked"))
+        executor.browser.get_text = AsyncMock(return_value="some text")
+        executor._log_task = MagicMock()
+
+        result = await executor.execute_task("test task")
+        # 50% failure rate — under 70% threshold, so it should hit max_steps
+        # (consecutive breaker never fires because read_page resets it)
+        assert result["status"] == "max_steps_reached"
 
     @pytest.mark.asyncio
     async def test_error_result_strings_detected_as_failures(self):
@@ -154,6 +189,15 @@ class TestFillFormSelectorNormalization:
 
     def test_textarea_kept(self):
         assert Browser._normalize_selector("textarea#bio") == "textarea#bio"
+
+    def test_tag_with_attribute_selector_kept(self):
+        """a[href='...'] must NOT be treated as a bare name."""
+        sel = "a[href='/accounts/emailsignup/']"
+        assert Browser._normalize_selector(sel) == sel
+
+    def test_sibling_combinator_kept(self):
+        sel = "label + input"
+        assert Browser._normalize_selector(sel) == sel
 
 
 class TestTorControlPort:

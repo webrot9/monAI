@@ -296,6 +296,43 @@ class TestViewports:
         assert 1366 in widths
 
 
+class TestProxyFallbackTTL:
+    """Blocked proxy entries should expire after BLOCK_TTL_SECONDS."""
+
+    def test_block_expires_after_ttl(self, tor_config):
+        from monai.utils.privacy import ProxyFallbackChain, AllProxiesBlockedError
+        chain = ProxyFallbackChain(tor_config.privacy)
+
+        # Block tor for example.com
+        chain.report_blocked("example.com", "tor")
+        assert chain.is_blocked("example.com", "tor")
+
+        # Should raise because tor is the only configured proxy
+        with pytest.raises(AllProxiesBlockedError):
+            chain.get_proxy_for_domain("example.com")
+
+        # Manually backdate the block timestamp past TTL
+        with chain._lock:
+            chain._blocked["example.com"]["tor"] = 0  # epoch = long expired
+
+        # Now it should be unblocked
+        assert not chain.is_blocked("example.com", "tor")
+        ptype, url = chain.get_proxy_for_domain("example.com")
+        assert ptype == "tor"
+
+    def test_block_does_not_expire_before_ttl(self, tor_config):
+        import time
+        from monai.utils.privacy import ProxyFallbackChain, AllProxiesBlockedError
+        chain = ProxyFallbackChain(tor_config.privacy)
+
+        chain.report_blocked("example.com", "tor")
+
+        # Block is fresh — should still be blocked
+        assert chain.is_blocked("example.com", "tor")
+        with pytest.raises(AllProxiesBlockedError):
+            chain.get_proxy_for_domain("example.com")
+
+
 class TestPrivacyConfig:
     def test_defaults_to_tor(self):
         cfg = PrivacyConfig()
