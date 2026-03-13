@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -329,7 +330,7 @@ class AutonomousExecutor:
             elif tool == "run_tests":
                 test_path = args.get("path", "")
                 result = sandbox_run(
-                    ["python", "-m", "pytest", test_path, "-v", "--tb=short"],
+                    [sys.executable, "-m", "pytest", test_path, "-v", "--tb=short"],
                     timeout=120,
                 )
                 return {

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-
+import sys
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -228,7 +228,7 @@ class Coder:
     def _run_tests(self, test_path: Path, work_dir: Path) -> dict[str, Any]:
         from monai.utils.sandbox import sandbox_run
         result = sandbox_run(
-            ["python", "-m", "pytest", str(test_path), "-v", "--tb=short"],
+            [sys.executable, "-m", "pytest", str(test_path), "-v", "--tb=short"],
             cwd=work_dir,
             timeout=60,
             allowed_paths=[work_dir],
@@ -242,7 +242,7 @@ class Coder:
     def _run_script(self, script_path: Path) -> dict[str, Any]:
         from monai.utils.sandbox import sandbox_run
         return sandbox_run(
-            ["python", str(script_path)],
+            [sys.executable, str(script_path)],
             cwd=script_path.parent,
             timeout=60,
             allowed_paths=[script_path.parent],
