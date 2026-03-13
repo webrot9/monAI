@@ -51,6 +51,8 @@ class InfraSetup:
         self.results["llm"] = self._ensure_llm_access()
         self.results["browser"] = self._ensure_browser()
         self.results["pdf_libs"] = self._ensure_pdf_libs()
+        self.results["nodejs"] = self._ensure_nodejs()
+        self.results["util_linux"] = self._ensure_util_linux()
 
         # Crypto infrastructure is OPTIONAL — only set up if explicitly configured.
         # The primary payout flow is LLC → contractor invoice → bank transfer.
@@ -279,6 +281,122 @@ class InfraSetup:
             "status": "degraded",
             "warning": "PDF generation unavailable (WeasyPrint system libs missing)",
         }
+
+    # ── Node.js ───────────────────────────────────────────────────
+
+    def _ensure_nodejs(self) -> dict[str, Any]:
+        """Ensure Node.js and npm are installed for web deployment CLIs.
+
+        Without Node.js, agents cannot deploy landing pages (Netlify,
+        Vercel, Cloudflare Workers). Web deployment is a core capability.
+        """
+        if shutil.which("node") and shutil.which("npm"):
+            logger.info("Node.js and npm already installed")
+            return {"status": "ok"}
+
+        installed = self._install_nodejs()
+        if installed:
+            return {"status": "ok", "method": "auto_installed"}
+
+        logger.warning(
+            "Could not auto-install Node.js. Web deployment will not work. "
+            "Install manually: https://nodejs.org/"
+        )
+        return {"status": "degraded", "warning": "Node.js not available — web deployment disabled"}
+
+    def _install_nodejs(self) -> bool:
+        """Attempt to install Node.js via package manager or nodesource."""
+        system = platform.system().lower()
+        try:
+            if system == "linux":
+                if shutil.which("apt-get"):
+                    # Use nodesource for a recent version
+                    subprocess.run(
+                        ["sudo", "apt-get", "install", "-y", "nodejs", "npm"],
+                        capture_output=True, timeout=120,
+                    )
+                    if shutil.which("node"):
+                        logger.info("Node.js installed via apt-get")
+                        return True
+                if shutil.which("dnf"):
+                    subprocess.run(
+                        ["sudo", "dnf", "install", "-y", "nodejs", "npm"],
+                        capture_output=True, timeout=120,
+                    )
+                    if shutil.which("node"):
+                        logger.info("Node.js installed via dnf")
+                        return True
+                if shutil.which("pacman"):
+                    subprocess.run(
+                        ["sudo", "pacman", "-S", "--noconfirm", "nodejs", "npm"],
+                        capture_output=True, timeout=120,
+                    )
+                    if shutil.which("node"):
+                        logger.info("Node.js installed via pacman")
+                        return True
+            elif system == "darwin":
+                if shutil.which("brew"):
+                    subprocess.run(
+                        ["brew", "install", "node"],
+                        capture_output=True, timeout=120,
+                    )
+                    if shutil.which("node"):
+                        logger.info("Node.js installed via brew")
+                        return True
+        except Exception as e:
+            logger.warning("Node.js installation failed: %s", e)
+        return False
+
+    # ── util-linux (unshare) ──────────────────────────────────────
+
+    def _ensure_util_linux(self) -> dict[str, Any]:
+        """Ensure util-linux is installed (provides 'unshare' for sandbox fallback).
+
+        If bubblewrap fails, unshare is the next line of defense for
+        process isolation. Without it, sandbox degrades to application-level
+        only — which means NO OS-level isolation at all.
+        """
+        if shutil.which("unshare"):
+            logger.info("util-linux (unshare) already available")
+            return {"status": "ok"}
+
+        system = platform.system().lower()
+        if system != "linux":
+            # unshare is Linux-specific
+            return {"status": "skipped", "reason": "unshare is Linux-only"}
+
+        installed = False
+        try:
+            if shutil.which("apt-get"):
+                subprocess.run(
+                    ["sudo", "apt-get", "install", "-y", "util-linux"],
+                    capture_output=True, timeout=120,
+                )
+                installed = shutil.which("unshare") is not None
+            elif shutil.which("dnf"):
+                subprocess.run(
+                    ["sudo", "dnf", "install", "-y", "util-linux"],
+                    capture_output=True, timeout=120,
+                )
+                installed = shutil.which("unshare") is not None
+            elif shutil.which("pacman"):
+                subprocess.run(
+                    ["sudo", "pacman", "-S", "--noconfirm", "util-linux"],
+                    capture_output=True, timeout=120,
+                )
+                installed = shutil.which("unshare") is not None
+        except Exception as e:
+            logger.warning("util-linux installation failed: %s", e)
+
+        if installed:
+            # Refresh sandbox backend to pick up unshare
+            from monai.utils import sandbox
+            sandbox.refresh_isolation_backend()
+            logger.info("util-linux installed — unshare available for sandbox fallback")
+            return {"status": "ok", "method": "auto_installed"}
+
+        logger.warning("Could not install util-linux — sandbox has no OS-level fallback")
+        return {"status": "degraded", "warning": "unshare not available — no sandbox fallback"}
 
     # ── Tor ──────────────────────────────────────────────────────
 

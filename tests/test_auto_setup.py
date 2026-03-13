@@ -142,6 +142,10 @@ class TestSandboxSetup:
              patch.object(setup, "_ensure_sandbox", return_value={"status": "ok"}), \
              patch.object(setup, "_ensure_tor", return_value={"status": "ok"}), \
              patch.object(setup, "_ensure_llm_access", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_browser", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_pdf_libs", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_nodejs", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_util_linux", return_value={"status": "ok"}), \
              patch.object(setup, "_is_crypto_configured", return_value=False):
             (tmp_path / "bin").mkdir(exist_ok=True)
             results = setup.run_all()
@@ -219,12 +223,109 @@ class TestPdfLibsSetup:
              patch.object(setup, "_ensure_llm_access", return_value={"status": "ok"}), \
              patch.object(setup, "_ensure_browser", return_value={"status": "ok"}), \
              patch.object(setup, "_ensure_pdf_libs", return_value={"status": "degraded", "warning": "test"}), \
+             patch.object(setup, "_ensure_nodejs", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_util_linux", return_value={"status": "ok"}), \
              patch.object(setup, "_is_crypto_configured", return_value=False):
             (tmp_path / "bin").mkdir(exist_ok=True)
             results = setup.run_all()
         assert "browser" in results
         assert "pdf_libs" in results
         # degraded is acceptable — system still starts
+        assert results["ready"] is True
+
+
+class TestNodejsSetup:
+    def test_node_already_installed(self):
+        setup = InfraSetup()
+        with patch("shutil.which", side_effect=lambda n: "/usr/bin/" + n if n in ("node", "npm") else None):
+            result = setup._ensure_nodejs()
+        assert result["status"] == "ok"
+
+    def test_node_not_found_install_succeeds(self):
+        setup = InfraSetup()
+        with patch.object(setup, "_install_nodejs", return_value=True), \
+             patch("shutil.which", return_value=None):
+            result = setup._ensure_nodejs()
+        assert result["status"] == "ok"
+        assert result["method"] == "auto_installed"
+
+    def test_node_install_fails_degrades(self):
+        setup = InfraSetup()
+        with patch("shutil.which", return_value=None):
+            result = setup._ensure_nodejs()
+        assert result["status"] == "degraded"
+
+    def test_install_nodejs_apt(self):
+        setup = InfraSetup()
+        # _install_nodejs calls: which("apt-get") -> run apt -> which("node")
+        # We need apt-get found, then node found after install
+        call_seq = iter(["apt-get", "node_after"])
+
+        def which_side_effect(name):
+            if name == "apt-get":
+                return "/usr/bin/apt-get"
+            if name == "node":
+                # First call returns None (in _ensure_nodejs), second returns path (after install)
+                return "/usr/bin/node"
+            return None
+
+        with patch("shutil.which", side_effect=which_side_effect), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("platform.system", return_value="Linux"):
+            result = setup._install_nodejs()
+        assert result is True
+
+
+class TestUtilLinuxSetup:
+    def test_unshare_already_available(self):
+        setup = InfraSetup()
+        with patch("shutil.which", return_value="/usr/bin/unshare"):
+            result = setup._ensure_util_linux()
+        assert result["status"] == "ok"
+
+    def test_unshare_not_linux_skipped(self):
+        setup = InfraSetup()
+        with patch("shutil.which", return_value=None), \
+             patch("platform.system", return_value="Darwin"):
+            result = setup._ensure_util_linux()
+        assert result["status"] == "skipped"
+
+    def test_unshare_install_succeeds(self):
+        setup = InfraSetup()
+        call_count = {"unshare": 0}
+
+        def which_side_effect(name):
+            if name == "unshare":
+                call_count["unshare"] += 1
+                return "/usr/bin/unshare" if call_count["unshare"] > 1 else None
+            if name == "apt-get":
+                return "/usr/bin/apt-get"
+            return None
+
+        with patch("shutil.which", side_effect=which_side_effect), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("platform.system", return_value="Linux"), \
+             patch("monai.utils.sandbox.refresh_isolation_backend", return_value="unshare"):
+            result = setup._ensure_util_linux()
+        assert result["status"] == "ok"
+        assert result["method"] == "auto_installed"
+
+    def test_run_all_includes_nodejs_and_util_linux(self, tmp_path):
+        setup = InfraSetup()
+        with patch("monai.infra.auto_setup.MONAI_DIR", tmp_path), \
+             patch("monai.infra.auto_setup.MONAI_BIN", tmp_path / "bin"), \
+             patch.object(setup, "_ensure_sandbox", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_tor", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_llm_access", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_browser", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_pdf_libs", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_nodejs", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_util_linux", return_value={"status": "ok"}), \
+             patch.object(setup, "_is_crypto_configured", return_value=False):
+            (tmp_path / "bin").mkdir(exist_ok=True)
+            results = setup.run_all()
+        assert "nodejs" in results
+        assert "util_linux" in results
         assert results["ready"] is True
 
 
