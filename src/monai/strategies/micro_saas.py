@@ -382,6 +382,89 @@ class MicroSaaSAgent(BaseAgent):
 
         return {"landing_pages_created": created}
 
+    def apply_improvements(self) -> dict[str, Any]:
+        """Apply pending improvements from ProductIterator to existing products.
+
+        Retrieves pending improvement plans, rebuilds code or content via
+        the Coder agent, re-reviews the updated product, and marks iterations
+        as applied.
+        """
+        pending = self.product_iterator.get_pending_improvements(self.name)
+        if not pending:
+            return {"status": "no_pending_improvements"}
+
+        applied = 0
+        for improvement in pending[:2]:  # Max 2 per cycle to control costs
+            product_name = improvement["product_name"]
+            improvements_json = improvement.get("improvements", "[]")
+            try:
+                plan = json.loads(improvements_json) if isinstance(improvements_json, str) else improvements_json
+            except (json.JSONDecodeError, TypeError):
+                plan = {}
+
+            improvement_items = plan.get("improvements", []) if isinstance(plan, dict) else []
+
+            # Find the product file
+            product_path = None
+            product_data = None
+            for path in self.products_dir.glob("*.json"):
+                data = json.loads(path.read_text())
+                design = data.get("design", data.get("research", {}))
+                name = design.get("name", path.stem)
+                if name == product_name or path.stem == product_name:
+                    product_path = path
+                    product_data = data
+                    break
+
+            if not product_data or not product_path:
+                self.product_iterator.mark_applied(improvement["id"])
+                continue
+
+            # Build improvement spec for Coder
+            current_build = product_data.get("build", {})
+            design = product_data.get("design", {})
+            change_descriptions = [
+                f"- {item.get('area', 'general')}: {item.get('specific_change', item.get('current_issue', ''))}"
+                for item in improvement_items
+            ]
+            changes_text = "\n".join(change_descriptions) if change_descriptions else "General quality improvements"
+
+            rebuild_spec = (
+                f"Improve the existing micro-SaaS product: {product_name}\n"
+                f"Original spec: {json.dumps(design, default=str)[:2000]}\n\n"
+                f"REQUIRED IMPROVEMENTS:\n{changes_text}\n\n"
+                f"Rebuild the product with these improvements applied. "
+                f"Keep existing functionality working while adding the improvements. "
+                f"Include proper error handling and tests."
+            )
+
+            build_result = self.coder.generate_module(rebuild_spec)
+
+            if build_result.get("status") == "success":
+                product_data["build"] = build_result
+                product_data["status"] = "built"
+                product_data.setdefault("iteration_history", []).append({
+                    "iteration_id": improvement["id"],
+                    "improvements_applied": change_descriptions,
+                    "rebuild_status": "success",
+                })
+                product_path.write_text(json.dumps(product_data, indent=2))
+                self.product_iterator.mark_applied(improvement["id"])
+                applied += 1
+                self.log_action(
+                    "product_improved",
+                    f"{product_name}: rebuilt with {len(improvement_items)} improvements",
+                )
+            else:
+                self.log_action(
+                    "product_improve_failed",
+                    f"{product_name}: rebuild failed — {build_result.get('error', 'unknown')}",
+                )
+                # Mark applied anyway to prevent infinite retry
+                self.product_iterator.mark_applied(improvement["id"])
+
+        return {"applied": applied, "total_pending": len(pending)}
+
     def _check_usage(self) -> dict[str, Any]:
         """Check real usage metrics for deployed products."""
         metrics = {}

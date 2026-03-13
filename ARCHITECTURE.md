@@ -120,13 +120,35 @@ PHASE 3: Self-Sustaining
 ```
 Content Generation → ProductReviewer (Humanizer + FactChecker + Legal) → Publish/Revise/Block
                                           ↓
-                              ProductIterator (monitors sales/quality)
+                              ProductIterator (monitors sales/quality/customer feedback)
                                           ↓
-                            Competitor Analysis → Improvement Plan → Rebuild
+                    Competitor Analysis (persistent DB) → Improvement Plan → Rebuild
+                                          ↓
+                              Customer Feedback Loop (ratings, NPS, refund reasons)
 ```
 
 All 11 content/product-producing strategies pass through the ProductReviewer quality gate.
 The ProductIterator runs every 5 cycles to identify underperformers and trigger improvements.
+
+### Self-Improvement A/B Testing (Statistical Rigor)
+- **Welch's t-test** for comparing before/after metrics (no scipy dependency)
+- **Minimum sample size** (N≥10) before making deployment decisions
+- **Bonferroni correction** for multiple metric comparisons
+- **Variance/stdev analysis** to flag high-noise results
+- **Early stop** support: experiments resolved early if p < 0.01
+- **SharedMemory integration**: experiment results written as knowledge + lessons
+
+### Customer Feedback Loop
+- `product_reviews` table extended with: `customer_rating`, `customer_feedback`, `nps_score`, `support_tickets`
+- `record_customer_feedback()` method for webhooks/support systems to feed real customer data
+- `get_customer_sentiment()` aggregates rating, NPS, tickets, and recent feedback
+- Customer voice prioritized over internal reviews in product iteration prompts
+
+### Competitor Tracking Database
+- `competitors` table: persistent, queryable, with UNIQUE constraint per product/competitor
+- `competitor_history` table: tracks pricing, features, rating changes over time
+- `get_competitor_trends()`: retrieves competitor data with historical changes
+- Web search results automatically persisted with change detection
 
 - **Humanizer**: Ensures content passes AI detection tools
 - **FactChecker**: Extracts claims, verifies each one, tracks per-brand accuracy

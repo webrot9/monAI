@@ -8,6 +8,7 @@ Zero human intervention.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import asyncio
@@ -228,9 +229,18 @@ def run_daemon(config: Config, cycle_interval: int = 300):
         logger.info(f"  CYCLE {cycle} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"{'='*60}")
 
+        # Watchdog: run cycle with hard timeout (10 minutes) to detect hangs
+        cycle_timeout = 600  # seconds
         try:
-            result = orchestrator.run()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(orchestrator.run)
+                result = future.result(timeout=cycle_timeout)
             _print_cycle_summary(result, db)
+        except concurrent.futures.TimeoutError:
+            logger.critical(
+                f"WATCHDOG: Cycle {cycle} exceeded {cycle_timeout}s timeout — "
+                "force-completing and moving to next cycle"
+            )
         except Exception as e:
             logger.error(f"Cycle {cycle} failed: {e}", exc_info=True)
 
@@ -255,9 +265,12 @@ def run_daemon(config: Config, cycle_interval: int = 300):
 
 
 def run_once(config: Config):
-    """Run a single orchestration cycle."""
+    """Run a single orchestration cycle with watchdog timeout."""
     orchestrator, db = create_orchestrator(config)
-    result = orchestrator.run()
+    cycle_timeout = 600  # 10 minutes
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(orchestrator.run)
+        result = future.result(timeout=cycle_timeout)
     _print_cycle_summary(result, db)
     return result
 

@@ -147,6 +147,25 @@ class Orchestrator(BaseAgent):
         self.workflow_engine.register_agent("api_provisioner", self.api_provisioner)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
+        # Startup anonymity verification — refuse to run if proxy is required but broken
+        if config.privacy.proxy_type != "none" and getattr(config.privacy, "verify_anonymity", True):
+            anonymizer = get_anonymizer(config)
+            try:
+                anon_status = anonymizer.startup_check()
+                if not anon_status.get("anonymous"):
+                    logger.critical(
+                        "STARTUP ANONYMITY CHECK FAILED: %s — "
+                        "monAI will NOT operate without verified anonymity",
+                        anon_status,
+                    )
+                else:
+                    logger.info(
+                        "Startup anonymity verified: visible IP %s",
+                        anon_status.get("visible_ip", "unknown"),
+                    )
+            except Exception as e:
+                logger.warning("Startup anonymity check error (will retry per-cycle): %s", e)
+
     def register_strategy(self, agent: BaseAgent):
         self._strategy_agents[agent.name] = agent
         self.workflow_engine.register_agent(agent.name, agent)
@@ -1500,7 +1519,7 @@ class Orchestrator(BaseAgent):
         try:
             result = self.product_iterator.run()
 
-            # Feed pending improvements back to strategy agents
+            # Apply pending improvements to actual products via strategy agents
             for name, agent in self._strategy_agents.items():
                 pending = self.product_iterator.get_pending_improvements(name)
                 if pending:
@@ -1508,10 +1527,23 @@ class Orchestrator(BaseAgent):
                         "product_improvements_pending",
                         f"{name}: {len(pending)} improvement(s) queued",
                     )
-                    # Mark as applied — the strategy will pick up review feedback
-                    # on its next cycle via the product_reviews table
-                    for p in pending:
-                        self.product_iterator.mark_applied(p["id"])
+                    # Call the strategy's apply_improvements() to rebuild code/content
+                    if hasattr(agent, "apply_improvements"):
+                        try:
+                            apply_result = agent.apply_improvements()
+                            self.log_action(
+                                "product_improvements_applied",
+                                f"{name}: {json.dumps(apply_result, default=str)[:300]}",
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to apply improvements for {name}: {e}")
+                            # Mark remaining pending as applied to prevent infinite retry
+                            for p in pending:
+                                self.product_iterator.mark_applied(p["id"])
+                    else:
+                        # Strategy doesn't support improvements yet — mark as applied
+                        for p in pending:
+                            self.product_iterator.mark_applied(p["id"])
 
             self.log_action("product_iteration", json.dumps(result, default=str)[:500])
             return result

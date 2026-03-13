@@ -106,18 +106,17 @@ class Pipeline:
         old_stage = rows[0]["stage"]
         now = datetime.now().isoformat()
 
-        updates = "stage = ?, last_touch_at = ?"
-        params: list = [new_stage, now]
-
         if new_stage == "customer" and old_stage != "customer":
-            updates += ", converted_at = ?"
-            params.append(now)
-
-        params.append(lead_id)
-        self.db.execute(
-            f"UPDATE pipeline_leads SET {updates} WHERE id = ?",
-            tuple(params),
-        )
+            self.db.execute(
+                "UPDATE pipeline_leads SET stage = ?, last_touch_at = ?, "
+                "converted_at = ? WHERE id = ?",
+                (new_stage, now, now, lead_id),
+            )
+        else:
+            self.db.execute(
+                "UPDATE pipeline_leads SET stage = ?, last_touch_at = ? WHERE id = ?",
+                (new_stage, now, lead_id),
+            )
 
         self.log_event(lead_id, "stage_change",
                        {"from": old_stage, "to": new_stage})

@@ -49,6 +49,7 @@ class BaseAgent(ABC):
         self._provisioner = None  # Lazy-loaded
         self._reviewer = None  # Lazy-loaded
         self._api_provisioner = None  # Lazy-loaded
+        self._product_iterator = None  # Lazy-loaded
 
     @property
     def coder(self):
@@ -117,6 +118,18 @@ class BaseAgent(ABC):
     @api_provisioner.setter
     def api_provisioner(self, value):
         self._api_provisioner = value
+
+    @property
+    def product_iterator(self):
+        """Lazy-load product iterator — continuous product improvement engine."""
+        if self._product_iterator is None:
+            from monai.agents.product_iterator import ProductIterator
+            self._product_iterator = ProductIterator(self.config, self.db, self.llm)
+        return self._product_iterator
+
+    @product_iterator.setter
+    def product_iterator(self, value):
+        self._product_iterator = value
 
     def write_code(self, spec: str, project_dir: str | None = None,
                    language: str = "python") -> dict:
@@ -571,6 +584,51 @@ class BaseAgent(ABC):
             lesson=lesson_text,
             rule=rule_text,
             severity="high",
+        )
+
+    def learn_from_silent_failure(
+        self,
+        action: str,
+        result: Any,
+        expected: str = "",
+        context: str = "",
+    ):
+        """Detect and learn from silent failures — operations that succeed
+        but produce empty, null, or unexpected results without raising.
+
+        Call this after any operation where an empty/null result indicates a problem.
+        """
+        # Detect silent failure patterns
+        is_failure = False
+        failure_reason = ""
+
+        if result is None:
+            is_failure = True
+            failure_reason = "returned None"
+        elif isinstance(result, (list, dict)) and len(result) == 0:
+            is_failure = True
+            failure_reason = "returned empty collection"
+        elif isinstance(result, dict) and result.get("status") in ("error", "failed"):
+            is_failure = True
+            failure_reason = f"status={result.get('status')}: {result.get('error', 'unknown')}"
+        elif isinstance(result, str) and not result.strip():
+            is_failure = True
+            failure_reason = "returned empty string"
+
+        if not is_failure:
+            return
+
+        self.logger.warning(
+            "[%s] Silent failure detected: %s → %s",
+            self.name, action, failure_reason,
+        )
+
+        self.learn(
+            category="silent_failure",
+            situation=f"Action '{action}' {failure_reason}. Context: {context}. Expected: {expected}",
+            lesson=f"Silent failure in {action}: {failure_reason}",
+            rule=f"Add validation for {action} return value before proceeding",
+            severity="medium",
         )
 
     def get_my_lessons(self) -> list[dict[str, Any]]:

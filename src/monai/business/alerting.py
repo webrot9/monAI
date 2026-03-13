@@ -156,11 +156,14 @@ class AlertingEngine:
 
     def update_rule(self, rule_id: int, **kwargs: Any) -> None:
         """Update fields on an existing rule."""
-        allowed = {"name", "metric", "operator", "threshold", "severity",
-                    "cooldown_minutes", "message_template", "enabled"}
-        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        _ALLOWED_COLUMNS = frozenset({
+            "name", "metric", "operator", "threshold", "severity",
+            "cooldown_minutes", "message_template", "enabled",
+        })
+        updates = {k: v for k, v in kwargs.items() if k in _ALLOWED_COLUMNS}
         if not updates:
             return
+        # Safe: column names come from _ALLOWED_COLUMNS whitelist, not user input
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         self.db.execute(
             f"UPDATE alert_rules SET {set_clause} WHERE id = ?",

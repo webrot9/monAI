@@ -7,6 +7,13 @@ Agents can improve themselves by:
 4. Deploying improvements as A/B experiments (status='testing')
 5. Evaluating experiments after N cycles — auto-deploy or auto-revert
 
+Statistical rigor:
+- Minimum sample size (N≥10) before making decisions
+- Welch's t-test for significance (p < 0.05)
+- Variance/stdev analysis to flag noisy results
+- Bonferroni correction for multiple metric comparisons
+- Early stop if p < 0.01 with sufficient data
+
 Constraints:
 - Ethics are NEVER relaxed — improvements must pass ethics tests
 - Cost must stay within budget
@@ -18,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import datetime
 from typing import Any
 
@@ -71,6 +79,60 @@ CREATE TABLE IF NOT EXISTS agent_metrics (
 MIN_IMPROVEMENT_PCT = 5.0    # Must improve by at least 5% to keep
 MAX_DECLINE_PCT = -10.0      # Revert if any metric declines more than 10%
 DEFAULT_EVAL_CYCLES = 5      # Evaluate after 5 orchestration cycles
+MIN_SAMPLE_SIZE = 10         # Minimum data points per metric for valid comparison
+SIGNIFICANCE_LEVEL = 0.05    # p-value threshold for statistical significance
+EARLY_STOP_P = 0.01          # p-value for early stop (very significant)
+HIGH_VARIANCE_RATIO = 0.5    # Flag if stdev > 50% of mean
+
+
+def _welch_t_test(
+    vals_a: list[float], vals_b: list[float],
+) -> tuple[float, float]:
+    """Welch's t-test for unequal variances (no scipy dependency).
+
+    Returns (t_statistic, p_value_approx).
+    Uses the Welch-Satterthwaite approximation for degrees of freedom
+    and a simple t-distribution approximation for the p-value.
+    """
+    n_a, n_b = len(vals_a), len(vals_b)
+    if n_a < 2 or n_b < 2:
+        return 0.0, 1.0
+
+    mean_a = sum(vals_a) / n_a
+    mean_b = sum(vals_b) / n_b
+
+    var_a = sum((x - mean_a) ** 2 for x in vals_a) / (n_a - 1)
+    var_b = sum((x - mean_b) ** 2 for x in vals_b) / (n_b - 1)
+
+    se = math.sqrt(var_a / n_a + var_b / n_b) if (var_a + var_b) > 0 else 0.0
+    if se == 0:
+        return 0.0, 1.0
+
+    t_stat = (mean_b - mean_a) / se
+
+    # Welch-Satterthwaite degrees of freedom
+    numerator = (var_a / n_a + var_b / n_b) ** 2
+    denom = (var_a / n_a) ** 2 / (n_a - 1) + (var_b / n_b) ** 2 / (n_b - 1)
+    df = numerator / denom if denom > 0 else 1.0
+
+    # Approximate two-tailed p-value using the normal distribution for large df,
+    # or a conservative t-distribution approximation for small df.
+    abs_t = abs(t_stat)
+    if df >= 30:
+        # Normal approximation (good for df >= 30)
+        p_value = 2.0 * _normal_sf(abs_t)
+    else:
+        # Conservative approximation for small df
+        # Uses: p ≈ 2 * (1 - Φ(|t| * sqrt(df/(df+t²))))
+        adjusted = abs_t * math.sqrt(df / (df + abs_t ** 2)) if (df + abs_t ** 2) > 0 else 0.0
+        p_value = 2.0 * _normal_sf(adjusted)
+
+    return t_stat, max(0.0, min(1.0, p_value))
+
+
+def _normal_sf(x: float) -> float:
+    """Survival function (1 - CDF) for standard normal, no scipy needed."""
+    return 0.5 * math.erfc(x / math.sqrt(2))
 
 
 class SelfImprover:
@@ -378,8 +440,11 @@ class SelfImprover:
     def tick_experiments(self) -> list[dict[str, Any]]:
         """Advance experiment cycle counters and evaluate ready experiments.
 
-        Call this once per orchestration cycle. Returns a list of
-        experiment results (deployed or reverted).
+        Call this once per orchestration cycle. Supports early stop:
+        if an experiment already has enough data and p < EARLY_STOP_P,
+        it can be resolved before eval_after_cycles is reached.
+
+        Returns a list of experiment results (deployed or reverted).
         """
         rows = self.db.execute(
             "SELECT * FROM agent_improvements WHERE status = 'testing'"
@@ -397,36 +462,142 @@ class SelfImprover:
                 (eval_cycles, exp["id"]),
             )
 
+            # Check for early stop opportunity (at least half the eval window)
+            if eval_cycles >= max(3, eval_after // 2) and eval_cycles < eval_after:
+                early_result = self._check_early_stop(exp)
+                if early_result:
+                    results.append(early_result)
+                    continue
+
             if eval_cycles >= eval_after:
                 result = self._evaluate_experiment(exp)
                 results.append(result)
 
         return results
 
+    def _check_early_stop(self, experiment: dict[str, Any]) -> dict[str, Any] | None:
+        """Check if experiment can be stopped early due to very strong signal.
+
+        Only triggers if p < EARLY_STOP_P (0.01) with sufficient sample size.
+        Returns result dict if early-stopped, None otherwise.
+        """
+        agent_name = experiment["agent_name"]
+        deployed_at = experiment.get("deployed_at", "")
+
+        for metric_name in ["execution_success", "revenue", "roi"]:
+            before_vals = self._get_metric_values(
+                agent_name, metric_name, before_cycle=deployed_at,
+            )
+            after_vals = self._get_metric_values(
+                agent_name, metric_name, after_cycle=deployed_at,
+            )
+
+            if len(before_vals) < MIN_SAMPLE_SIZE or len(after_vals) < MIN_SAMPLE_SIZE:
+                continue
+
+            t_stat, p_value = _welch_t_test(before_vals, after_vals)
+
+            if p_value < EARLY_STOP_P:
+                b_mean = sum(before_vals) / len(before_vals)
+                a_mean = sum(after_vals) / len(after_vals)
+                pct_change = ((a_mean - b_mean) / abs(b_mean)) * 100 if b_mean != 0 else 0.0
+
+                if pct_change <= MAX_DECLINE_PCT:
+                    # Strong decline — early revert
+                    logger.info(
+                        "Experiment %s EARLY STOP (decline p=%.4f): %s",
+                        experiment["id"], p_value, experiment["description"][:80],
+                    )
+                    self._revert_deployment(experiment)
+                    self.db.execute(
+                        "UPDATE agent_improvements SET status = 'reverted', "
+                        "performance_after = ? WHERE id = ?",
+                        (json.dumps({"early_stop": True, metric_name: a_mean}),
+                         experiment["id"]),
+                    )
+                    self._record_experiment_result(
+                        experiment, "declined",
+                        {"early_stop": True, "p_value": p_value, "metric": metric_name},
+                    )
+                    return {
+                        "id": experiment["id"],
+                        "agent": agent_name,
+                        "action": "early_reverted",
+                        "verdict": "declined",
+                        "details": {"early_stop": True, "p_value": p_value,
+                                    "metric": metric_name, "pct_change": pct_change},
+                    }
+                elif pct_change >= MIN_IMPROVEMENT_PCT:
+                    # Strong improvement — early promote
+                    logger.info(
+                        "Experiment %s EARLY STOP (improvement p=%.4f): %s",
+                        experiment["id"], p_value, experiment["description"][:80],
+                    )
+                    after_snapshot = self._snapshot_metrics(agent_name)
+                    self.db.execute(
+                        "UPDATE agent_improvements SET status = 'deployed', "
+                        "performance_after = ? WHERE id = ?",
+                        (json.dumps(after_snapshot), experiment["id"]),
+                    )
+                    self._record_experiment_result(
+                        experiment, "improved",
+                        {"early_stop": True, "p_value": p_value, "metric": metric_name},
+                    )
+                    return {
+                        "id": experiment["id"],
+                        "agent": agent_name,
+                        "action": "early_promoted",
+                        "verdict": "improved",
+                        "details": {"early_stop": True, "p_value": p_value,
+                                    "metric": metric_name, "pct_change": pct_change},
+                    }
+
+        return None
+
     def _evaluate_experiment(self, experiment: dict[str, Any]) -> dict[str, Any]:
-        """Evaluate an A/B experiment by comparing before/after metrics.
+        """Evaluate an A/B experiment using statistical analysis.
+
+        Uses Welch's t-test, minimum sample sizes, and Bonferroni correction
+        to determine if the experiment produced a statistically significant result.
 
         If metrics improved (or held steady): promote to 'deployed'.
         If metrics declined significantly: revert to 'reverted'.
+        If high variance or insufficient data: extend the experiment.
         """
         agent_name = experiment["agent_name"]
         exp_id = experiment["id"]
+        deployed_at = experiment.get("deployed_at", "")
 
-        # Get before snapshot
+        # Get before snapshot (averages)
         try:
             before = json.loads(experiment.get("performance_before") or "{}")
         except (json.JSONDecodeError, TypeError):
             before = {}
 
-        # Take after snapshot
+        # Take after snapshot (averages)
         after = self._snapshot_metrics(agent_name)
 
-        # Compare
-        verdict, details = self._compare_snapshots(before, after)
+        # Collect RAW data for statistical testing
+        key_metrics = ["execution_success", "revenue", "roi"]
+        before_raw: dict[str, list[float]] = {}
+        after_raw: dict[str, list[float]] = {}
+
+        for metric_name in key_metrics:
+            before_raw[metric_name] = self._get_metric_values(
+                agent_name, metric_name, before_cycle=deployed_at,
+            )
+            after_raw[metric_name] = self._get_metric_values(
+                agent_name, metric_name, after_cycle=deployed_at,
+            )
+
+        # Compare with statistics
+        verdict, details = self._compare_snapshots(
+            before, after, before_raw=before_raw, after_raw=after_raw,
+        )
 
         now = datetime.now().isoformat()
-        if verdict == "insufficient_data":
-            # Not enough metrics yet — extend experiment
+        if verdict in ("insufficient_data", "inconclusive_high_variance"):
+            # Not enough data or too noisy — extend experiment
             extra_cycles = experiment.get("eval_after_cycles") or DEFAULT_EVAL_CYCLES
             self.db.execute(
                 "UPDATE agent_improvements SET eval_after_cycles = ?, eval_cycles = 0 "
@@ -434,8 +605,8 @@ class SelfImprover:
                 (extra_cycles + DEFAULT_EVAL_CYCLES, exp_id),
             )
             logger.info(
-                "Experiment %s EXTENDED (insufficient data): %s",
-                exp_id, experiment["description"][:80],
+                "Experiment %s EXTENDED (verdict=%s): %s",
+                exp_id, verdict, experiment["description"][:80],
             )
             return {
                 "id": exp_id,
@@ -444,6 +615,9 @@ class SelfImprover:
                 "verdict": verdict,
                 "details": details,
             }
+
+        # Record experiment result in SharedMemory for cross-agent learning
+        self._record_experiment_result(experiment, verdict, details)
 
         if verdict == "improved" or verdict == "stable":
             # Promote: experiment succeeded
@@ -483,6 +657,53 @@ class SelfImprover:
                 "details": details,
             }
 
+    def _record_experiment_result(
+        self, experiment: dict[str, Any], verdict: str, details: dict[str, Any],
+    ) -> None:
+        """Write experiment evaluation results to SharedMemory for cross-agent learning."""
+        if not self.memory:
+            return
+
+        agent_name = experiment["agent_name"]
+        desc = experiment.get("description", "")[:200]
+        imp_type = experiment.get("improvement_type", "unknown")
+
+        # Store as knowledge
+        self.memory.store_knowledge(
+            category="experiment_result",
+            topic=f"{agent_name}/{imp_type}",
+            content=json.dumps({
+                "experiment_id": experiment["id"],
+                "agent": agent_name,
+                "type": imp_type,
+                "description": desc,
+                "verdict": verdict,
+                "details": {k: v for k, v in details.items() if k != "metrics"},
+            }, default=str),
+            source_agent="self_improver",
+            tags=["experiment", verdict, agent_name, imp_type],
+        )
+
+        # Record as lesson if meaningful
+        if verdict == "improved":
+            self.memory.record_lesson(
+                agent_name=agent_name,
+                category="optimization",
+                situation=f"A/B experiment confirmed: {desc}",
+                lesson=f"Statistically significant improvement from {imp_type} change",
+                rule=f"Continue with this {imp_type} optimization approach",
+                severity="low",
+            )
+        elif verdict == "declined":
+            self.memory.record_lesson(
+                agent_name=agent_name,
+                category="warning",
+                situation=f"A/B experiment failed: {desc}",
+                lesson=f"Change caused statistically significant decline — reverted",
+                rule=f"Avoid similar {imp_type} changes for {agent_name}",
+                severity="high",
+            )
+
     def _snapshot_metrics(self, agent_name: str) -> dict[str, float]:
         """Capture current metric averages for an agent (last 50 entries)."""
         rows = self.db.execute(
@@ -495,28 +716,209 @@ class SelfImprover:
         )
         return {r["metric_name"]: r["avg_val"] for r in rows}
 
+    def _get_metric_values(self, agent_name: str, metric_name: str,
+                           before_cycle: str | None = None,
+                           after_cycle: str | None = None,
+                           limit: int = 50) -> list[float]:
+        """Get raw metric values for statistical analysis."""
+        if after_cycle:
+            rows = self.db.execute(
+                "SELECT metric_value FROM agent_metrics "
+                "WHERE agent_name = ? AND metric_name = ? AND created_at >= ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (agent_name, metric_name, after_cycle, limit),
+            )
+        elif before_cycle:
+            rows = self.db.execute(
+                "SELECT metric_value FROM agent_metrics "
+                "WHERE agent_name = ? AND metric_name = ? AND created_at <= ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (agent_name, metric_name, before_cycle, limit),
+            )
+        else:
+            rows = self.db.execute(
+                "SELECT metric_value FROM agent_metrics "
+                "WHERE agent_name = ? AND metric_name = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (agent_name, metric_name, limit),
+            )
+        return [r["metric_value"] for r in rows]
+
     def _compare_snapshots(
         self,
         before: dict[str, float],
         after: dict[str, float],
+        before_raw: dict[str, list[float]] | None = None,
+        after_raw: dict[str, list[float]] | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Compare before/after metric snapshots.
+        """Compare before/after metric snapshots with statistical rigor.
+
+        When raw data lists are provided (before_raw/after_raw), uses:
+        - Minimum sample size check (N >= MIN_SAMPLE_SIZE)
+        - Welch's t-test for significance (p < SIGNIFICANCE_LEVEL)
+        - Bonferroni correction for multiple comparisons
+        - Variance/stdev analysis
+
+        Falls back to threshold comparison when only averages are available.
 
         Returns (verdict, details) where verdict is one of:
-        - 'improved': at least one metric improved >= MIN_IMPROVEMENT_PCT
+        - 'improved': statistically significant improvement
         - 'stable': no significant change
-        - 'declined': at least one metric declined > MAX_DECLINE_PCT
+        - 'declined': statistically significant decline
+        - 'insufficient_data': not enough samples
+        - 'inconclusive_high_variance': data too noisy
         """
         if not before or not after:
             return "insufficient_data", {"reason": "no_metrics"}
 
+        # Determine which metrics to compare
+        common_metrics = [m for m in before if m in after]
+        if not common_metrics:
+            return "insufficient_data", {"reason": "no_common_metrics"}
+
+        # If we have raw data, use statistical testing
+        if before_raw and after_raw:
+            return self._compare_with_statistics(
+                before, after, before_raw, after_raw, common_metrics,
+            )
+
+        # Fallback: threshold-based comparison (legacy, for snapshot-only data)
+        return self._compare_with_thresholds(before, after, common_metrics)
+
+    def _compare_with_statistics(
+        self,
+        before: dict[str, float],
+        after: dict[str, float],
+        before_raw: dict[str, list[float]],
+        after_raw: dict[str, list[float]],
+        metrics: list[str],
+    ) -> tuple[str, dict[str, Any]]:
+        """Compare metrics using proper statistical tests."""
+        # Bonferroni correction: adjust alpha for number of metrics tested
+        num_tests = len(metrics)
+        corrected_alpha = SIGNIFICANCE_LEVEL / max(num_tests, 1)
+
+        results: dict[str, Any] = {}
+        improved_count = 0
+        declined_count = 0
+        insufficient_count = 0
+        high_variance_count = 0
+
+        for metric_name in metrics:
+            b_vals = before_raw.get(metric_name, [])
+            a_vals = after_raw.get(metric_name, [])
+
+            # Check minimum sample size
+            if len(b_vals) < MIN_SAMPLE_SIZE or len(a_vals) < MIN_SAMPLE_SIZE:
+                insufficient_count += 1
+                results[metric_name] = {
+                    "verdict": "insufficient_data",
+                    "n_before": len(b_vals),
+                    "n_after": len(a_vals),
+                    "min_required": MIN_SAMPLE_SIZE,
+                }
+                continue
+
+            # Compute descriptive statistics
+            b_mean = sum(b_vals) / len(b_vals)
+            a_mean = sum(a_vals) / len(a_vals)
+            b_stdev = math.sqrt(sum((x - b_mean) ** 2 for x in b_vals) / (len(b_vals) - 1)) if len(b_vals) > 1 else 0.0
+            a_stdev = math.sqrt(sum((x - a_mean) ** 2 for x in a_vals) / (len(a_vals) - 1)) if len(a_vals) > 1 else 0.0
+
+            # High variance check
+            b_cv = b_stdev / abs(b_mean) if b_mean != 0 else 0.0
+            a_cv = a_stdev / abs(a_mean) if a_mean != 0 else 0.0
+
+            if b_cv > HIGH_VARIANCE_RATIO or a_cv > HIGH_VARIANCE_RATIO:
+                high_variance_count += 1
+
+            # Welch's t-test
+            t_stat, p_value = _welch_t_test(b_vals, a_vals)
+
+            # Percentage change
+            pct_change = ((a_mean - b_mean) / abs(b_mean)) * 100 if b_mean != 0 else 0.0
+
+            # Effect size (Cohen's d)
+            pooled_std = math.sqrt((b_stdev ** 2 + a_stdev ** 2) / 2) if (b_stdev + a_stdev) > 0 else 1.0
+            cohens_d = (a_mean - b_mean) / pooled_std if pooled_std > 0 else 0.0
+
+            metric_result: dict[str, Any] = {
+                "before_mean": round(b_mean, 4),
+                "after_mean": round(a_mean, 4),
+                "before_stdev": round(b_stdev, 4),
+                "after_stdev": round(a_stdev, 4),
+                "pct_change": round(pct_change, 2),
+                "t_statistic": round(t_stat, 4),
+                "p_value": round(p_value, 6),
+                "corrected_alpha": round(corrected_alpha, 6),
+                "significant": p_value < corrected_alpha,
+                "cohens_d": round(cohens_d, 4),
+                "n_before": len(b_vals),
+                "n_after": len(a_vals),
+            }
+
+            if p_value < corrected_alpha:
+                if pct_change >= MIN_IMPROVEMENT_PCT:
+                    improved_count += 1
+                    metric_result["verdict"] = "improved"
+                elif pct_change <= MAX_DECLINE_PCT:
+                    declined_count += 1
+                    metric_result["verdict"] = "declined"
+                else:
+                    metric_result["verdict"] = "stable"
+            else:
+                metric_result["verdict"] = "not_significant"
+
+            results[metric_name] = metric_result
+
+        # If ALL metrics have insufficient data, extend
+        if insufficient_count == len(metrics):
+            return "insufficient_data", {
+                "reason": "all_metrics_below_min_sample",
+                "min_required": MIN_SAMPLE_SIZE,
+                "metrics": results,
+            }
+
+        # If majority high variance with no significant results, flag it
+        testable = len(metrics) - insufficient_count
+        if testable > 0 and high_variance_count >= testable and improved_count == 0 and declined_count == 0:
+            return "inconclusive_high_variance", {
+                "reason": "data_too_noisy",
+                "high_variance_metrics": high_variance_count,
+                "metrics": results,
+            }
+
+        # Make decision based on statistically significant results
+        if declined_count > 0:
+            return "declined", {
+                "metrics": results,
+                "significant_declines": declined_count,
+                "bonferroni_alpha": corrected_alpha,
+            }
+        elif improved_count > 0:
+            return "improved", {
+                "metrics": results,
+                "significant_improvements": improved_count,
+                "bonferroni_alpha": corrected_alpha,
+            }
+        else:
+            return "stable", {"metrics": results}
+
+    def _compare_with_thresholds(
+        self,
+        before: dict[str, float],
+        after: dict[str, float],
+        metrics: list[str],
+    ) -> tuple[str, dict[str, Any]]:
+        """Legacy threshold comparison when raw data not available."""
         changes: dict[str, float] = {}
         improved_count = 0
         declined_count = 0
 
-        for metric_name, before_val in before.items():
-            after_val = after.get(metric_name)
-            if after_val is None or before_val == 0:
+        for metric_name in metrics:
+            before_val = before[metric_name]
+            after_val = after[metric_name]
+            if before_val == 0:
                 continue
 
             pct_change = ((after_val - before_val) / abs(before_val)) * 100
@@ -528,11 +930,11 @@ class SelfImprover:
                 declined_count += 1
 
         if declined_count > 0:
-            return "declined", {"changes": changes, "declined_metrics": declined_count}
+            return "declined", {"changes": changes, "declined_metrics": declined_count, "method": "threshold"}
         elif improved_count > 0:
-            return "improved", {"changes": changes, "improved_metrics": improved_count}
+            return "improved", {"changes": changes, "improved_metrics": improved_count, "method": "threshold"}
         else:
-            return "stable", {"changes": changes}
+            return "stable", {"changes": changes, "method": "threshold"}
 
     def _revert_deployment(self, experiment: dict[str, Any]) -> None:
         """Undo a deployed experiment's changes."""

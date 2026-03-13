@@ -283,7 +283,7 @@ class LLM:
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
-        response = self.client.chat.completions.create(**kwargs)
+        response = self._call_with_fallback(kwargs, used_model)
 
         # Track cost
         usage = response.usage
@@ -301,6 +301,33 @@ class LLM:
         )
 
         return response.choices[0].message.content
+
+    def _call_with_fallback(self, kwargs: dict[str, Any], model: str):
+        """Call primary LLM, fall back to Ollama if primary fails."""
+        try:
+            return self.client.chat.completions.create(**kwargs)
+        except Exception as primary_err:
+            # Only attempt fallback if primary is NOT already Ollama
+            provider = getattr(self.config.llm, "provider", "")
+            if provider == "ollama":
+                raise  # Already using Ollama, no fallback available
+
+            logger.warning(
+                "Primary LLM (%s) failed: %s — attempting Ollama fallback",
+                model, primary_err,
+            )
+            try:
+                fallback_client = OpenAI(
+                    base_url="http://127.0.0.1:11434/v1",
+                    api_key="ollama",
+                )
+                # Use a generic model name for Ollama
+                fallback_kwargs = {**kwargs, "model": "llama3.1"}
+                return fallback_client.chat.completions.create(**fallback_kwargs)
+            except Exception as fallback_err:
+                logger.error("Ollama fallback also failed: %s", fallback_err)
+                # Re-raise the original error if fallback fails
+                raise primary_err
 
     def chat_json(
         self,

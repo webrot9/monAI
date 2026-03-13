@@ -562,3 +562,96 @@ class TestStrategyPipelineIntegration:
             assert plan == ["deploy"]
 
             os.unlink(dbpath)
+
+
+class TestCustomerFeedback:
+    """Tests for the customer feedback recording and sentiment analysis."""
+
+    def test_review_result_has_customer_fields(self):
+        r = ReviewResult()
+        assert r.customer_rating is None
+        assert r.customer_feedback is None
+        assert r.nps_score is None
+        assert r.support_tickets == 0
+
+    def test_record_customer_feedback(self, reviewer, db):
+        # First create a review
+        result = ReviewResult(verdict="approved", quality_score=0.8)
+        reviewer._save_review("saas", "tool_1", result)
+
+        # Now record customer feedback
+        updated = reviewer.record_customer_feedback(
+            strategy="saas",
+            product_name="tool_1",
+            rating=4.5,
+            feedback_text="Great tool, minor UI issues",
+            nps_score=70,
+            support_tickets=2,
+        )
+        assert updated == 1
+
+        # Verify it was stored
+        rows = db.execute(
+            "SELECT customer_rating, customer_feedback, nps_score, support_tickets "
+            "FROM product_reviews WHERE strategy = 'saas' AND product_name = 'tool_1'"
+        )
+        assert len(rows) == 1
+        assert rows[0]["customer_rating"] == 4.5
+        assert rows[0]["customer_feedback"] == "Great tool, minor UI issues"
+        assert rows[0]["nps_score"] == 70
+        assert rows[0]["support_tickets"] == 2
+
+    def test_record_feedback_clamps_rating(self, reviewer, db):
+        result = ReviewResult(verdict="approved", quality_score=0.8)
+        reviewer._save_review("saas", "tool_1", result)
+
+        reviewer.record_customer_feedback("saas", "tool_1", rating=10.0)
+        rows = db.execute("SELECT customer_rating FROM product_reviews")
+        assert rows[0]["customer_rating"] == 5.0  # Clamped to max 5
+
+    def test_record_feedback_no_updates(self, reviewer, db):
+        result = reviewer.record_customer_feedback("saas", "tool_1")
+        assert result == 0  # Nothing to update
+
+    def test_get_customer_sentiment_empty(self, reviewer, db):
+        sentiment = reviewer.get_customer_sentiment("saas", "nonexistent")
+        assert sentiment["avg_rating"] is None
+        assert sentiment["rating_count"] == 0
+        assert sentiment["recent_feedback"] == []
+
+    def test_get_customer_sentiment(self, reviewer, db):
+        # Create reviews with customer data
+        for i, (rating, nps, tickets) in enumerate([
+            (4.0, 60, 1), (5.0, 80, 0), (3.5, 40, 2),
+        ]):
+            r = ReviewResult(
+                verdict="approved", quality_score=0.8,
+                customer_rating=rating, nps_score=nps,
+                customer_feedback=f"Review {i}", support_tickets=tickets,
+            )
+            reviewer._save_review("saas", "tool_1", r)
+
+        sentiment = reviewer.get_customer_sentiment("saas", "tool_1")
+        assert sentiment["rating_count"] == 3
+        assert 3.5 <= sentiment["avg_rating"] <= 5.0
+        assert sentiment["avg_nps"] is not None
+        assert sentiment["total_tickets"] == 3
+        assert len(sentiment["recent_feedback"]) == 3
+
+    def test_save_review_includes_customer_fields(self, reviewer, db):
+        result = ReviewResult(
+            verdict="approved",
+            quality_score=0.9,
+            customer_rating=4.2,
+            customer_feedback="Good product",
+            nps_score=65,
+            support_tickets=1,
+        )
+        reviewer._save_review("saas", "tool_1", result)
+
+        rows = db.execute("SELECT * FROM product_reviews")
+        assert len(rows) == 1
+        assert rows[0]["customer_rating"] == 4.2
+        assert rows[0]["customer_feedback"] == "Good product"
+        assert rows[0]["nps_score"] == 65
+        assert rows[0]["support_tickets"] == 1
