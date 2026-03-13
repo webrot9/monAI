@@ -10,7 +10,9 @@ import json
 import logging
 from typing import Any
 
+from monai.agents.asset_aware import AssetManager
 from monai.agents.base import BaseAgent
+from monai.agents.constraint_planner import ConstraintPlanner
 from monai.agents.executor import AutonomousExecutor
 from monai.agents.identity import IdentityManager
 from monai.config import Config
@@ -34,6 +36,7 @@ class Provisioner(BaseAgent):
         super().__init__(config, db, llm)
         self.identity = IdentityManager(config, db, llm)
         self.executor = AutonomousExecutor(config, db, llm)
+        self.constraint_planner = ConstraintPlanner(db, llm)
 
     def plan(self) -> list[str]:
         """Determine what needs to be provisioned."""
@@ -41,10 +44,17 @@ class Provisioner(BaseAgent):
         accounts = self.identity.get_all_accounts()
         resources_cost = self.identity.get_monthly_resource_costs()
 
+        # Include real asset inventory so the LLM knows what actually exists
+        try:
+            asset_inventory = AssetManager(self.db).get_inventory().to_context()
+        except Exception:
+            asset_inventory = ""
+
         context = (
             f"Identity: {json.dumps(identity, default=str)}\n"
             f"Existing accounts: {json.dumps([{'platform': a['platform'], 'type': a['type']} for a in accounts], default=str)}\n"
             f"Monthly resource costs: ${resources_cost:.2f}\n"
+            f"\n{asset_inventory}\n"
         )
 
         plan = self.think_json(
@@ -62,15 +72,45 @@ class Provisioner(BaseAgent):
         return [s["action"] for s in sorted(steps, key=lambda x: x.get("priority", 99))]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
-        """Run provisioning cycle — set up everything needed."""
+        """Run provisioning cycle with constraint-aware planning.
+
+        Uses the ConstraintPlanner to build a dependency graph, then executes
+        steps in topological order — prerequisites first, dependents after.
+        """
         self.log_action("run_start", "Starting provisioning cycle")
 
-        steps = self.plan()
-        results = {}
+        goals = self.plan()
+        graph = self.constraint_planner.plan(goals)
 
-        for step in steps:
-            result = self._execute_provisioning(step)
-            results[step] = result
+        self.log_action("constraint_plan", graph.summary()[:500])
+
+        # Execute in dependency order
+        results = graph_results = {}
+        max_rounds = len(graph.steps) * 2  # safety cap
+
+        for _ in range(max_rounds):
+            ready = graph.get_ready_steps()
+            if not ready:
+                break
+
+            for step in ready:
+                step_result = self._execute_provisioning(step.action)
+                results[step.action] = step_result
+
+                if isinstance(step_result, dict) and step_result.get("status") in (
+                    "completed", "already_registered", "already_exists", "already_have",
+                ):
+                    graph.mark_completed(step.id)
+                elif isinstance(step_result, dict) and step_result.get("status") in (
+                    "failed", "blocked", "skipped",
+                ):
+                    graph.mark_failed(
+                        step.id,
+                        step_result.get("reason", step_result.get("status", "unknown")),
+                    )
+                else:
+                    # Assume success if not explicitly failed
+                    graph.mark_completed(step.id)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results
@@ -188,6 +228,12 @@ class Provisioner(BaseAgent):
 
     def _execute_provisioning(self, step: str) -> dict[str, Any]:
         """Execute a provisioning step (sync wrapper for async operations)."""
+        # Pre-check: verify assets exist before attempting registration
+        missing = AssetManager(self.db).get_missing_prerequisites(step)
+        if missing:
+            logger.warning(f"Cannot execute '{step}': missing {missing}")
+            return {"status": "blocked", "missing_prerequisites": missing}
+
         if "register" in step.lower() and "platform" in step.lower():
             platform = self.think(
                 f"Extract just the platform name from this step: '{step}'. "

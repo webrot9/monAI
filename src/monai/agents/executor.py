@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from monai.agents.asset_aware import AssetManager
 from monai.agents.ethics import CORE_DIRECTIVES, is_action_blocked, requires_risk_check
 from monai.agents.memory import SharedMemory
 from monai.config import Config
@@ -32,8 +33,8 @@ from monai.utils.sandbox import is_path_allowed, safe_read, safe_write, sandbox_
 
 logger = logging.getLogger(__name__)
 
-# Tools the executor can use — described for the LLM
-TOOL_DESCRIPTIONS = """
+# Built-in tools the executor can use — described for the LLM
+BUILTIN_TOOL_DESCRIPTIONS = """
 Available tools:
 1. browse(url) — Navigate to a URL and return page content + interactive elements
 2. click(selector) — Click an element on the page
@@ -51,9 +52,13 @@ Available tools:
 14. run_tests(path) — Run tests for a code file
 15. wait(seconds) — Wait for a specified time
 16. wait_for(selector, timeout) — Wait for an element to appear on the page (timeout in seconds, default 10)
-17. done(result) — Signal task completion with a result
-18. fail(reason) — Signal task failure with a reason
+17. create_tool(name, description, code) — Create a new reusable tool at runtime
+18. done(result) — Signal task completion with a result
+19. fail(reason) — Signal task failure with a reason
 """
+
+# Backward-compat alias
+TOOL_DESCRIPTIONS = BUILTIN_TOOL_DESCRIPTIONS
 
 
 class AutonomousExecutor:
@@ -80,6 +85,10 @@ class AutonomousExecutor:
         self.action_history: list[dict] = []
         self._reflection_count = 0  # Cap reflections per task
         self.memory = SharedMemory(db)
+
+        # Dynamic tool registry — agents can create tools at runtime
+        self._custom_tools: dict[str, dict] = {}
+        self._load_custom_tools()
 
         # Use BrowserLearner (adaptive) instead of raw Browser.
         # Falls back to raw Browser if BrowserLearner can't be created.
@@ -270,14 +279,21 @@ class AutonomousExecutor:
         custom_rules = self._get_executor_config("custom_rules", "")
         custom_rules_text = f"\nDEPLOYED RULES:\n{custom_rules}\n" if custom_rules else ""
 
+        # Inject asset inventory so the LLM knows what resources are REAL
+        try:
+            asset_context = AssetManager(self.db).get_inventory().to_context() + "\n\n"
+        except Exception:
+            asset_context = ""
+
         prompt = (
             f"TASK: {task}\n\n"
             f"CONTEXT: {context}\n\n"
             f"STEP: {step + 1}/{self.max_steps}\n\n"
             f"PREVIOUS ACTIONS:\n{history_summary or 'None yet'}\n\n"
             f"{learned_context}"
+            f"{asset_context}"
             f"{custom_rules_text}"
-            f"{TOOL_DESCRIPTIONS}\n\n"
+            f"{self._get_tool_descriptions()}\n\n"
             "Decide the next action. Return JSON: "
             '{"reasoning": "why this action", "tool": "tool_name", "args": {...}}\n\n'
             "CRITICAL RULES:\n"
@@ -589,6 +605,9 @@ class AutonomousExecutor:
                 await self.browser.wait_for(selector, timeout=timeout_s * 1000)
                 return f"Element '{selector}' appeared"
 
+            elif tool == "create_tool":
+                return self._handle_create_tool(args)
+
             elif tool == "done":
                 return args.get("result", "Task completed")
 
@@ -596,11 +615,148 @@ class AutonomousExecutor:
                 return args.get("reason", "Task failed")
 
             else:
+                # Try custom tools before giving up
+                if tool in self._custom_tools:
+                    return await self._run_custom_tool(tool, args)
                 return f"Unknown tool: {tool}"
 
         except Exception as e:
             logger.error(f"Tool {tool} failed: {e}")
             return f"ERROR: {e}"
+
+    # ── Dynamic Tool Factory ─────────────────────────────────────
+
+    # Dangerous patterns that custom tools must NOT contain
+    _TOOL_BLOCKLIST = [
+        "import os", "import subprocess", "os.system", "subprocess.",
+        "eval(", "exec(", "__import__", "open(",
+        "shutil.rmtree", "os.remove", "os.unlink",
+        "requests.", "urllib.", "httpx.",  # use executor's proxied http instead
+    ]
+
+    def _load_custom_tools(self) -> None:
+        """Load previously created custom tools from the database."""
+        try:
+            rows = self.db.execute(
+                "SELECT tool_name, description, code, args_schema "
+                "FROM custom_tools WHERE status = 'active'"
+            )
+            for row in rows:
+                r = dict(row)
+                self._custom_tools[r["tool_name"]] = {
+                    "description": r["description"],
+                    "code": r["code"],
+                    "args_schema": r.get("args_schema", ""),
+                }
+        except Exception:
+            pass  # Table might not exist yet
+
+    def _handle_create_tool(self, args: dict) -> str:
+        """Create a new reusable tool at runtime.
+
+        The tool code must be a pure Python function body that:
+        - Takes a single `args` dict parameter
+        - Returns a string result
+        - Does NOT import dangerous modules or perform I/O directly
+        - Can use self.http_client for HTTP (proxied), self.browser for browsing
+        """
+        name = args.get("name", "").strip()
+        description = args.get("description", "").strip()
+        code = args.get("code", "").strip()
+
+        if not name or not description or not code:
+            return "ERROR: create_tool requires name, description, and code"
+
+        if not name.isidentifier() or name in (
+            "browse", "click", "type", "screenshot", "fill_form", "submit",
+            "read_page", "http_get", "http_post", "shell", "write_file",
+            "read_file", "write_code", "run_tests", "wait", "wait_for",
+            "done", "fail", "create_tool",
+        ):
+            return f"ERROR: invalid or reserved tool name: {name}"
+
+        # Security: block dangerous code patterns
+        code_lower = code.lower()
+        for blocked in self._TOOL_BLOCKLIST:
+            if blocked.lower() in code_lower:
+                return f"BLOCKED: tool code contains forbidden pattern: {blocked}"
+
+        # Validate the code compiles
+        try:
+            compile(code, f"<custom_tool:{name}>", "exec")
+        except SyntaxError as e:
+            return f"ERROR: syntax error in tool code: {e}"
+
+        # Store in registry
+        self._custom_tools[name] = {
+            "description": description,
+            "code": code,
+        }
+
+        # Persist to database
+        try:
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS custom_tools ("
+                "  tool_name TEXT PRIMARY KEY,"
+                "  description TEXT NOT NULL,"
+                "  code TEXT NOT NULL,"
+                "  args_schema TEXT DEFAULT '',"
+                "  status TEXT DEFAULT 'active',"
+                "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                ")"
+            )
+            self.db.execute(
+                "INSERT INTO custom_tools (tool_name, description, code) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(tool_name) DO UPDATE "
+                "SET description = excluded.description, "
+                "    code = excluded.code",
+                (name, description, code),
+            )
+        except Exception as e:
+            logger.warning(f"Could not persist custom tool '{name}': {e}")
+
+        logger.info(f"Custom tool created: {name} — {description}")
+        return f"Tool '{name}' created successfully. It is now available for use."
+
+    async def _run_custom_tool(self, tool_name: str, args: dict) -> str:
+        """Execute a custom tool in a restricted namespace."""
+        tool_def = self._custom_tools.get(tool_name)
+        if not tool_def:
+            return f"ERROR: custom tool '{tool_name}' not found"
+
+        code = tool_def["code"]
+
+        # Build restricted namespace — give access to args and safe utilities
+        namespace = {
+            "args": args,
+            "result": "",
+            "json": json,
+            "logger": logger,
+        }
+
+        try:
+            exec(code, {"__builtins__": {}}, namespace)
+            return str(namespace.get("result", "Tool executed (no result)"))
+        except Exception as e:
+            logger.error(f"Custom tool '{tool_name}' failed: {e}")
+            return f"ERROR: custom tool '{tool_name}' failed: {e}"
+
+    def _get_tool_descriptions(self) -> str:
+        """Get full tool descriptions including custom tools."""
+        desc = BUILTIN_TOOL_DESCRIPTIONS
+        if self._custom_tools:
+            custom_lines = []
+            idx = 20  # Start numbering after builtins
+            for name, tool_def in self._custom_tools.items():
+                custom_lines.append(
+                    f"{idx}. {name}(args) — {tool_def['description']}"
+                )
+                idx += 1
+            if custom_lines:
+                desc += "\nCustom tools (created by agent):\n"
+                desc += "\n".join(custom_lines) + "\n"
+        return desc
 
     def _reflect_on_failures(self, task: str, context: str) -> str | None:
         """When hitting repeated failures, pause and analyze what's going wrong.

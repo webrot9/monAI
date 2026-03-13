@@ -113,18 +113,24 @@ class BrowserLearner:
 
     async def smart_click(self, selector: str, domain: str = "",
                           fallback_text: str = "") -> dict[str, Any]:
-        """Click with self-healing selectors."""
+        """Click with self-healing selectors.
+
+        Healing chain: known playbook → original → text fallbacks → LLM discovery.
+        """
         start = time.time()
+
+        # 1. Check if we already learned a better selector
+        effective = self._get_known_selector(domain, selector) or selector
 
         try:
             await self._human_delay(short=True)
-            await self.browser.click(selector)
+            await self.browser.click(effective)
             duration = int((time.time() - start) * 1000)
-            self._log_action(domain, "click", selector, None, True, duration=duration)
-            return {"success": True, "selector_used": selector}
+            self._log_action(domain, "click", effective, None, True, duration=duration)
+            return {"success": True, "selector_used": effective}
 
         except Exception as e:
-            # Primary selector failed — try fallbacks
+            # 2. Try text-based fallbacks
             if fallback_text:
                 fallback_selectors = self._generate_fallback_selectors(fallback_text)
                 for fallback in fallback_selectors:
@@ -133,12 +139,33 @@ class BrowserLearner:
                         duration = int((time.time() - start) * 1000)
                         self._log_action(domain, "click", fallback, None, True,
                                          countermeasure="fallback_selector", duration=duration)
-                        # Learn the working selector
                         self._update_playbook_selector(domain, selector, fallback)
                         return {"success": True, "selector_used": fallback,
                                 "original_failed": selector}
                     except Exception:
                         continue
+
+            # 3. LLM-based self-healing: discover page elements, ask LLM
+            logger.info(f"Click selector '{effective}' failed on {domain}, "
+                        f"attempting LLM self-healing")
+            try:
+                elements = await self._discover_form_elements(domain)
+                description = fallback_text or selector
+                healed = self._llm_match_selector(description, elements)
+                if healed:
+                    try:
+                        await self.browser.click(healed)
+                        duration = int((time.time() - start) * 1000)
+                        self._log_action(domain, "click", healed, None, True,
+                                         countermeasure="llm_healed", duration=duration)
+                        self._update_playbook_selector(domain, selector, healed)
+                        logger.info(f"LLM healed click: '{selector}' → '{healed}'")
+                        return {"success": True, "selector_used": healed,
+                                "original_failed": selector, "healed": True}
+                    except Exception:
+                        pass
+            except Exception as heal_err:
+                logger.debug(f"LLM healing failed for click: {heal_err}")
 
             duration = int((time.time() - start) * 1000)
             self._log_action(domain, "click", selector, None, False,
@@ -147,25 +174,56 @@ class BrowserLearner:
 
     async def smart_type(self, selector: str, text: str,
                          domain: str = "", human_like: bool = True) -> dict[str, Any]:
-        """Type with human-like keystroke timing."""
+        """Type with human-like keystroke timing and self-healing selectors."""
         start = time.time()
+
+        # Check if we already learned a better selector
+        effective = self._get_known_selector(domain, selector) or selector
 
         try:
             if human_like:
                 page = await self.browser._get_page()
-                await page.click(selector)
+                await page.click(effective)
                 for char in text:
                     await page.keyboard.type(char, delay=random.randint(30, 150))
                     if random.random() < 0.05:  # 5% chance of brief pause
                         await asyncio.sleep(random.uniform(0.2, 0.8))
             else:
-                await self.browser.type_text(selector, text)
+                await self.browser.type_text(effective, text)
 
             duration = int((time.time() - start) * 1000)
-            self._log_action(domain, "type", selector, None, True, duration=duration)
+            self._log_action(domain, "type", effective, None, True, duration=duration)
             return {"success": True}
 
         except Exception as e:
+            # Self-healing: discover page elements, ask LLM for correct selector
+            logger.info(f"Type selector '{effective}' failed on {domain}, "
+                        f"attempting LLM self-healing")
+            try:
+                elements = await self._discover_form_elements(domain)
+                healed = self._llm_match_selector(selector, elements)
+                if healed:
+                    try:
+                        page = await self.browser._get_page()
+                        await page.click(healed)
+                        if human_like:
+                            for char in text:
+                                await page.keyboard.type(char, delay=random.randint(30, 150))
+                        else:
+                            await self.browser.type_text(healed, text)
+
+                        duration = int((time.time() - start) * 1000)
+                        self._log_action(domain, "type", healed, None, True,
+                                         countermeasure="llm_healed", duration=duration)
+                        self._update_playbook_selector(domain, selector, healed)
+                        logger.info(f"LLM healed type: '{selector}' → '{healed}'")
+                        return {"success": True, "healed_selector": healed,
+                                "original_selector": selector}
+                    except Exception:
+                        pass
+            except Exception as heal_err:
+                logger.debug(f"LLM healing failed for type: {heal_err}")
+
             duration = int((time.time() - start) * 1000)
             self._log_action(domain, "type", selector, None, False,
                              "dom_change", str(e), duration)
@@ -173,11 +231,40 @@ class BrowserLearner:
 
     async def smart_fill_form(self, fields: dict[str, str],
                               domain: str = "") -> dict[str, Any]:
-        """Fill a form with human-like behavior."""
+        """Fill a form with human-like behavior and self-healing selectors."""
         results = {}
+        discovered_elements: list[dict] | None = None
+
         for selector, value in fields.items():
             await self._human_delay(short=True)
-            result = await self.smart_type(selector, value, domain, human_like=True)
+
+            # Check if we already learned a better selector for this field
+            effective_selector = self._get_known_selector(domain, selector) or selector
+
+            result = await self.smart_type(effective_selector, value, domain,
+                                           human_like=True)
+
+            if not result.get("success"):
+                # Self-healing: discover actual page elements and ask LLM
+                logger.info(f"Selector '{effective_selector}' failed, attempting "
+                            f"self-healing for field '{selector}'")
+                if discovered_elements is None:
+                    discovered_elements = await self._discover_form_elements(domain)
+
+                llm_selector = self._llm_match_selector(selector,
+                                                       discovered_elements)
+                if llm_selector:
+                    logger.info(f"LLM suggested selector '{llm_selector}' "
+                                f"for field '{selector}'")
+                    retry_result = await self.smart_type(llm_selector, value,
+                                                        domain, human_like=True)
+                    if retry_result.get("success"):
+                        self._update_playbook_selector(domain, selector,
+                                                       llm_selector)
+                        result = retry_result
+                        result["healed_selector"] = llm_selector
+                        result["original_selector"] = selector
+
             results[selector] = result
 
         return {"success": all(r.get("success") for r in results.values()),
@@ -331,6 +418,65 @@ class BrowserLearner:
             return {"action": "retry_with_longer_wait", "success": False}
 
     # ── Self-Healing Selectors ────────────────────────────────────
+
+    async def _discover_form_elements(self, domain: str) -> list[dict]:
+        """Extract all interactive form elements from the current page."""
+        page = await self.browser._get_page()
+        elements = await page.evaluate("""() => {
+            const els = document.querySelectorAll('input, textarea, select, button');
+            return Array.from(els).map(el => {
+                const rect = el.getBoundingClientRect();
+                return {
+                    tag: el.tagName.toLowerCase(),
+                    type: el.getAttribute('type') || '',
+                    name: el.getAttribute('name') || '',
+                    id: el.getAttribute('id') || '',
+                    placeholder: el.getAttribute('placeholder') || '',
+                    ariaLabel: el.getAttribute('aria-label') || '',
+                    className: el.className || '',
+                    visibleText: el.innerText || el.value || '',
+                    boundingBox: {
+                        x: rect.x, y: rect.y,
+                        width: rect.width, height: rect.height
+                    },
+                    isVisible: rect.width > 0 && rect.height > 0
+                };
+            }).filter(e => e.isVisible);
+        }""")
+        logger.debug(f"Discovered {len(elements)} form elements on {domain}")
+        return elements
+
+    def _llm_match_selector(self, field_description: str,
+                            elements: list[dict]) -> str | None:
+        """Use the LLM to find the best CSS selector for a field."""
+        elements_summary = json.dumps(elements, indent=2)
+        prompt = (
+            f"Given these interactive form elements on a web page:\n"
+            f"{elements_summary}\n\n"
+            f"Which element best matches the field '{field_description}'?\n"
+            f"Return ONLY a single CSS selector string that uniquely identifies "
+            f"the matching element (e.g. '#email', 'input[name=\"user\"]'). "
+            f"If no element matches, return the word NONE."
+        )
+        response = self.llm.quick(prompt)
+        selector = response.strip().strip("`").strip('"').strip("'")
+        if not selector or selector.upper() == "NONE":
+            return None
+        return selector
+
+    def _get_known_selector(self, domain: str,
+                            original_selector: str) -> str | None:
+        """Check if we already learned a replacement selector for this domain."""
+        if not domain:
+            return None
+        rows = self.db.execute(
+            "SELECT known_selectors FROM site_playbooks WHERE domain = ?",
+            (domain,),
+        )
+        if rows:
+            selectors = json.loads(rows[0]["known_selectors"] or "{}")
+            return selectors.get(original_selector)
+        return None
 
     def _generate_fallback_selectors(self, text: str) -> list[str]:
         """Generate fallback selectors based on text content."""
