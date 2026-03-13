@@ -133,11 +133,15 @@ class ProxyFallbackChain:
     Thread-safe: all state mutations are guarded by a lock.
     """
 
+    # Blocked entries expire after this many seconds so new tasks
+    # (which get a fresh browser / Tor circuit) can retry domains.
+    BLOCK_TTL_SECONDS = 300  # 5 minutes
+
     def __init__(self, privacy_config: PrivacyConfig):
         self._privacy = privacy_config
         self._lock = threading.Lock()
-        # domain → set of blocked proxy types
-        self._blocked: dict[str, set[str]] = {}
+        # domain → {proxy_type: timestamp_blocked}
+        self._blocked: dict[str, dict[str, float]] = {}
         # domain → proxy type that last succeeded
         self._preferred: dict[str, str] = {}
 
@@ -179,7 +183,8 @@ class ProxyFallbackChain:
             raise AnonymityError("No proxy configured and fallback is disabled")
 
         with self._lock:
-            blocked = self._blocked.get(domain, set())
+            self._expire_blocks(domain)
+            blocked = set(self._blocked.get(domain, {}).keys())
             preferred = self._preferred.get(domain)
 
             # Try preferred first if it's not blocked
@@ -202,17 +207,17 @@ class ProxyFallbackChain:
         )
 
     def report_blocked(self, domain: str, proxy_type: str) -> None:
-        """Mark a proxy type as blocked for a domain."""
+        """Mark a proxy type as blocked for a domain (with TTL)."""
         with self._lock:
             if domain not in self._blocked:
-                self._blocked[domain] = set()
-            self._blocked[domain].add(proxy_type)
+                self._blocked[domain] = {}
+            self._blocked[domain][proxy_type] = time.time()
             # Clear preferred if it was the one that got blocked
             if self._preferred.get(domain) == proxy_type:
                 del self._preferred[domain]
         logger.warning(
             f"PROXY FALLBACK: {proxy_type} blocked on {domain} — "
-            f"blocked set: {self._blocked[domain]}"
+            f"blocked set: {set(self._blocked[domain].keys())}"
         )
 
     def report_success(self, domain: str, proxy_type: str) -> None:
@@ -221,7 +226,7 @@ class ProxyFallbackChain:
             self._preferred[domain] = proxy_type
             # Un-block it in case it was previously blocked and recovered
             if domain in self._blocked:
-                self._blocked[domain].discard(proxy_type)
+                self._blocked[domain].pop(proxy_type, None)
         logger.info(f"PROXY FALLBACK: {proxy_type} working for {domain}")
 
     def get_next_fallback(self, domain: str, current_type: str) -> tuple[str, str]:
@@ -236,15 +241,35 @@ class ProxyFallbackChain:
     def is_blocked(self, domain: str, proxy_type: str) -> bool:
         """Check whether a proxy type is blocked for a domain."""
         with self._lock:
-            return proxy_type in self._blocked.get(domain, set())
+            self._expire_blocks(domain)
+            return proxy_type in self._blocked.get(domain, {})
 
     def get_domain_status(self) -> dict[str, Any]:
         """Return a snapshot of blocked/preferred state for logging."""
         with self._lock:
             return {
-                "blocked": {d: list(s) for d, s in self._blocked.items()},
+                "blocked": {d: list(b.keys()) for d, b in self._blocked.items()},
                 "preferred": dict(self._preferred),
             }
+
+    def _expire_blocks(self, domain: str) -> None:
+        """Remove expired block entries for a domain. Must hold self._lock."""
+        blocks = self._blocked.get(domain)
+        if not blocks:
+            return
+        now = time.time()
+        expired = [
+            ptype for ptype, ts in blocks.items()
+            if now - ts >= self.BLOCK_TTL_SECONDS
+        ]
+        for ptype in expired:
+            del blocks[ptype]
+            logger.info(
+                f"PROXY FALLBACK: {ptype} block expired for {domain} "
+                f"(after {self.BLOCK_TTL_SECONDS}s TTL)"
+            )
+        if not blocks:
+            del self._blocked[domain]
 
     @staticmethod
     def detect_block_page(page_content: str) -> bool:

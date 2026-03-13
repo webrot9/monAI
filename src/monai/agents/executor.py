@@ -57,8 +57,12 @@ Available tools:
 class AutonomousExecutor:
     """Executes complex multi-step tasks autonomously using an LLM-driven action loop."""
 
-    # Circuit breaker: abort task after this many consecutive tool failures
+    # Circuit breaker: abort after this many consecutive tool failures
     MAX_CONSECUTIVE_FAILURES = 5
+    # Also abort when total failure ratio exceeds this threshold
+    # (prevents LLM from gaming the breaker with read_page/screenshot between fails)
+    MAX_FAILURE_RATIO = 0.7  # 70% of steps failing = abort
+    MIN_STEPS_FOR_RATIO = 6  # don't apply ratio check before this many steps
 
     def __init__(self, config: Config, db: Database, llm: LLM,
                  max_steps: int = 30, headless: bool = True,
@@ -88,6 +92,7 @@ class AutonomousExecutor:
         self.action_history = []
         start_time = time.time()
         consecutive_failures = 0
+        total_failures = 0
 
         try:
             await self.browser.start()
@@ -109,6 +114,24 @@ class AutonomousExecutor:
                     reason = (
                         f"Circuit breaker: {consecutive_failures} consecutive tool "
                         f"failures — aborting task to stop wasting API calls"
+                    )
+                    logger.warning(reason)
+                    self._log_task(task, "circuit_breaker", reason)
+                    return {
+                        "status": "failed",
+                        "reason": reason,
+                        "steps": step,
+                        "history": self.action_history,
+                    }
+
+                # Circuit breaker: abort when failure ratio is too high
+                # (prevents LLM from gaming breaker with read_page/screenshot
+                # between actual failures)
+                if (step >= self.MIN_STEPS_FOR_RATIO
+                        and total_failures / step >= self.MAX_FAILURE_RATIO):
+                    reason = (
+                        f"Circuit breaker: {total_failures}/{step} steps failed "
+                        f"({total_failures/step:.0%}) — aborting task"
                     )
                     logger.warning(reason)
                     self._log_task(task, "circuit_breaker", reason)
@@ -143,6 +166,7 @@ class AutonomousExecutor:
                 )
                 if is_failure:
                     consecutive_failures += 1
+                    total_failures += 1
                 else:
                     consecutive_failures = 0
 
