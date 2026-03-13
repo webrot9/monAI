@@ -1,0 +1,40 @@
+[Unit]
+Description=monAI Autonomous Agent Daemon
+After=network-online.target tor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monai
+Group=monai
+WorkingDirectory=/opt/monai
+ExecStart=/usr/local/bin/monai daemon
+Restart=always
+RestartSec=10
+
+# Watchdog: systemd kills process if no sd_notify within 900s
+# (monAI cycles are max 600s + 300s buffer)
+WatchdogSec=900
+
+# Resource limits — match monai/utils/resources.py
+MemoryMax=2G
+# Prevent accidental disk bombs
+LimitFSIZE=5G
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/monai /home/monai/.monai
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=monai
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

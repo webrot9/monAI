@@ -399,12 +399,20 @@ class GrowthHacker(BaseAgent):
         """Record real data for an experiment variant (called by other systems)."""
         if variant not in ("a", "b"):
             raise ValueError(f"variant must be 'a' or 'b', got '{variant}'")
-        col_views = f"variant_{variant}_views"
-        col_conv = f"variant_{variant}_conversions"
-        self.db.execute(
-            f"UPDATE growth_experiments SET "
-            f"{col_views} = {col_views} + ?, "
-            f"{col_conv} = {col_conv} + ? "
-            f"WHERE id = ?",
-            (views, conversions, experiment_id),
-        )
+        # Use explicit branches instead of dynamic column names to prevent SQL injection
+        if variant == "a":
+            self.db.execute(
+                "UPDATE growth_experiments SET "
+                "variant_a_views = variant_a_views + ?, "
+                "variant_a_conversions = variant_a_conversions + ? "
+                "WHERE id = ?",
+                (views, conversions, experiment_id),
+            )
+        else:
+            self.db.execute(
+                "UPDATE growth_experiments SET "
+                "variant_b_views = variant_b_views + ?, "
+                "variant_b_conversions = variant_b_conversions + ? "
+                "WHERE id = ?",
+                (views, conversions, experiment_id),
+            )

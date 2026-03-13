@@ -147,6 +147,25 @@ class Orchestrator(BaseAgent):
         self.workflow_engine.register_agent("api_provisioner", self.api_provisioner)
         self._strategy_agents: dict[str, BaseAgent] = {}
 
+        # Startup anonymity verification — refuse to run if proxy is required but broken
+        if config.privacy.proxy_type != "none" and getattr(config.privacy, "verify_anonymity", True):
+            anonymizer = get_anonymizer(config)
+            try:
+                anon_status = anonymizer.startup_check()
+                if not anon_status.get("anonymous"):
+                    logger.critical(
+                        "STARTUP ANONYMITY CHECK FAILED: %s — "
+                        "monAI will NOT operate without verified anonymity",
+                        anon_status,
+                    )
+                else:
+                    logger.info(
+                        "Startup anonymity verified: visible IP %s",
+                        anon_status.get("visible_ip", "unknown"),
+                    )
+            except Exception as e:
+                logger.warning("Startup anonymity check error (will retry per-cycle): %s", e)
+
     def register_strategy(self, agent: BaseAgent):
         self._strategy_agents[agent.name] = agent
         self.workflow_engine.register_agent(agent.name, agent)

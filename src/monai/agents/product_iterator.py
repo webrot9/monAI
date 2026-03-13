@@ -121,8 +121,8 @@ class ProductIterator(BaseAgent):
                     "quality_score", rd["quality_score"],
                 )
                 metrics.append(rd)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to fetch product review metrics: %s", e)
 
         # Get strategy revenue data
         try:
@@ -142,8 +142,8 @@ class ProductIterator(BaseAgent):
                     "sales_count", srd["sales_count"],
                 )
                 metrics.append(srd)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to fetch strategy revenue data: %s", e)
 
         # Get refund data
         try:
@@ -158,8 +158,8 @@ class ProductIterator(BaseAgent):
                     "refund_count", refd["refund_count"],
                 )
                 metrics.append(refd)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to fetch refund data: %s", e)
 
         return metrics
 
@@ -209,8 +209,8 @@ class ProductIterator(BaseAgent):
                     "avg_score": 0.0,
                     "trigger": "zero_sales",
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to check zero-revenue strategies: %s", e)
 
         return underperformers
 
@@ -237,8 +237,8 @@ class ProductIterator(BaseAgent):
                 suggestions = json.loads(rd.get("suggestions", "[]") or "[]")
                 review_feedback.extend(issues)
                 review_feedback.extend(suggestions)
-        except Exception:
-            pass  # product_reviews table may not exist yet
+        except Exception as e:
+            logger.debug("Could not fetch review feedback (table may not exist): %s", e)
 
         # Run competitor analysis via web search
         competitor_data = self._analyze_competitors(strategy, product_name)
