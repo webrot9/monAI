@@ -144,8 +144,9 @@ class UnifiedPaymentManager:
                 "SELECT DISTINCT brand FROM brand_api_keys "
                 "WHERE provider = 'lemonsqueezy' AND status = 'active'"
             )
-        except Exception:
+        except Exception as e:
             # Table may not exist yet (APIProvisioner not initialized)
+            logger.debug("LemonSqueezy DB query skipped (table may not exist): %s", e)
             return
 
         for row in rows:
@@ -171,8 +172,8 @@ class UnifiedPaymentManager:
                     api_key = decrypt_value(api_key)
                     if webhook_secret:
                         webhook_secret = decrypt_value(webhook_secret)
-                except Exception:
-                    pass  # Keys may not be encrypted
+                except Exception as e:
+                    logger.debug("Key decryption skipped (may be plaintext): %s", e)
 
                 provider = LemonSqueezyProvider(
                     api_key=api_key,

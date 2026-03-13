@@ -183,7 +183,7 @@ The ProductIterator runs every 5 cycles to identify underperformers and trigger 
 ### Communication
 - Creator contacted via Telegram bot (self-provisioned)
 - Bot uses verification code from `~/.monai/verify.txt`
-- Creator username: Cristal89
+- Creator username: (configured at runtime via ~/.monai/config.json)
 
 ### Config
 - Dataclass-based config in `config.py`
@@ -460,7 +460,7 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 - Currency: USD (with EUR conversion when needed)
 - Initial budget: $500
 - Tax regime: P.IVA forfettario (5% first 5 years)
-- Communication: Telegram (username: Cristal89)
+- Communication: Telegram (username configured at runtime)
 - Privacy: Maximum — Tor by default, full anonymity
 - Content standard: Zero AI slop, expert human quality
 - Strategy scope: ANYTHING legal that makes money — no artificial limits

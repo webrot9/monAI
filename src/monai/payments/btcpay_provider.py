@@ -219,8 +219,10 @@ class BTCPayProvider(PaymentProvider):
             )
             amount = float(invoice.get("amount", 0))
             currency = invoice.get("currency", "BTC")
-        except BTCPayAPIError:
-            pass
+        except BTCPayAPIError as e:
+            logger.warning(
+                "Failed to fetch BTCPay invoice %s details: %s", invoice_id, e
+            )
 
         return WebhookEvent(
             event_type=wh_type,

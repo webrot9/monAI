@@ -46,8 +46,13 @@ class InfraSetup:
         MONAI_BIN.mkdir(parents=True, exist_ok=True)
 
         self.results["config"] = self._ensure_config()
+        self.results["sandbox"] = self._ensure_sandbox()
         self.results["tor"] = self._ensure_tor()
         self.results["llm"] = self._ensure_llm_access()
+        self.results["browser"] = self._ensure_browser()
+        self.results["pdf_libs"] = self._ensure_pdf_libs()
+        self.results["nodejs"] = self._ensure_nodejs()
+        self.results["util_linux"] = self._ensure_util_linux()
 
         # Crypto infrastructure is OPTIONAL — only set up if explicitly configured.
         # The primary payout flow is LLC → contractor invoice → bank transfer.
@@ -62,11 +67,336 @@ class InfraSetup:
 
         all_ok = all(
             r.get("status") in ("ok", "already_running", "already_configured", "skipped",
-                                 "already_exists")
+                                 "already_exists", "degraded")
             for r in self.results.values()
         )
         self.results["ready"] = all_ok
         return self.results
+
+    # ── Sandbox (bubblewrap) ─────────────────────────────────────
+
+    def _ensure_sandbox(self) -> dict[str, Any]:
+        """Ensure bubblewrap is installed for OS-level process isolation.
+
+        Without bubblewrap, agents can read any world-readable file on the
+        creator's system. With it, child processes literally cannot see
+        files outside the bind-mounted paths.
+        """
+        if shutil.which("bwrap"):
+            logger.info("bubblewrap (bwrap) already installed")
+            return {"status": "ok"}
+
+        installed = self._install_bubblewrap()
+        if installed:
+            # Re-detect sandbox backend so sandbox.py picks up bwrap
+            from monai.utils import sandbox
+            sandbox.refresh_isolation_backend()
+            return {"status": "ok", "method": "auto_installed"}
+
+        logger.warning(
+            "Could not auto-install bubblewrap. Process isolation will use "
+            "weaker fallbacks (unshare or application-level only). "
+            "Install manually: sudo apt install bubblewrap"
+        )
+        return {
+            "status": "degraded",
+            "warning": "bubblewrap not available — weaker sandbox isolation",
+        }
+
+    def _install_bubblewrap(self) -> bool:
+        """Attempt to install bubblewrap via package manager."""
+        system = platform.system().lower()
+        if system != "linux":
+            logger.info("bubblewrap only supported on Linux (current: %s)", system)
+            return False
+
+        try:
+            if shutil.which("apt-get"):
+                subprocess.run(
+                    ["sudo", "apt-get", "install", "-y", "bubblewrap"],
+                    capture_output=True, timeout=120,
+                )
+                if shutil.which("bwrap"):
+                    logger.info("bubblewrap installed via apt-get")
+                    return True
+            if shutil.which("dnf"):
+                subprocess.run(
+                    ["sudo", "dnf", "install", "-y", "bubblewrap"],
+                    capture_output=True, timeout=120,
+                )
+                if shutil.which("bwrap"):
+                    logger.info("bubblewrap installed via dnf")
+                    return True
+            if shutil.which("pacman"):
+                subprocess.run(
+                    ["sudo", "pacman", "-S", "--noconfirm", "bubblewrap"],
+                    capture_output=True, timeout=120,
+                )
+                if shutil.which("bwrap"):
+                    logger.info("bubblewrap installed via pacman")
+                    return True
+        except Exception as e:
+            logger.warning("bubblewrap installation failed: %s", e)
+        return False
+
+    # ── Browser (Playwright + Chromium) ─────────────────────────
+
+    def _ensure_browser(self) -> dict[str, Any]:
+        """Ensure Playwright and Chromium are installed for browser automation.
+
+        Without a browser, agents cannot scrape websites, register on
+        platforms, or perform any web-based actions. This is a critical
+        dependency for the entire system.
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            logger.warning(
+                "Playwright Python package not installed. "
+                "Run: pip install playwright"
+            )
+            return {"status": "degraded", "warning": "playwright package not installed"}
+
+        # Check if Chromium binary is already installed
+        if self._is_chromium_installed():
+            logger.info("Playwright Chromium already installed")
+            return {"status": "ok"}
+
+        # Install Chromium browser binary
+        return self._install_chromium()
+
+    def _is_chromium_installed(self) -> bool:
+        """Check if Playwright's Chromium binary is available."""
+        try:
+            result = subprocess.run(
+                ["python3", "-m", "playwright", "install", "--dry-run", "chromium"],
+                capture_output=True, text=True, timeout=15,
+            )
+            # If dry-run says nothing to install, it's already there
+            if result.returncode == 0 and "is already installed" in result.stdout.lower():
+                return True
+        except Exception:
+            pass
+
+        # Fallback: check if the browser dir exists
+        browser_path = Path.home() / ".cache" / "ms-playwright" / "chromium-"
+        try:
+            matches = list(Path.home().glob(".cache/ms-playwright/chromium-*"))
+            return len(matches) > 0
+        except Exception:
+            return False
+
+    def _install_chromium(self) -> dict[str, Any]:
+        """Install Playwright Chromium browser binary."""
+        try:
+            # Install system deps first (Playwright needs these)
+            system = platform.system().lower()
+            if system == "linux":
+                subprocess.run(
+                    ["python3", "-m", "playwright", "install-deps", "chromium"],
+                    capture_output=True, timeout=180,
+                )
+
+            # Install Chromium binary
+            result = subprocess.run(
+                ["python3", "-m", "playwright", "install", "chromium"],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                logger.info("Playwright Chromium installed successfully")
+                return {"status": "ok", "method": "auto_installed"}
+
+            logger.warning(
+                "Playwright Chromium install failed: %s",
+                result.stderr[:200] if result.stderr else "unknown error",
+            )
+            return {
+                "status": "degraded",
+                "warning": "Chromium install failed — browser automation unavailable",
+            }
+        except Exception as e:
+            logger.warning("Playwright Chromium install error: %s", e)
+            return {
+                "status": "degraded",
+                "warning": f"Chromium install error: {e}",
+            }
+
+    # ── PDF libs (WeasyPrint system deps) ─────────────────────
+
+    def _ensure_pdf_libs(self) -> dict[str, Any]:
+        """Ensure system libraries for PDF generation (WeasyPrint) are installed.
+
+        WeasyPrint needs libpango, libcairo, etc. Without them, invoice
+        PDF generation silently fails. This is optional — the system
+        works without it, but invoicing degrades to HTML-only.
+        """
+        try:
+            from weasyprint import HTML  # noqa: F401
+            logger.info("WeasyPrint available — PDF generation enabled")
+            return {"status": "ok"}
+        except ImportError:
+            pass
+        except OSError:
+            # WeasyPrint installed but system libs missing
+            pass
+
+        system = platform.system().lower()
+        if system != "linux":
+            return {
+                "status": "degraded",
+                "warning": "WeasyPrint system libs not auto-installed on non-Linux",
+            }
+
+        # Install system libs
+        installed = False
+        try:
+            if shutil.which("apt-get"):
+                subprocess.run(
+                    ["sudo", "apt-get", "install", "-y",
+                     "libpango-1.0-0", "libpangoft2-1.0-0",
+                     "libcairo2", "libffi-dev", "libgdk-pixbuf2.0-0"],
+                    capture_output=True, timeout=120,
+                )
+                installed = True
+            elif shutil.which("dnf"):
+                subprocess.run(
+                    ["sudo", "dnf", "install", "-y",
+                     "pango", "cairo", "libffi-devel", "gdk-pixbuf2"],
+                    capture_output=True, timeout=120,
+                )
+                installed = True
+        except Exception as e:
+            logger.warning("PDF system libs installation failed: %s", e)
+
+        if installed:
+            # Check if it works now
+            try:
+                from weasyprint import HTML  # noqa: F401
+                logger.info("WeasyPrint system libs installed — PDF generation enabled")
+                return {"status": "ok", "method": "auto_installed"}
+            except Exception:
+                pass
+
+        return {
+            "status": "degraded",
+            "warning": "PDF generation unavailable (WeasyPrint system libs missing)",
+        }
+
+    # ── Node.js ───────────────────────────────────────────────────
+
+    def _ensure_nodejs(self) -> dict[str, Any]:
+        """Ensure Node.js and npm are installed for web deployment CLIs.
+
+        Without Node.js, agents cannot deploy landing pages (Netlify,
+        Vercel, Cloudflare Workers). Web deployment is a core capability.
+        """
+        if shutil.which("node") and shutil.which("npm"):
+            logger.info("Node.js and npm already installed")
+            return {"status": "ok"}
+
+        installed = self._install_nodejs()
+        if installed:
+            return {"status": "ok", "method": "auto_installed"}
+
+        logger.warning(
+            "Could not auto-install Node.js. Web deployment will not work. "
+            "Install manually: https://nodejs.org/"
+        )
+        return {"status": "degraded", "warning": "Node.js not available — web deployment disabled"}
+
+    def _install_nodejs(self) -> bool:
+        """Attempt to install Node.js via package manager or nodesource."""
+        system = platform.system().lower()
+        try:
+            if system == "linux":
+                if shutil.which("apt-get"):
+                    # Use nodesource for a recent version
+                    subprocess.run(
+                        ["sudo", "apt-get", "install", "-y", "nodejs", "npm"],
+                        capture_output=True, timeout=120,
+                    )
+                    if shutil.which("node"):
+                        logger.info("Node.js installed via apt-get")
+                        return True
+                if shutil.which("dnf"):
+                    subprocess.run(
+                        ["sudo", "dnf", "install", "-y", "nodejs", "npm"],
+                        capture_output=True, timeout=120,
+                    )
+                    if shutil.which("node"):
+                        logger.info("Node.js installed via dnf")
+                        return True
+                if shutil.which("pacman"):
+                    subprocess.run(
+                        ["sudo", "pacman", "-S", "--noconfirm", "nodejs", "npm"],
+                        capture_output=True, timeout=120,
+                    )
+                    if shutil.which("node"):
+                        logger.info("Node.js installed via pacman")
+                        return True
+            elif system == "darwin":
+                if shutil.which("brew"):
+                    subprocess.run(
+                        ["brew", "install", "node"],
+                        capture_output=True, timeout=120,
+                    )
+                    if shutil.which("node"):
+                        logger.info("Node.js installed via brew")
+                        return True
+        except Exception as e:
+            logger.warning("Node.js installation failed: %s", e)
+        return False
+
+    # ── util-linux (unshare) ──────────────────────────────────────
+
+    def _ensure_util_linux(self) -> dict[str, Any]:
+        """Ensure util-linux is installed (provides 'unshare' for sandbox fallback).
+
+        If bubblewrap fails, unshare is the next line of defense for
+        process isolation. Without it, sandbox degrades to application-level
+        only — which means NO OS-level isolation at all.
+        """
+        if shutil.which("unshare"):
+            logger.info("util-linux (unshare) already available")
+            return {"status": "ok"}
+
+        system = platform.system().lower()
+        if system != "linux":
+            # unshare is Linux-specific
+            return {"status": "skipped", "reason": "unshare is Linux-only"}
+
+        installed = False
+        try:
+            if shutil.which("apt-get"):
+                subprocess.run(
+                    ["sudo", "apt-get", "install", "-y", "util-linux"],
+                    capture_output=True, timeout=120,
+                )
+                installed = shutil.which("unshare") is not None
+            elif shutil.which("dnf"):
+                subprocess.run(
+                    ["sudo", "dnf", "install", "-y", "util-linux"],
+                    capture_output=True, timeout=120,
+                )
+                installed = shutil.which("unshare") is not None
+            elif shutil.which("pacman"):
+                subprocess.run(
+                    ["sudo", "pacman", "-S", "--noconfirm", "util-linux"],
+                    capture_output=True, timeout=120,
+                )
+                installed = shutil.which("unshare") is not None
+        except Exception as e:
+            logger.warning("util-linux installation failed: %s", e)
+
+        if installed:
+            # Refresh sandbox backend to pick up unshare
+            from monai.utils import sandbox
+            sandbox.refresh_isolation_backend()
+            logger.info("util-linux installed — unshare available for sandbox fallback")
+            return {"status": "ok", "method": "auto_installed"}
+
+        logger.warning("Could not install util-linux — sandbox has no OS-level fallback")
+        return {"status": "degraded", "warning": "unshare not available — no sandbox fallback"}
 
     # ── Tor ──────────────────────────────────────────────────────
 

@@ -145,7 +145,7 @@ All config lives in `~/.monai/config.json`. Created automatically on `monai init
   },
   "telegram": {
     "enabled": true,
-    "creator_username": "Cristal89"
+    "creator_username": "YOUR_TELEGRAM_USERNAME"
   },
   "initial_capital": 500.0,
   "currency": "EUR"
@@ -231,7 +231,7 @@ monAI auto-provisions a Telegram bot for creator communication:
 3. Agent verifies creator identity via cryptographic token in `~/.monai/verify.txt`
 4. Creator can request status updates, reports, and give instructions
 
-Your Telegram username (`Cristal89`) is already configured. Just send `/start` to the bot after it self-provisions.
+Set your Telegram username in `~/.monai/config.json` under `telegram.creator_username`. Then send `/start` to the bot after it self-provisions.
 
 ## Development
 

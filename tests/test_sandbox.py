@@ -3,7 +3,7 @@
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -20,6 +20,7 @@ from monai.utils.sandbox import (
     safe_delete,
     sandbox_run,
     get_sandbox_info,
+    refresh_isolation_backend,
 )
 
 
@@ -260,3 +261,37 @@ class TestSandboxRun:
         info = get_sandbox_info()
         assert "isolation_backend" in info
         assert info["isolation_backend"] in ("bubblewrap", "unshare", "none")
+
+
+class TestRefreshIsolationBackend:
+    def test_returns_valid_backend(self):
+        """refresh_isolation_backend should return one of the known backends."""
+        result = refresh_isolation_backend()
+        assert result in ("bubblewrap", "unshare", "none")
+
+    def test_detects_bwrap_when_available(self):
+        """When bwrap is available, refresh should detect it."""
+        with patch("shutil.which", return_value="/usr/bin/bwrap"), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0)):
+            result = refresh_isolation_backend()
+        assert result == "bubblewrap"
+
+    def test_falls_back_to_unshare(self):
+        """When bwrap unavailable but unshare works, should detect unshare."""
+        def which_side_effect(name):
+            if name == "bwrap":
+                return None
+            if name == "unshare":
+                return "/usr/bin/unshare"
+            return None
+
+        with patch("monai.utils.sandbox.shutil.which", side_effect=which_side_effect), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0)):
+            result = refresh_isolation_backend()
+        assert result == "unshare"
+
+    def test_returns_none_when_nothing_available(self):
+        """When no isolation tool available, should return 'none'."""
+        with patch("monai.utils.sandbox.shutil.which", return_value=None):
+            result = refresh_isolation_backend()
+        assert result == "none"
