@@ -48,7 +48,7 @@
 ### 2026-03-09 - Creator communication via Telegram only
 - **Mistake**: No way for the agent to contact the creator when human input is needed
 - **Root cause**: Assumed full autonomy means zero communication
-- **Rule**: The master agent contacts the creator via Telegram (username: Cristal89) when it needs human input. The bot is self-provisioned — the agent creates it, gets the API key, everything. The agent ALWAYS identifies itself with a verification code (stored locally in ~/.monai/verify.txt) proving it runs on the creator's machine. The creator does NOTHING. Every message includes the verification header.
+- **Rule**: The master agent contacts the creator via Telegram (username configured at runtime) when it needs human input. The bot is self-provisioned — the agent creates it, gets the API key, everything. The agent ALWAYS identifies itself with a verification code (stored locally in ~/.monai/verify.txt) proving it runs on the creator's machine. The creator does NOTHING. Every message includes the verification header.
 
 ### 2026-03-09 - Agents must pass ethics tests — no exceptions
 - **Mistake**: Agents could operate without verified ethical behavior

@@ -201,7 +201,8 @@ class GumroadProvider(PaymentProvider):
             # Gumroad sends form-encoded data
             from urllib.parse import parse_qs
             data = {k: v[0] for k, v in parse_qs(payload.decode("utf-8")).items()}
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to parse Gumroad webhook payload: %s", e)
             return None
 
         if not data:
