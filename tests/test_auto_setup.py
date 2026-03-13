@@ -114,20 +114,8 @@ class TestSandboxSetup:
 
     def test_bwrap_not_found_install_succeeds(self):
         setup = InfraSetup()
-        call_count = 0
-
-        def which_side_effect(name):
-            nonlocal call_count
-            if name == "bwrap":
-                call_count += 1
-                # First call: not found. After install: found.
-                return None if call_count <= 1 else "/usr/bin/bwrap"
-            if name == "apt-get":
-                return "/usr/bin/apt-get"
-            return None
-
-        with patch("shutil.which", side_effect=which_side_effect), \
-             patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+        with patch.object(setup, "_install_bubblewrap", return_value=True), \
+             patch("shutil.which", return_value=None), \
              patch("monai.utils.sandbox.refresh_isolation_backend", return_value="bubblewrap"):
             result = setup._ensure_sandbox()
         assert result["status"] == "ok"
@@ -159,6 +147,85 @@ class TestSandboxSetup:
             results = setup.run_all()
         assert "sandbox" in results
         assert results["sandbox"]["status"] == "ok"
+
+
+class TestBrowserSetup:
+    def test_chromium_already_installed(self):
+        setup = InfraSetup()
+        with patch("monai.infra.auto_setup.InfraSetup._is_chromium_installed", return_value=True), \
+             patch.dict("sys.modules", {"playwright": MagicMock(), "playwright.sync_api": MagicMock()}):
+            result = setup._ensure_browser()
+        assert result["status"] == "ok"
+
+    def test_playwright_not_installed(self):
+        setup = InfraSetup()
+        import sys
+        # Simulate playwright not importable
+        with patch.dict("sys.modules", {"playwright": None, "playwright.sync_api": None}):
+            # Force ImportError
+            with patch("builtins.__import__", side_effect=ImportError("no playwright")):
+                result = setup._ensure_browser()
+        assert result["status"] == "degraded"
+        assert "playwright" in result["warning"]
+
+    def test_chromium_install_succeeds(self):
+        setup = InfraSetup()
+        with patch.object(setup, "_is_chromium_installed", return_value=False), \
+             patch.object(setup, "_install_chromium", return_value={"status": "ok", "method": "auto_installed"}), \
+             patch.dict("sys.modules", {"playwright": MagicMock(), "playwright.sync_api": MagicMock()}):
+            result = setup._ensure_browser()
+        assert result["status"] == "ok"
+
+    def test_install_chromium_runs_playwright(self):
+        setup = InfraSetup()
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as mock_run, \
+             patch("platform.system", return_value="Linux"):
+            result = setup._install_chromium()
+        assert result["status"] == "ok"
+        # Should have called playwright install chromium
+        calls = [str(c) for c in mock_run.call_args_list]
+        assert any("chromium" in c for c in calls)
+
+    def test_install_chromium_failure_degrades(self):
+        setup = InfraSetup()
+        with patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="error")), \
+             patch("platform.system", return_value="Linux"):
+            result = setup._install_chromium()
+        assert result["status"] == "degraded"
+
+
+class TestPdfLibsSetup:
+    def test_weasyprint_available(self):
+        setup = InfraSetup()
+        mock_weasyprint = MagicMock()
+        with patch.dict("sys.modules", {"weasyprint": mock_weasyprint}):
+            result = setup._ensure_pdf_libs()
+        assert result["status"] == "ok"
+
+    def test_weasyprint_missing_non_linux(self):
+        setup = InfraSetup()
+        with patch.dict("sys.modules", {"weasyprint": None}), \
+             patch("builtins.__import__", side_effect=ImportError("no weasyprint")), \
+             patch("platform.system", return_value="Darwin"):
+            result = setup._ensure_pdf_libs()
+        assert result["status"] == "degraded"
+
+    def test_run_all_includes_browser_and_pdf(self, tmp_path):
+        setup = InfraSetup()
+        with patch("monai.infra.auto_setup.MONAI_DIR", tmp_path), \
+             patch("monai.infra.auto_setup.MONAI_BIN", tmp_path / "bin"), \
+             patch.object(setup, "_ensure_sandbox", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_tor", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_llm_access", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_browser", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_pdf_libs", return_value={"status": "degraded", "warning": "test"}), \
+             patch.object(setup, "_is_crypto_configured", return_value=False):
+            (tmp_path / "bin").mkdir(exist_ok=True)
+            results = setup.run_all()
+        assert "browser" in results
+        assert "pdf_libs" in results
+        # degraded is acceptable — system still starts
+        assert results["ready"] is True
 
 
 class TestLocalModelPricing:

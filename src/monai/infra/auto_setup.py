@@ -49,6 +49,8 @@ class InfraSetup:
         self.results["sandbox"] = self._ensure_sandbox()
         self.results["tor"] = self._ensure_tor()
         self.results["llm"] = self._ensure_llm_access()
+        self.results["browser"] = self._ensure_browser()
+        self.results["pdf_libs"] = self._ensure_pdf_libs()
 
         # Crypto infrastructure is OPTIONAL — only set up if explicitly configured.
         # The primary payout flow is LLC → contractor invoice → bank transfer.
@@ -63,7 +65,7 @@ class InfraSetup:
 
         all_ok = all(
             r.get("status") in ("ok", "already_running", "already_configured", "skipped",
-                                 "already_exists")
+                                 "already_exists", "degraded")
             for r in self.results.values()
         )
         self.results["ready"] = all_ok
@@ -134,6 +136,149 @@ class InfraSetup:
         except Exception as e:
             logger.warning("bubblewrap installation failed: %s", e)
         return False
+
+    # ── Browser (Playwright + Chromium) ─────────────────────────
+
+    def _ensure_browser(self) -> dict[str, Any]:
+        """Ensure Playwright and Chromium are installed for browser automation.
+
+        Without a browser, agents cannot scrape websites, register on
+        platforms, or perform any web-based actions. This is a critical
+        dependency for the entire system.
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            logger.warning(
+                "Playwright Python package not installed. "
+                "Run: pip install playwright"
+            )
+            return {"status": "degraded", "warning": "playwright package not installed"}
+
+        # Check if Chromium binary is already installed
+        if self._is_chromium_installed():
+            logger.info("Playwright Chromium already installed")
+            return {"status": "ok"}
+
+        # Install Chromium browser binary
+        return self._install_chromium()
+
+    def _is_chromium_installed(self) -> bool:
+        """Check if Playwright's Chromium binary is available."""
+        try:
+            result = subprocess.run(
+                ["python3", "-m", "playwright", "install", "--dry-run", "chromium"],
+                capture_output=True, text=True, timeout=15,
+            )
+            # If dry-run says nothing to install, it's already there
+            if result.returncode == 0 and "is already installed" in result.stdout.lower():
+                return True
+        except Exception:
+            pass
+
+        # Fallback: check if the browser dir exists
+        browser_path = Path.home() / ".cache" / "ms-playwright" / "chromium-"
+        try:
+            matches = list(Path.home().glob(".cache/ms-playwright/chromium-*"))
+            return len(matches) > 0
+        except Exception:
+            return False
+
+    def _install_chromium(self) -> dict[str, Any]:
+        """Install Playwright Chromium browser binary."""
+        try:
+            # Install system deps first (Playwright needs these)
+            system = platform.system().lower()
+            if system == "linux":
+                subprocess.run(
+                    ["python3", "-m", "playwright", "install-deps", "chromium"],
+                    capture_output=True, timeout=180,
+                )
+
+            # Install Chromium binary
+            result = subprocess.run(
+                ["python3", "-m", "playwright", "install", "chromium"],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                logger.info("Playwright Chromium installed successfully")
+                return {"status": "ok", "method": "auto_installed"}
+
+            logger.warning(
+                "Playwright Chromium install failed: %s",
+                result.stderr[:200] if result.stderr else "unknown error",
+            )
+            return {
+                "status": "degraded",
+                "warning": "Chromium install failed — browser automation unavailable",
+            }
+        except Exception as e:
+            logger.warning("Playwright Chromium install error: %s", e)
+            return {
+                "status": "degraded",
+                "warning": f"Chromium install error: {e}",
+            }
+
+    # ── PDF libs (WeasyPrint system deps) ─────────────────────
+
+    def _ensure_pdf_libs(self) -> dict[str, Any]:
+        """Ensure system libraries for PDF generation (WeasyPrint) are installed.
+
+        WeasyPrint needs libpango, libcairo, etc. Without them, invoice
+        PDF generation silently fails. This is optional — the system
+        works without it, but invoicing degrades to HTML-only.
+        """
+        try:
+            from weasyprint import HTML  # noqa: F401
+            logger.info("WeasyPrint available — PDF generation enabled")
+            return {"status": "ok"}
+        except ImportError:
+            pass
+        except OSError:
+            # WeasyPrint installed but system libs missing
+            pass
+
+        system = platform.system().lower()
+        if system != "linux":
+            return {
+                "status": "degraded",
+                "warning": "WeasyPrint system libs not auto-installed on non-Linux",
+            }
+
+        # Install system libs
+        installed = False
+        try:
+            if shutil.which("apt-get"):
+                subprocess.run(
+                    ["sudo", "apt-get", "install", "-y",
+                     "libpango-1.0-0", "libpangoft2-1.0-0",
+                     "libcairo2", "libffi-dev", "libgdk-pixbuf2.0-0"],
+                    capture_output=True, timeout=120,
+                )
+                installed = True
+            elif shutil.which("dnf"):
+                subprocess.run(
+                    ["sudo", "dnf", "install", "-y",
+                     "pango", "cairo", "libffi-devel", "gdk-pixbuf2"],
+                    capture_output=True, timeout=120,
+                )
+                installed = True
+        except Exception as e:
+            logger.warning("PDF system libs installation failed: %s", e)
+
+        if installed:
+            # Check if it works now
+            try:
+                from weasyprint import HTML  # noqa: F401
+                logger.info("WeasyPrint system libs installed — PDF generation enabled")
+                return {"status": "ok", "method": "auto_installed"}
+            except Exception:
+                pass
+
+        return {
+            "status": "degraded",
+            "warning": "PDF generation unavailable (WeasyPrint system libs missing)",
+        }
 
     # ── Tor ──────────────────────────────────────────────────────
 
