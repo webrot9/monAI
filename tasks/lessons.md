@@ -165,3 +165,13 @@
   1. `_normalize_selector` must check for `[` *anywhere* in the string, not just at position 0. Any string containing CSS syntax chars (`[`, `:`, `>`, `+`, `~`) is already a selector.
   2. Proxy blocks must have a TTL (5 min). Fresh browser sessions get fresh Tor circuits — stale blocks waste opportunities.
   3. Circuit breaker must track both consecutive failures AND total failure ratio. If >70% of steps are failures (after ≥6 steps), abort — regardless of interleaved successes.
+
+### 2026-03-13 - Executor must use existing learning infrastructure
+- **Mistake**: Executor used raw `Browser` instead of `BrowserLearner`. Had no access to `SharedMemory`. Never called `learn_from_error()`. Every task started from zero with no memory of what worked or failed before.
+- **Root cause**: The learning infrastructure (BrowserLearner, SharedMemory, lessons) was built but never wired into the executor. Classic "built it but forgot to plug it in."
+- **Rules**:
+  1. Executor MUST use BrowserLearner (not raw Browser) — it gets CAPTCHA solving, self-healing selectors, human-like behavior, and site playbooks for free.
+  2. `_think()` MUST inject learned context: domain playbooks, past failure rates, lessons from SharedMemory, and currently blocked domains.
+  3. After every task, analyze failures and store lessons in SharedMemory — visible to ALL agents.
+  4. When hitting 3+ failures mid-task, PAUSE and reflect: ask the LLM to analyze WHY things are failing and suggest a different approach before continuing.
+  5. NEVER build new capabilities without wiring them into the components that need them. A feature that isn't connected is the same as no feature.
