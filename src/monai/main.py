@@ -54,6 +54,10 @@ _shutdown = False
 
 def _handle_signal(signum, frame):
     global _shutdown
+    if _shutdown:
+        # Second signal — force exit immediately
+        logger.warning("Force shutdown (second signal). Exiting now.")
+        sys.exit(1)
     logger.info("Shutdown signal received. Finishing current cycle...")
     _shutdown = True
 
@@ -230,17 +234,35 @@ def run_daemon(config: Config, cycle_interval: int = 300):
         logger.info(f"{'='*60}")
 
         # Watchdog: run cycle with hard timeout (10 minutes) to detect hangs
+        # Check _shutdown every second so Ctrl+C is responsive
         cycle_timeout = 600  # seconds
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(orchestrator.run)
-                result = future.result(timeout=cycle_timeout)
-            _print_cycle_summary(result, db)
-        except concurrent.futures.TimeoutError:
-            logger.critical(
-                f"WATCHDOG: Cycle {cycle} exceeded {cycle_timeout}s timeout — "
-                "force-completing and moving to next cycle"
-            )
+                # Poll future in 1s increments so we can respond to Ctrl+C
+                elapsed_wait = 0
+                result = None
+                while elapsed_wait < cycle_timeout:
+                    if _shutdown:
+                        future.cancel()
+                        logger.info("Aborting cycle due to shutdown signal...")
+                        break
+                    try:
+                        result = future.result(timeout=1)
+                        break  # Cycle completed normally
+                    except concurrent.futures.TimeoutError:
+                        elapsed_wait += 1
+                        continue
+                else:
+                    # Exceeded cycle_timeout
+                    logger.critical(
+                        f"WATCHDOG: Cycle {cycle} exceeded {cycle_timeout}s timeout — "
+                        "force-completing and moving to next cycle"
+                    )
+                    continue
+
+                if result is not None:
+                    _print_cycle_summary(result, db)
         except Exception as e:
             logger.error(f"Cycle {cycle} failed: {e}", exc_info=True)
 

@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -56,8 +57,11 @@ Available tools:
 class AutonomousExecutor:
     """Executes complex multi-step tasks autonomously using an LLM-driven action loop."""
 
+    # Circuit breaker: abort task after this many consecutive tool failures
+    MAX_CONSECUTIVE_FAILURES = 5
+
     def __init__(self, config: Config, db: Database, llm: LLM,
-                 max_steps: int = 50, headless: bool = True,
+                 max_steps: int = 30, headless: bool = True,
                  timeout_seconds: int = 3600):
         self.config = config
         self.db = db
@@ -83,6 +87,7 @@ class AutonomousExecutor:
         logger.info(f"Starting autonomous task: {task[:100]}")
         self.action_history = []
         start_time = time.time()
+        consecutive_failures = 0
 
         try:
             await self.browser.start()
@@ -98,6 +103,22 @@ class AutonomousExecutor:
                         "elapsed_seconds": int(elapsed),
                         "history": self.action_history,
                     }
+
+                # Circuit breaker: abort after too many consecutive failures
+                if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                    reason = (
+                        f"Circuit breaker: {consecutive_failures} consecutive tool "
+                        f"failures — aborting task to stop wasting API calls"
+                    )
+                    logger.warning(reason)
+                    self._log_task(task, "circuit_breaker", reason)
+                    return {
+                        "status": "failed",
+                        "reason": reason,
+                        "steps": step,
+                        "history": self.action_history,
+                    }
+
                 # THINK: Decide next action
                 action = self._think(task, context, step)
 
@@ -111,13 +132,26 @@ class AutonomousExecutor:
 
                 # ACT: Execute the action
                 result = await self._act(tool, args)
+                result_str = str(result)
+
+                # Track consecutive failures for circuit breaker
+                is_failure = (
+                    result_str.startswith("ERROR:")
+                    or result_str.startswith("BLOCKED")
+                    or "Timeout" in result_str
+                    or "timed out" in result_str.lower()
+                )
+                if is_failure:
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
 
                 # OBSERVE: Record the result
                 self.action_history.append({
                     "step": step + 1,
                     "tool": tool,
                     "args": args,
-                    "result": str(result)[:1000],
+                    "result": result_str[:1000],
                 })
 
                 # Check if task is done
@@ -296,7 +330,7 @@ class AutonomousExecutor:
             elif tool == "run_tests":
                 test_path = args.get("path", "")
                 result = sandbox_run(
-                    ["python", "-m", "pytest", test_path, "-v", "--tb=short"],
+                    [sys.executable, "-m", "pytest", test_path, "-v", "--tb=short"],
                     timeout=120,
                 )
                 return {

@@ -237,15 +237,56 @@ class Browser:
         page = await self._get_page()
         return await page.inner_text("body")
 
+    async def _resolve_selector(self, page, raw_selector: str, timeout: int = 10000):
+        """Try to find an element, auto-normalizing bare field names.
+
+        Returns the working selector string, or raises if nothing found.
+        """
+        selector = self._normalize_selector(raw_selector)
+        # For compound selectors, try each part
+        if ", " in selector:
+            parts = [p.strip() for p in selector.split(", ")]
+        else:
+            parts = [selector]
+
+        for part in parts:
+            try:
+                await page.wait_for_selector(part, state="visible", timeout=timeout)
+                return part
+            except Exception:
+                continue
+
+        # Fallback: try the original raw selector in case it's something exotic
+        try:
+            await page.wait_for_selector(raw_selector, state="visible", timeout=3000)
+            return raw_selector
+        except Exception:
+            pass
+
+        # Last resort: try attached (not necessarily visible) — some forms
+        # have hidden inputs that still accept fill()
+        for part in parts:
+            try:
+                await page.wait_for_selector(part, state="attached", timeout=3000)
+                return part
+            except Exception:
+                continue
+
+        raise TimeoutError(
+            f"Element not found: {raw_selector} (tried: {', '.join(parts)})"
+        )
+
     async def click(self, selector: str):
         page = await self._get_page()
-        await page.click(selector)
-        logger.info(f"Clicked: {selector}")
+        resolved = await self._resolve_selector(page, selector)
+        await page.click(resolved)
+        logger.info(f"Clicked: {resolved}")
 
     async def type_text(self, selector: str, text: str):
         page = await self._get_page()
-        await page.fill(selector, text)
-        logger.info(f"Typed into: {selector}")
+        resolved = await self._resolve_selector(page, selector)
+        await page.fill(resolved, text)
+        logger.info(f"Typed into: {resolved}")
 
     async def select_option(self, selector: str, value: str):
         page = await self._get_page()
@@ -287,12 +328,34 @@ class Browser:
             "interactive_elements": forms[:50],  # Cap elements
         }
 
+    @staticmethod
+    def _normalize_selector(selector: str) -> str:
+        """Turn bare field names into valid CSS selectors.
+
+        The LLM often passes bare names like 'firstName' instead of
+        'input[name="firstName"]'. Detect this and fix it.
+        """
+        s = selector.strip()
+        # Already a CSS selector (starts with #, ., [, or contains tag names)
+        if s.startswith(("#", ".", "[", "input", "textarea", "select", "button")):
+            return s
+        # Looks like a CSS combinator or pseudo-selector
+        if " " in s or ":" in s or ">" in s:
+            return s
+        # Bare field name — wrap as attribute selector
+        return f'[name="{s}"], #{s}'
+
     async def fill_form(self, fields: dict[str, str]):
-        """Fill a form with multiple fields at once."""
+        """Fill a form with multiple fields at once.
+
+        Handles bare field names (e.g. 'firstName') by auto-normalizing
+        to CSS selectors, and waits for each element to be visible.
+        """
         page = await self._get_page()
-        for selector, value in fields.items():
-            await page.fill(selector, value)
-            logger.info(f"Filled {selector}")
+        for raw_selector, value in fields.items():
+            resolved = await self._resolve_selector(page, raw_selector)
+            await page.fill(resolved, value)
+            logger.info(f"Filled {resolved}")
 
     async def submit_form(self, selector: str = "form"):
         """Submit a form."""
