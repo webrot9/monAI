@@ -34,8 +34,21 @@ Orchestrator (brain)
 
 ```bash
 cd monAI
+
+# Upgrade pip and setuptools first (required for editable installs)
+pip install --upgrade pip setuptools wheel
+
+# Install monAI with dev dependencies
 pip install -e ".[dev]"
 ```
+
+> **Troubleshooting**: If `pip install -e .` fails with a `build_editable` error,
+> your setuptools is too old. Run `pip install --upgrade setuptools>=68.0` first.
+> If that's blocked by a system-managed Python, use a virtualenv:
+> ```bash
+> python3 -m venv .venv && source .venv/bin/activate
+> pip install -e ".[dev]"
+> ```
 
 ### 2. Set your OpenAI API key
 
@@ -240,6 +253,9 @@ Set your Telegram username in `~/.monai/config.json` under `telegram.creator_use
 ```bash
 pip install -e ".[dev]"
 pytest tests/ -v
+
+# If pip install -e fails, use PYTHONPATH instead:
+PYTHONPATH=src pytest tests/ -v
 ```
 
 ### Project structure
