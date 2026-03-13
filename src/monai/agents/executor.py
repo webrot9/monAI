@@ -235,6 +235,24 @@ class AutonomousExecutor:
             except Exception as e:
                 logger.warning(f"Error closing HTTP client: {e}")
 
+    def _get_executor_config(self, key: str, default: Any = None) -> Any:
+        """Read executor-specific config from agent_config (set by self-improvement)."""
+        try:
+            rows = self.db.execute(
+                "SELECT config_value FROM agent_config "
+                "WHERE agent_name = 'executor' AND config_key = ?",
+                (key,),
+            )
+            if rows:
+                import json as _json
+                try:
+                    return _json.loads(rows[0]["config_value"])
+                except (json.JSONDecodeError, TypeError):
+                    return rows[0]["config_value"]
+        except Exception:
+            pass
+        return default
+
     def _think(self, task: str, context: str, step: int) -> dict[str, Any]:
         """Use LLM to decide the next action, enriched with learned context."""
         history_summary = ""
@@ -248,12 +266,17 @@ class AutonomousExecutor:
         # Inject learned context: domain playbooks, past failures, lessons
         learned_context = self._get_learned_context(task)
 
+        # Read deployed improvements for executor behavior
+        custom_rules = self._get_executor_config("custom_rules", "")
+        custom_rules_text = f"\nDEPLOYED RULES:\n{custom_rules}\n" if custom_rules else ""
+
         prompt = (
             f"TASK: {task}\n\n"
             f"CONTEXT: {context}\n\n"
             f"STEP: {step + 1}/{self.max_steps}\n\n"
             f"PREVIOUS ACTIONS:\n{history_summary or 'None yet'}\n\n"
             f"{learned_context}"
+            f"{custom_rules_text}"
             f"{TOOL_DESCRIPTIONS}\n\n"
             "Decide the next action. Return JSON: "
             '{"reasoning": "why this action", "tool": "tool_name", "args": {...}}\n\n'
@@ -264,6 +287,9 @@ class AutonomousExecutor:
             "- read_page/screenshot do NOT count as progress — only use them when genuinely needed\n"
             "- Be efficient. Change strategy when things aren't working."
         )
+
+        # Temperature can be tuned by self-improvement experiments
+        temperature = self._get_executor_config("temperature", 0.3)
 
         response = self.llm.chat_json(
             [
@@ -280,7 +306,7 @@ class AutonomousExecutor:
                 )},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.3,
+            temperature=temperature,
         )
         return response
 
@@ -625,9 +651,14 @@ class AutonomousExecutor:
             return None
 
     def _post_task_learn(self, task: str, history: list[dict]) -> None:
-        """After task completion/failure, analyze what happened and store lessons.
+        """After task completion/failure, analyze and produce ACTIONABLE changes.
 
-        This is how the executor builds knowledge across tasks.
+        This is how the executor ACTUALLY improves — not just logging lessons,
+        but producing concrete behavioral changes:
+        1. Lessons → stored in SharedMemory → injected into future system prompts
+        2. Domain blocklists → prevent retrying known-broken sites
+        3. Successful patterns → stored as playbooks for future tasks
+        4. Parameter adjustments → written to agent_config for next run
         """
         if not history or len(history) < 3:
             return
@@ -638,7 +669,25 @@ class AutonomousExecutor:
                       and not a["result"].startswith("BLOCKED")]
         failure_rate = len(failures) / len(history) if history else 0
 
-        # Only learn from tasks with significant failures
+        # ── ALWAYS learn from successes too ────────────────────────
+        # Store successful tool sequences as playbooks
+        if not failures and len(successes) >= 3:
+            # Task completed cleanly — record the winning pattern
+            tool_sequence = " → ".join(a["tool"] for a in history if a["tool"] not in ("done", "fail"))
+            self.memory.store_knowledge(
+                category="playbook",
+                topic=f"successful_task_pattern",
+                content=json.dumps({
+                    "task_summary": task[:200],
+                    "tool_sequence": tool_sequence,
+                    "steps": len(history),
+                }),
+                source_agent="executor",
+                confidence=0.8,
+                tags=["playbook", "success"],
+            )
+
+        # Only deep-analyze tasks with significant failures
         if failure_rate < 0.3:
             return
 
@@ -653,7 +702,7 @@ class AutonomousExecutor:
                     failed_domains.add(domain)
 
         # Build failure summary
-        failure_types = {}
+        failure_types: dict[str, int] = {}
         for a in failures:
             result = a["result"][:100]
             failure_types[result] = failure_types.get(result, 0) + 1
@@ -661,22 +710,37 @@ class AutonomousExecutor:
         top_failures = sorted(failure_types.items(), key=lambda x: -x[1])[:3]
         failure_text = "; ".join(f"{msg} (x{n})" for msg, n in top_failures)
 
-        # Use cheap LLM to extract a lesson
+        # ── Extract lesson AND concrete action ─────────────────────
         try:
             lesson_response = self.llm.quick(
                 f"Task: {task[:200]}\n"
                 f"Steps: {len(history)}, Failures: {len(failures)} ({failure_rate:.0%})\n"
                 f"Top failures: {failure_text}\n"
-                f"Failed domains: {', '.join(failed_domains) or 'N/A'}\n\n"
-                "Extract a CONCISE lesson (1 sentence) and a CONCRETE rule "
-                "(1 sentence, actionable) to prevent this in future.\n"
-                "Format: LESSON: ...\nRULE: ...",
-                system="You analyze task execution outcomes and extract actionable lessons.",
+                f"Failed domains: {', '.join(failed_domains) or 'N/A'}\n"
+                f"Successful tools: {', '.join(a['tool'] for a in successes[:5])}\n\n"
+                "Extract:\n"
+                "LESSON: (1 sentence — what went wrong)\n"
+                "RULE: (1 sentence — concrete rule to prevent this)\n"
+                "ACTION: (1 sentence — specific parameter or approach change. "
+                "E.g. 'increase timeout to 30s', 'try API before browser', "
+                "'skip this domain', 'use different selector strategy')\n",
+                system="You analyze task failures and produce actionable improvements.",
             )
 
             # Parse response
-            lesson = lesson_response.split("RULE:")[0].replace("LESSON:", "").strip()
-            rule = lesson_response.split("RULE:")[-1].strip() if "RULE:" in lesson_response else ""
+            parts = lesson_response.split("RULE:")
+            lesson = parts[0].replace("LESSON:", "").strip()
+
+            rule = ""
+            action = ""
+            if len(parts) > 1:
+                rule_and_action = parts[1]
+                if "ACTION:" in rule_and_action:
+                    rule_parts = rule_and_action.split("ACTION:")
+                    rule = rule_parts[0].strip()
+                    action = rule_parts[1].strip()
+                else:
+                    rule = rule_and_action.strip()
 
             if lesson:
                 self.memory.record_lesson(
@@ -688,8 +752,74 @@ class AutonomousExecutor:
                     severity="high" if failure_rate > 0.7 else "medium",
                 )
                 logger.info(f"Post-task lesson stored: {lesson[:100]}")
+
+            # ── Apply concrete action if identified ────────────────
+            if action:
+                self._apply_learned_action(action, failed_domains, failure_rate)
+
         except Exception as e:
             logger.debug(f"Post-task learning failed (non-fatal): {e}")
+
+    def _apply_learned_action(
+        self, action: str, failed_domains: set[str], failure_rate: float
+    ) -> None:
+        """Convert a learned action into a concrete behavioral change.
+
+        This is what makes reflection REAL — not just words in a log,
+        but actual changes to how the executor operates next time.
+        """
+        action_lower = action.lower()
+
+        # Store domain-specific blocklists
+        if failed_domains and ("skip" in action_lower or "avoid" in action_lower
+                                or "block" in action_lower):
+            for domain in failed_domains:
+                self.memory.store_knowledge(
+                    category="warning",
+                    topic=f"domain_blocked:{domain}",
+                    content=f"Domain {domain} should be avoided: {action}",
+                    source_agent="executor",
+                    confidence=0.9,
+                    tags=["domain_block", domain],
+                )
+
+        # Store as an executor-specific rule that gets injected into _think()
+        try:
+            existing_rules = ""
+            try:
+                rows = self.db.execute(
+                    "SELECT config_value FROM agent_config "
+                    "WHERE agent_name = 'executor' AND config_key = 'custom_rules'"
+                )
+                if rows:
+                    existing_rules = rows[0]["config_value"]
+                    try:
+                        existing_rules = json.loads(existing_rules)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            except Exception:
+                pass
+
+            # Append new rule (cap at 10 rules to prevent bloat)
+            if existing_rules:
+                rules_list = existing_rules.split("\n") if isinstance(existing_rules, str) else [existing_rules]
+            else:
+                rules_list = []
+
+            rules_list.append(f"- {action[:200]}")
+            rules_list = rules_list[-10:]  # Keep last 10 rules
+
+            new_rules = "\n".join(rules_list)
+            self.db.execute(
+                "INSERT INTO agent_config (agent_name, config_key, config_value, updated_at) "
+                "VALUES ('executor', 'custom_rules', ?, datetime('now')) "
+                "ON CONFLICT(agent_name, config_key) DO UPDATE "
+                "SET config_value = excluded.config_value, updated_at = excluded.updated_at",
+                (json.dumps(new_rules),),
+            )
+            logger.info(f"Applied learned action to executor config: {action[:100]}")
+        except Exception as e:
+            logger.debug(f"Could not store learned action (non-fatal): {e}")
 
     def _log_task(self, task: str, status: str, result: Any):
         self.db.execute_insert(

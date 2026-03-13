@@ -124,7 +124,36 @@ class Provisioner(BaseAgent):
         return result
 
     async def register_domain(self, domain: str, registrar: str = "namecheap") -> dict[str, Any]:
-        """Register a domain name."""
+        """Register a domain name — only after validating availability."""
+        # Validate domain before attempting registration
+        try:
+            from monai.agents.name_validator import NameValidator
+            validator = NameValidator(self.config, self.db, self.llm)
+            check = validator.check_domain_whois(domain)
+            validator.close()
+
+            if check.available is False:
+                self.log_action(
+                    "register_domain_blocked",
+                    f"Domain '{domain}' is already taken: {check.details}",
+                )
+                # Ask LLM to suggest alternatives
+                alternatives = self.think_json(
+                    f"The domain '{domain}' is already taken. "
+                    "Suggest 5 alternative domain names that are similar but likely available. "
+                    "Try variations: different TLDs, prefixes, suffixes. "
+                    "Return: {\"alternatives\": [str]}",
+                )
+                alt_list = alternatives.get("alternatives", [])
+                return {
+                    "status": "domain_taken",
+                    "domain": domain,
+                    "details": check.details,
+                    "alternatives": alt_list,
+                }
+        except Exception as e:
+            logger.warning(f"Domain validation failed ({e}), proceeding with registration attempt")
+
         task = (
             f"Register the domain '{domain}' on {registrar}. "
             "Navigate to the registrar, search for the domain, "
@@ -168,12 +197,30 @@ class Provisioner(BaseAgent):
         elif "email" in step.lower():
             return self._run_async(self.setup_email())
         elif "domain" in step.lower():
+            # Extract or generate a domain, then validate before registering
             domain_name = self.think(
                 f"Extract just the domain name from this step: '{step}'. "
                 "Reply with only the domain name (e.g. 'example.com'). "
-                "If no specific domain is mentioned, generate one that's "
-                "professional and available (e.g. 'nexifydigital.com')."
+                "If no specific domain is mentioned, generate a unique, "
+                "professional name (e.g. 'nexifydigital.com')."
             ).strip().strip("'\"").lower()
+
+            # Validate and find an available domain
+            try:
+                from monai.agents.name_validator import NameValidator
+                validator = NameValidator(self.config, self.db, self.llm)
+                check = validator.check_domain(domain_name)
+                if check.available is False:
+                    # Domain taken — generate and validate a new one
+                    identity, validation = validator.generate_and_validate(
+                        domain_tlds=[".com", ".io", ".co", ".dev"],
+                    )
+                    domain_name = identity.get("validated_domain", domain_name)
+                    logger.info(f"Original domain taken, using validated: {domain_name}")
+                validator.close()
+            except Exception as e:
+                logger.warning(f"Domain validation failed ({e}), using original: {domain_name}")
+
             return self._run_async(self.register_domain(domain_name))
         elif "api" in step.lower():
             return self._run_async(self.acquire_api_key(step))
