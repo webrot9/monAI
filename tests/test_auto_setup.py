@@ -105,6 +105,62 @@ class TestInfraSetup:
         assert setup._is_port_open(1) is False
 
 
+class TestSandboxSetup:
+    def test_bwrap_already_installed(self):
+        setup = InfraSetup()
+        with patch("shutil.which", return_value="/usr/bin/bwrap"):
+            result = setup._ensure_sandbox()
+        assert result["status"] == "ok"
+
+    def test_bwrap_not_found_install_succeeds(self):
+        setup = InfraSetup()
+        call_count = 0
+
+        def which_side_effect(name):
+            nonlocal call_count
+            if name == "bwrap":
+                call_count += 1
+                # First call: not found. After install: found.
+                return None if call_count <= 1 else "/usr/bin/bwrap"
+            if name == "apt-get":
+                return "/usr/bin/apt-get"
+            return None
+
+        with patch("shutil.which", side_effect=which_side_effect), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("monai.utils.sandbox.refresh_isolation_backend", return_value="bubblewrap"):
+            result = setup._ensure_sandbox()
+        assert result["status"] == "ok"
+        assert result["method"] == "auto_installed"
+
+    def test_bwrap_install_fails_degrades(self):
+        setup = InfraSetup()
+        with patch("shutil.which", return_value=None):
+            result = setup._ensure_sandbox()
+        assert result["status"] == "degraded"
+        assert "warning" in result
+
+    def test_bwrap_install_not_linux(self):
+        setup = InfraSetup()
+        with patch("shutil.which", return_value=None), \
+             patch("platform.system", return_value="Darwin"):
+            result = setup._install_bubblewrap()
+        assert result is False
+
+    def test_run_all_includes_sandbox(self, tmp_path):
+        setup = InfraSetup()
+        with patch("monai.infra.auto_setup.MONAI_DIR", tmp_path), \
+             patch("monai.infra.auto_setup.MONAI_BIN", tmp_path / "bin"), \
+             patch.object(setup, "_ensure_sandbox", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_tor", return_value={"status": "ok"}), \
+             patch.object(setup, "_ensure_llm_access", return_value={"status": "ok"}), \
+             patch.object(setup, "_is_crypto_configured", return_value=False):
+            (tmp_path / "bin").mkdir(exist_ok=True)
+            results = setup.run_all()
+        assert "sandbox" in results
+        assert results["sandbox"]["status"] == "ok"
+
+
 class TestLocalModelPricing:
     def test_ollama_model_free(self):
         from monai.utils.llm import _get_model_pricing

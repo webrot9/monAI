@@ -92,6 +92,56 @@ else:
         "argument validation only. Install 'bubblewrap' for full isolation."
     )
 
+
+def refresh_isolation_backend() -> str:
+    """Re-detect available isolation backends.
+
+    Called after auto_setup installs bubblewrap, so that sandbox_run()
+    picks up the newly available backend without restarting the process.
+
+    Returns the name of the active backend: 'bubblewrap', 'unshare', or 'none'.
+    """
+    global _BWRAP_PATH, _CAN_BWRAP, _UNSHARE_PATH, _CAN_NAMESPACE
+
+    _BWRAP_PATH = shutil.which("bwrap")
+    _CAN_BWRAP = False
+
+    if _BWRAP_PATH:
+        try:
+            r = subprocess.run(
+                [_BWRAP_PATH, "--ro-bind", "/", "/", "--dev", "/dev",
+                 "--proc", "/proc", "--", "true"],
+                capture_output=True, timeout=5,
+            )
+            _CAN_BWRAP = r.returncode == 0
+        except Exception:
+            pass
+
+    if not _CAN_BWRAP:
+        _UNSHARE_PATH = shutil.which("unshare")
+        _CAN_NAMESPACE = False
+        if _UNSHARE_PATH:
+            try:
+                r = subprocess.run(
+                    [_UNSHARE_PATH, "--user", "--map-root-user", "--", "true"],
+                    capture_output=True, timeout=5,
+                )
+                _CAN_NAMESPACE = r.returncode == 0
+            except Exception:
+                pass
+
+    if _CAN_BWRAP:
+        backend = "bubblewrap"
+        logger.info("Sandbox backend refreshed: bubblewrap (mount namespace isolation)")
+    elif _CAN_NAMESPACE:
+        backend = "unshare"
+        logger.warning("Sandbox backend refreshed: unshare (no mount isolation)")
+    else:
+        backend = "none"
+        logger.warning("Sandbox backend refreshed: none (application-level only)")
+
+    return backend
+
 # Read-only system paths to bind-mount inside bwrap.
 # Only what's needed to run Python/Node scripts.
 _BWRAP_RO_BINDS = [

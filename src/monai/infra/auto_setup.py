@@ -46,6 +46,7 @@ class InfraSetup:
         MONAI_BIN.mkdir(parents=True, exist_ok=True)
 
         self.results["config"] = self._ensure_config()
+        self.results["sandbox"] = self._ensure_sandbox()
         self.results["tor"] = self._ensure_tor()
         self.results["llm"] = self._ensure_llm_access()
 
@@ -67,6 +68,72 @@ class InfraSetup:
         )
         self.results["ready"] = all_ok
         return self.results
+
+    # ── Sandbox (bubblewrap) ─────────────────────────────────────
+
+    def _ensure_sandbox(self) -> dict[str, Any]:
+        """Ensure bubblewrap is installed for OS-level process isolation.
+
+        Without bubblewrap, agents can read any world-readable file on the
+        creator's system. With it, child processes literally cannot see
+        files outside the bind-mounted paths.
+        """
+        if shutil.which("bwrap"):
+            logger.info("bubblewrap (bwrap) already installed")
+            return {"status": "ok"}
+
+        installed = self._install_bubblewrap()
+        if installed:
+            # Re-detect sandbox backend so sandbox.py picks up bwrap
+            from monai.utils import sandbox
+            sandbox.refresh_isolation_backend()
+            return {"status": "ok", "method": "auto_installed"}
+
+        logger.warning(
+            "Could not auto-install bubblewrap. Process isolation will use "
+            "weaker fallbacks (unshare or application-level only). "
+            "Install manually: sudo apt install bubblewrap"
+        )
+        return {
+            "status": "degraded",
+            "warning": "bubblewrap not available — weaker sandbox isolation",
+        }
+
+    def _install_bubblewrap(self) -> bool:
+        """Attempt to install bubblewrap via package manager."""
+        system = platform.system().lower()
+        if system != "linux":
+            logger.info("bubblewrap only supported on Linux (current: %s)", system)
+            return False
+
+        try:
+            if shutil.which("apt-get"):
+                subprocess.run(
+                    ["sudo", "apt-get", "install", "-y", "bubblewrap"],
+                    capture_output=True, timeout=120,
+                )
+                if shutil.which("bwrap"):
+                    logger.info("bubblewrap installed via apt-get")
+                    return True
+            if shutil.which("dnf"):
+                subprocess.run(
+                    ["sudo", "dnf", "install", "-y", "bubblewrap"],
+                    capture_output=True, timeout=120,
+                )
+                if shutil.which("bwrap"):
+                    logger.info("bubblewrap installed via dnf")
+                    return True
+            if shutil.which("pacman"):
+                subprocess.run(
+                    ["sudo", "pacman", "-S", "--noconfirm", "bubblewrap"],
+                    capture_output=True, timeout=120,
+                )
+                if shutil.which("bwrap"):
+                    logger.info("bubblewrap installed via pacman")
+                    return True
+        except Exception as e:
+            logger.warning("bubblewrap installation failed: %s", e)
+        return False
 
     # ── Tor ──────────────────────────────────────────────────────
 
