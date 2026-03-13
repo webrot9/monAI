@@ -479,7 +479,8 @@ class InfraSetup:
             tor_data_dir.mkdir(exist_ok=True)
 
             proc = subprocess.Popen(
-                [tor_bin, "--SocksPort", "9050", "--DataDirectory", str(tor_data_dir)],
+                [tor_bin, "--SocksPort", "9050", "--ControlPort", "9051",
+                 "--DataDirectory", str(tor_data_dir)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )

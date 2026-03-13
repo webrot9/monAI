@@ -287,12 +287,48 @@ class Browser:
             "interactive_elements": forms[:50],  # Cap elements
         }
 
+    @staticmethod
+    def _normalize_selector(selector: str) -> str:
+        """Turn bare field names into valid CSS selectors.
+
+        The LLM often passes bare names like 'firstName' instead of
+        'input[name="firstName"]'. Detect this and fix it.
+        """
+        s = selector.strip()
+        # Already a CSS selector (starts with #, ., [, or contains tag names)
+        if s.startswith(("#", ".", "[", "input", "textarea", "select", "button")):
+            return s
+        # Looks like a CSS combinator or pseudo-selector
+        if " " in s or ":" in s or ">" in s:
+            return s
+        # Bare field name — wrap as attribute selector
+        return f'[name="{s}"], #{s}'
+
     async def fill_form(self, fields: dict[str, str]):
         """Fill a form with multiple fields at once."""
         page = await self._get_page()
-        for selector, value in fields.items():
-            await page.fill(selector, value)
-            logger.info(f"Filled {selector}")
+        for raw_selector, value in fields.items():
+            selector = self._normalize_selector(raw_selector)
+            try:
+                await page.fill(selector, value)
+                logger.info(f"Filled {selector}")
+            except Exception:
+                # If compound selector fails, try each part individually
+                if ", " in selector:
+                    parts = selector.split(", ")
+                    filled = False
+                    for part in parts:
+                        try:
+                            await page.fill(part.strip(), value)
+                            logger.info(f"Filled {part.strip()}")
+                            filled = True
+                            break
+                        except Exception:
+                            continue
+                    if not filled:
+                        raise
+                else:
+                    raise
 
     async def submit_form(self, selector: str = "form"):
         """Submit a form."""

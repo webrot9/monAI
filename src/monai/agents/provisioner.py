@@ -131,7 +131,8 @@ class Provisioner(BaseAgent):
             "add to cart, and complete purchase. "
             "Take screenshots of each step."
         )
-        result = await self.executor.execute_task(task)
+        identity = self.identity.get_identity()
+        result = await self.executor.execute_task(task, json.dumps(identity, default=str))
 
         if result.get("status") == "completed":
             self.identity.store_domain(domain, registrar)
@@ -167,7 +168,13 @@ class Provisioner(BaseAgent):
         elif "email" in step.lower():
             return self._run_async(self.setup_email())
         elif "domain" in step.lower():
-            return self._run_async(self.register_domain(step))
+            domain_name = self.think(
+                f"Extract just the domain name from this step: '{step}'. "
+                "Reply with only the domain name (e.g. 'example.com'). "
+                "If no specific domain is mentioned, generate one that's "
+                "professional and available (e.g. 'nexifydigital.com')."
+            ).strip().strip("'\"").lower()
+            return self._run_async(self.register_domain(domain_name))
         elif "api" in step.lower():
             return self._run_async(self.acquire_api_key(step))
         else:

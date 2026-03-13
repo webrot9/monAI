@@ -477,4 +477,4 @@ class TestExecutorTimeout:
         llm = MagicMock()
         executor = AutonomousExecutor(config, db, llm, timeout_seconds=1800)
         assert executor.timeout_seconds == 1800
-        assert executor.max_steps == 50  # default unchanged
+        assert executor.max_steps == 30  # default reduced from 50 for circuit breaker
