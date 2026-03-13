@@ -89,5 +89,13 @@
 - [x] Final audit: Newsletter sqlite3.Row .get() bug fix
 - [x] Total: 1605 tests, all passing
 
+- [x] Self-improvement statistical rigor (Welch's t-test, min sample N≥10, Bonferroni correction, variance analysis, early stop)
+- [x] Customer feedback loop (customer_rating, customer_feedback, nps_score, support_tickets in product_reviews)
+- [x] Competitor tracking DB (competitors + competitor_history tables, change detection, get_competitor_trends)
+- [x] Product iteration improvements (multi-metric evaluation, customer voice in prompts, refund reasons, min sample checks)
+- [x] Silent failure detection (learn_from_silent_failure on BaseAgent)
+- [x] Experiment results → SharedMemory (knowledge + lessons for cross-agent learning)
+- [x] Total: 1669 tests, all passing
+
 ## Next Up
 - [ ] First real deployment test (end-to-end with a real Ko-fi page)

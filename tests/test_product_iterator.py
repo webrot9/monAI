@@ -273,3 +273,262 @@ class TestRunCycle:
         # Should only call _iterate_product 3 times (max per cycle)
         assert mock_iterate.call_count == 3
         assert len(result["iterations"]) == 3
+
+
+class TestCompetitorTracking:
+    """Tests for persistent competitor tracking with change history."""
+
+    def test_competitors_table_created(self, iterator, db):
+        rows = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='competitors'"
+        )
+        assert len(rows) == 1
+
+    def test_competitor_history_table_created(self, iterator, db):
+        rows = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='competitor_history'"
+        )
+        assert len(rows) == 1
+
+    def test_persist_new_competitors(self, iterator, db):
+        competitor_data = {
+            "competitors": [
+                {"name": "Rival1", "features": ["a", "b"], "pricing": "$10/mo",
+                 "rating": "4.5", "differentiator": "fast"},
+                {"name": "Rival2", "features": ["c"], "pricing": "$20/mo",
+                 "rating": "4.0", "differentiator": "cheap"},
+            ]
+        }
+        iterator._persist_competitors("saas", "MyTool", competitor_data)
+
+        rows = db.execute("SELECT * FROM competitors ORDER BY competitor_name")
+        assert len(rows) == 2
+        assert rows[0]["competitor_name"] == "Rival1"
+        assert rows[0]["pricing"] == "$10/mo"
+        assert rows[1]["competitor_name"] == "Rival2"
+
+    def test_update_existing_competitor_tracks_changes(self, iterator, db):
+        # Insert initial
+        data1 = {"competitors": [
+            {"name": "Rival1", "features": ["a"], "pricing": "$10/mo",
+             "rating": "4.5", "differentiator": "fast"},
+        ]}
+        iterator._persist_competitors("saas", "MyTool", data1)
+
+        # Update with new pricing
+        data2 = {"competitors": [
+            {"name": "Rival1", "features": ["a", "b"], "pricing": "$15/mo",
+             "rating": "4.5", "differentiator": "fast"},
+        ]}
+        iterator._persist_competitors("saas", "MyTool", data2)
+
+        # Should still have 1 competitor
+        comps = db.execute("SELECT * FROM competitors")
+        assert len(comps) == 1
+        assert comps[0]["pricing"] == "$15/mo"
+
+        # Should have change history
+        history = db.execute("SELECT * FROM competitor_history")
+        assert len(history) >= 1
+        pricing_changes = [h for h in history if h["field_name"] == "pricing"]
+        assert len(pricing_changes) == 1
+        assert pricing_changes[0]["old_value"] == "$10/mo"
+        assert pricing_changes[0]["new_value"] == "$15/mo"
+
+    def test_get_competitor_trends(self, iterator, db):
+        data = {"competitors": [
+            {"name": "Rival1", "features": ["a"], "pricing": "$10",
+             "rating": "4.0", "differentiator": "speed"},
+        ]}
+        iterator._persist_competitors("saas", "MyTool", data)
+
+        # Update
+        data2 = {"competitors": [
+            {"name": "Rival1", "features": ["a", "b"], "pricing": "$12",
+             "rating": "4.2", "differentiator": "speed"},
+        ]}
+        iterator._persist_competitors("saas", "MyTool", data2)
+
+        trends = iterator.get_competitor_trends("saas", "MyTool")
+        assert len(trends) == 1
+        assert trends[0]["competitor_name"] == "Rival1"
+        assert len(trends[0]["recent_changes"]) >= 1
+
+    def test_handles_invalid_competitor_data(self, iterator, db):
+        # Should not crash on bad data
+        iterator._persist_competitors("saas", "MyTool", {})
+        iterator._persist_competitors("saas", "MyTool", {"competitors": "not_a_list"})
+        iterator._persist_competitors("saas", "MyTool", {"competitors": [{"no_name": True}]})
+        rows = db.execute("SELECT * FROM competitors")
+        assert len(rows) == 0
+
+    def test_analyze_competitors_persists(self, iterator, db):
+        """_analyze_competitors should persist results to DB."""
+        comp_data = {"competitors": [
+            {"name": "CompA", "features": ["x"], "pricing": "$5",
+             "rating": "3.8", "differentiator": "simple"},
+        ]}
+        with patch.object(iterator, "search_web", return_value=comp_data):
+            result = iterator._analyze_competitors("saas", "MyTool")
+
+        assert result == comp_data
+        rows = db.execute("SELECT * FROM competitors")
+        assert len(rows) == 1
+        assert rows[0]["competitor_name"] == "CompA"
+
+
+class TestCustomerFeedbackInIteration:
+    """Tests for customer feedback integration in product iteration."""
+
+    def _setup_reviews_table(self, db):
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS product_reviews ("
+            "id INTEGER PRIMARY KEY, strategy TEXT, product_name TEXT, "
+            "quality_score REAL, verdict TEXT, humanizer_score REAL, "
+            "factcheck_accuracy REAL, usability_score REAL, "
+            "issues TEXT, suggestions TEXT, "
+            "customer_rating REAL, customer_feedback TEXT, "
+            "nps_score INTEGER, support_tickets INTEGER DEFAULT 0, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+
+    def test_low_customer_rating_triggers_underperformer(self, iterator, db):
+        self._setup_reviews_table(db)
+        # Insert reviews with low customer rating but OK quality
+        for _ in range(5):
+            db.execute_insert(
+                "INSERT INTO product_reviews "
+                "(strategy, product_name, quality_score, verdict, customer_rating) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("saas", "tool_1", 0.8, "approved", 2.5),
+            )
+
+        result = iterator._identify_underperformers([])
+        low_rated = [p for p in result if p.get("trigger") == "low_customer_rating"]
+        assert len(low_rated) >= 1
+        assert low_rated[0]["product_name"] == "tool_1"
+
+    def test_customer_feedback_in_iterate_product(self, iterator, db):
+        """Customer feedback should be included in improvement plan prompt."""
+        self._setup_reviews_table(db)
+        db.execute_insert(
+            "INSERT INTO product_reviews "
+            "(strategy, product_name, quality_score, verdict, "
+            "customer_rating, customer_feedback, issues, suggestions) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("saas", "tool_1", 0.5, "needs_revision", 2.0,
+             "UI is confusing and slow", "[]", "[]"),
+        )
+
+        product = {
+            "strategy": "saas",
+            "product_name": "tool_1",
+            "avg_score": 0.5,
+            "trigger": "low_customer_rating",
+        }
+        with patch.object(iterator, "search_web", return_value={"competitors": []}):
+            result = iterator._iterate_product(product)
+
+        assert result["strategy"] == "saas"
+        # Verify iteration was created
+        rows = db.execute("SELECT * FROM product_iterations")
+        assert len(rows) == 1
+
+
+class TestImprovedEvaluation:
+    """Tests for the multi-metric iteration evaluation."""
+
+    def _setup_tables(self, db):
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS product_reviews ("
+            "id INTEGER PRIMARY KEY, strategy TEXT, product_name TEXT, "
+            "quality_score REAL, verdict TEXT, humanizer_score REAL, "
+            "factcheck_accuracy REAL, usability_score REAL, "
+            "issues TEXT, suggestions TEXT, "
+            "customer_rating REAL, customer_feedback TEXT, "
+            "nps_score INTEGER, support_tickets INTEGER DEFAULT 0, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS payments ("
+            "id INTEGER PRIMARY KEY, strategy TEXT, amount REAL, "
+            "status TEXT, refund_reason TEXT, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+
+    def test_skips_eval_with_few_reviews(self, iterator, db):
+        """Should not evaluate iteration without minimum reviews."""
+        self._setup_tables(db)
+        db.execute_insert(
+            "INSERT INTO product_iterations "
+            "(strategy, product_name, iteration_number, trigger, status, "
+            "performance_before, applied_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("saas", "tool_1", 1, "low_quality", "applied",
+             '{"quality_score": 0.4}', "2020-01-01T00:00:00"),
+        )
+        # Only 1 review (below MIN_REVIEW_SAMPLES=3)
+        db.execute_insert(
+            "INSERT INTO product_reviews (strategy, product_name, quality_score, verdict) "
+            "VALUES (?, ?, ?, ?)",
+            ("saas", "tool_1", 0.8, "approved"),
+        )
+
+        results = iterator._evaluate_past_iterations()
+        assert len(results) == 0  # Not enough data
+
+    def test_evaluates_with_sufficient_reviews(self, iterator, db):
+        """Should evaluate when enough reviews are available."""
+        self._setup_tables(db)
+        db.execute_insert(
+            "INSERT INTO product_iterations "
+            "(strategy, product_name, iteration_number, trigger, status, "
+            "performance_before, applied_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("saas", "tool_1", 1, "low_quality", "applied",
+             '{"quality_score": 0.4}', "2020-01-01T00:00:00"),
+        )
+        # Add enough reviews
+        for _ in range(5):
+            db.execute_insert(
+                "INSERT INTO product_reviews (strategy, product_name, quality_score, verdict) "
+                "VALUES (?, ?, ?, ?)",
+                ("saas", "tool_1", 0.85, "approved"),
+            )
+
+        results = iterator._evaluate_past_iterations()
+        assert len(results) == 1
+        assert results[0]["improved"] is True
+        assert results[0]["sample_size"] >= 3
+
+    def test_multi_metric_evaluation(self, iterator, db):
+        """Should check quality + revenue + refund rate."""
+        self._setup_tables(db)
+        db.execute_insert(
+            "INSERT INTO product_iterations "
+            "(strategy, product_name, iteration_number, trigger, status, "
+            "performance_before, applied_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("saas", "tool_1", 1, "low_quality", "applied",
+             '{"quality_score": 0.4}', "2020-01-01T00:00:00"),
+        )
+        # Good reviews
+        for _ in range(4):
+            db.execute_insert(
+                "INSERT INTO product_reviews (strategy, product_name, quality_score, verdict) "
+                "VALUES (?, ?, ?, ?)",
+                ("saas", "tool_1", 0.9, "approved"),
+            )
+        # Revenue
+        for _ in range(3):
+            db.execute_insert(
+                "INSERT INTO payments (strategy, amount, status) VALUES (?, ?, ?)",
+                ("saas", 50.0, "completed"),
+            )
+
+        results = iterator._evaluate_past_iterations()
+        assert len(results) == 1
+        r = results[0]
+        assert r["improved"] is True
+        assert "signals" in r
+        assert r["signals"]["improvement"] > 0

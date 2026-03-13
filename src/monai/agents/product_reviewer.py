@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS product_reviews (
     usability_score REAL DEFAULT 0.0,  -- 0-1 does this actually deliver value?
     issues TEXT,                       -- JSON list of issues found
     suggestions TEXT,                  -- JSON list of improvement suggestions
+    customer_rating REAL,             -- 1-5 stars from actual customers (NULL until rated)
+    customer_feedback TEXT,           -- customer review text / comments
+    nps_score INTEGER,                -- Net Promoter Score (-100 to +100, NULL until collected)
+    support_tickets INTEGER DEFAULT 0, -- number of support tickets for this product
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -57,6 +61,10 @@ class ReviewResult:
     issues: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
     improved_content: dict[str, str] = field(default_factory=dict)
+    customer_rating: float | None = None
+    customer_feedback: str | None = None
+    nps_score: int | None = None
+    support_tickets: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -92,9 +100,25 @@ class ProductReviewer(BaseAgent):
         super().__init__(config, db, llm)
         with db.connect() as conn:
             conn.executescript(REVIEW_SCHEMA)
+        self._ensure_feedback_columns()
         self._humanizer = None
         self._fact_checker = None
         self._legal_factory = None
+
+    def _ensure_feedback_columns(self) -> None:
+        """Add customer feedback columns that may not exist in older databases."""
+        for col, coldef in [
+            ("customer_rating", "REAL"),
+            ("customer_feedback", "TEXT"),
+            ("nps_score", "INTEGER"),
+            ("support_tickets", "INTEGER DEFAULT 0"),
+        ]:
+            try:
+                self.db.execute(
+                    f"ALTER TABLE product_reviews ADD COLUMN {col} {coldef}"
+                )
+            except Exception:
+                pass  # Column already exists
 
     @property
     def humanizer(self) -> Humanizer:
@@ -458,8 +482,9 @@ class ProductReviewer(BaseAgent):
             "INSERT INTO product_reviews "
             "(strategy, product_name, verdict, quality_score, humanizer_score, "
             "factcheck_verdict, factcheck_accuracy, legal_status, usability_score, "
-            "issues, suggestions) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "issues, suggestions, customer_rating, customer_feedback, nps_score, "
+            "support_tickets) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 strategy,
                 product_name,
@@ -472,5 +497,108 @@ class ProductReviewer(BaseAgent):
                 result.usability_score,
                 json.dumps(result.issues),
                 json.dumps(result.suggestions),
+                result.customer_rating,
+                result.customer_feedback,
+                result.nps_score,
+                result.support_tickets,
             ),
         )
+
+    def record_customer_feedback(
+        self,
+        strategy: str,
+        product_name: str,
+        rating: float | None = None,
+        feedback_text: str = "",
+        nps_score: int | None = None,
+        support_tickets: int = 0,
+        refund_reason: str = "",
+    ) -> int:
+        """Record real customer feedback for a product.
+
+        Called by payment webhooks, support ticket systems, or manual input.
+        Updates the most recent review for this product with customer data.
+        Returns number of rows updated.
+        """
+        updates = []
+        params: list[Any] = []
+
+        if rating is not None:
+            updates.append("customer_rating = ?")
+            params.append(max(1.0, min(5.0, rating)))
+        if feedback_text:
+            updates.append("customer_feedback = ?")
+            params.append(feedback_text[:2000])
+        if nps_score is not None:
+            updates.append("nps_score = ?")
+            params.append(max(-100, min(100, nps_score)))
+        if support_tickets > 0:
+            updates.append("support_tickets = support_tickets + ?")
+            params.append(support_tickets)
+
+        if not updates:
+            return 0
+
+        params.extend([strategy, product_name])
+        # Update the latest review for this strategy/product
+        self.db.execute(
+            f"UPDATE product_reviews SET {', '.join(updates)} "
+            "WHERE id = (SELECT id FROM product_reviews "
+            "WHERE strategy = ? AND product_name = ? "
+            "ORDER BY created_at DESC LIMIT 1)",
+            tuple(params),
+        )
+
+        self.log_action(
+            "customer_feedback_recorded",
+            f"{strategy}/{product_name}: rating={rating}, nps={nps_score}, "
+            f"tickets={support_tickets}",
+        )
+
+        return 1
+
+    def get_customer_sentiment(
+        self, strategy: str, product_name: str,
+    ) -> dict[str, Any]:
+        """Get aggregated customer sentiment for a product.
+
+        Returns average rating, NPS, support ticket count, and recent feedback.
+        """
+        rows = self.db.execute(
+            "SELECT AVG(customer_rating) as avg_rating, "
+            "AVG(nps_score) as avg_nps, "
+            "SUM(support_tickets) as total_tickets, "
+            "COUNT(customer_rating) as rating_count "
+            "FROM product_reviews "
+            "WHERE strategy = ? AND product_name = ? "
+            "AND customer_rating IS NOT NULL",
+            (strategy, product_name),
+        )
+
+        sentiment: dict[str, Any] = {
+            "avg_rating": None,
+            "avg_nps": None,
+            "total_tickets": 0,
+            "rating_count": 0,
+            "recent_feedback": [],
+        }
+
+        if rows and rows[0]["avg_rating"] is not None:
+            r = rows[0]
+            sentiment["avg_rating"] = round(r["avg_rating"], 2)
+            sentiment["avg_nps"] = round(r["avg_nps"], 1) if r["avg_nps"] is not None else None
+            sentiment["total_tickets"] = r["total_tickets"] or 0
+            sentiment["rating_count"] = r["rating_count"] or 0
+
+        # Get recent feedback text
+        feedback_rows = self.db.execute(
+            "SELECT customer_feedback, customer_rating, created_at "
+            "FROM product_reviews "
+            "WHERE strategy = ? AND product_name = ? "
+            "AND customer_feedback IS NOT NULL AND customer_feedback != '' "
+            "ORDER BY created_at DESC LIMIT 5",
+            (strategy, product_name),
+        )
+        sentiment["recent_feedback"] = [dict(f) for f in feedback_rows]
+
+        return sentiment

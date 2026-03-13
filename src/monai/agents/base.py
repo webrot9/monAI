@@ -586,6 +586,51 @@ class BaseAgent(ABC):
             severity="high",
         )
 
+    def learn_from_silent_failure(
+        self,
+        action: str,
+        result: Any,
+        expected: str = "",
+        context: str = "",
+    ):
+        """Detect and learn from silent failures — operations that succeed
+        but produce empty, null, or unexpected results without raising.
+
+        Call this after any operation where an empty/null result indicates a problem.
+        """
+        # Detect silent failure patterns
+        is_failure = False
+        failure_reason = ""
+
+        if result is None:
+            is_failure = True
+            failure_reason = "returned None"
+        elif isinstance(result, (list, dict)) and len(result) == 0:
+            is_failure = True
+            failure_reason = "returned empty collection"
+        elif isinstance(result, dict) and result.get("status") in ("error", "failed"):
+            is_failure = True
+            failure_reason = f"status={result.get('status')}: {result.get('error', 'unknown')}"
+        elif isinstance(result, str) and not result.strip():
+            is_failure = True
+            failure_reason = "returned empty string"
+
+        if not is_failure:
+            return
+
+        self.logger.warning(
+            "[%s] Silent failure detected: %s → %s",
+            self.name, action, failure_reason,
+        )
+
+        self.learn(
+            category="silent_failure",
+            situation=f"Action '{action}' {failure_reason}. Context: {context}. Expected: {expected}",
+            lesson=f"Silent failure in {action}: {failure_reason}",
+            rule=f"Add validation for {action} return value before proceeding",
+            severity="medium",
+        )
+
     def get_my_lessons(self) -> list[dict[str, Any]]:
         """Get all lessons relevant to this agent."""
         return self.memory.get_lessons(self.name, include_shared=True)
