@@ -668,3 +668,93 @@ class SaaSAgent(BaseAgent):
         self.log_action("product_launched", product["name"],
                         json.dumps(launch_results, default=str)[:500])
         return {"launch_plan": launch_plan, "launch_results": launch_results}
+
+    def apply_improvements(self) -> dict[str, Any]:
+        """Apply pending improvements from ProductIterator to existing SaaS products.
+
+        For SaaS products stored in the database, this rebuilds features via
+        the Coder agent based on improvement plans from the ProductIterator.
+        """
+        pending = self.product_iterator.get_pending_improvements(self.name)
+        if not pending:
+            return {"status": "no_pending_improvements"}
+
+        applied = 0
+        for improvement in pending[:2]:  # Max 2 per cycle
+            product_name = improvement["product_name"]
+            improvements_json = improvement.get("improvements", "[]")
+            try:
+                plan = json.loads(improvements_json) if isinstance(improvements_json, str) else improvements_json
+            except (json.JSONDecodeError, TypeError):
+                plan = {}
+
+            improvement_items = plan.get("improvements", []) if isinstance(plan, dict) else []
+
+            # Find the product in DB
+            products = self.db.execute(
+                "SELECT * FROM saas_products WHERE name = ? LIMIT 1",
+                (product_name,),
+            )
+            if not products:
+                self.product_iterator.mark_applied(improvement["id"])
+                continue
+
+            product = dict(products[0])
+            features = self.db.execute(
+                "SELECT * FROM saas_features WHERE product_id = ?",
+                (product["id"],),
+            )
+
+            change_descriptions = [
+                f"- {item.get('area', 'general')}: {item.get('specific_change', item.get('current_issue', ''))}"
+                for item in improvement_items
+            ]
+            changes_text = "\n".join(change_descriptions) if change_descriptions else "General quality improvements"
+
+            # Rebuild affected features via Coder
+            features_rebuilt = 0
+            for feature in features:
+                feature_dict = dict(feature)
+                # Check if any improvement targets this feature area
+                relevant = any(
+                    feature_dict["feature_name"].lower() in item.get("area", "").lower()
+                    or item.get("area", "").lower() in feature_dict["feature_name"].lower()
+                    for item in improvement_items
+                ) if improvement_items else True  # If no specific areas, improve all
+
+                if not relevant:
+                    continue
+
+                rebuild_spec = (
+                    f"Improve the '{feature_dict['feature_name']}' feature of SaaS product '{product_name}'.\n"
+                    f"Feature description: {feature_dict.get('description', '')}\n"
+                    f"Product problem: {product['problem']}\n"
+                    f"Product solution: {product['solution']}\n\n"
+                    f"REQUIRED IMPROVEMENTS:\n{changes_text}\n\n"
+                    f"Rebuild this feature with the improvements applied. "
+                    f"Maintain backward compatibility where possible."
+                )
+                build_result = self.coder.generate_module(rebuild_spec)
+
+                if build_result.get("status") == "success":
+                    self.db.execute(
+                        "UPDATE saas_features SET status = 'testing' WHERE id = ?",
+                        (feature_dict["id"],),
+                    )
+                    features_rebuilt += 1
+
+            # Send product back through review pipeline
+            if features_rebuilt > 0:
+                self.db.execute(
+                    "UPDATE saas_products SET status = 'beta' WHERE id = ?",
+                    (product["id"],),
+                )
+
+            self.product_iterator.mark_applied(improvement["id"])
+            applied += 1
+            self.log_action(
+                "product_improved",
+                f"{product_name}: {features_rebuilt} features rebuilt with improvements",
+            )
+
+        return {"applied": applied, "total_pending": len(pending)}

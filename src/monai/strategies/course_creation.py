@@ -469,3 +469,93 @@ class CourseCreationAgent(BaseAgent):
 
         self.log_action("list_courses_complete", f"{listed} courses listed")
         return {"courses_listed": listed}
+
+    def apply_improvements(self) -> dict[str, Any]:
+        """Apply pending improvements from ProductIterator to existing courses.
+
+        Rewrites lesson scripts based on improvement plans (competitor gaps,
+        quality issues, etc.) and sends courses back through the review pipeline.
+        """
+        pending = self.product_iterator.get_pending_improvements(self.name)
+        if not pending:
+            return {"status": "no_pending_improvements"}
+
+        applied = 0
+        for improvement in pending[:2]:  # Max 2 per cycle
+            product_name = improvement["product_name"]
+            improvements_json = improvement.get("improvements", "[]")
+            try:
+                plan = json.loads(improvements_json) if isinstance(improvements_json, str) else improvements_json
+            except (json.JSONDecodeError, TypeError):
+                plan = {}
+
+            improvement_items = plan.get("improvements", []) if isinstance(plan, dict) else []
+
+            # Find the course in DB
+            courses = self.db.execute(
+                "SELECT * FROM courses WHERE title = ? LIMIT 1",
+                (product_name,),
+            )
+            if not courses:
+                self.product_iterator.mark_applied(improvement["id"])
+                continue
+
+            course = dict(courses[0])
+            lessons = self.db.execute(
+                "SELECT * FROM course_lessons WHERE course_id = ? ORDER BY lesson_order",
+                (course["id"],),
+            )
+
+            change_descriptions = [
+                f"- {item.get('area', 'general')}: {item.get('specific_change', item.get('current_issue', ''))}"
+                for item in improvement_items
+            ]
+            changes_text = "\n".join(change_descriptions) if change_descriptions else "General quality improvements"
+
+            # Rewrite lesson scripts with improvements
+            rewritten = 0
+            for lesson in lessons:
+                lesson_dict = dict(lesson)
+                if not lesson_dict.get("script"):
+                    continue
+
+                revised_script = self.llm.chat(
+                    [
+                        {"role": "system", "content": (
+                            "You are improving an existing course lesson. Apply the "
+                            "required improvements while preserving the core educational "
+                            "content. The result must be premium quality."
+                        )},
+                        {"role": "user", "content": (
+                            f"Course: {course['title']}\n"
+                            f"Lesson: {lesson_dict['title']}\n"
+                            f"Section: {lesson_dict['section']}\n\n"
+                            f"CURRENT SCRIPT:\n{lesson_dict['script'][:3000]}\n\n"
+                            f"REQUIRED IMPROVEMENTS:\n{changes_text}\n\n"
+                            "Rewrite this lesson incorporating the improvements."
+                        )},
+                    ],
+                    model=self.config.llm.model,
+                )
+
+                self.db.execute(
+                    "UPDATE course_lessons SET script = ?, status = 'scripted' WHERE id = ?",
+                    (revised_script, lesson_dict["id"]),
+                )
+                rewritten += 1
+
+            # Send course back through review pipeline
+            if rewritten > 0:
+                self.db.execute(
+                    "UPDATE courses SET status = 'producing' WHERE id = ?",
+                    (course["id"],),
+                )
+
+            self.product_iterator.mark_applied(improvement["id"])
+            applied += 1
+            self.log_action(
+                "course_improved",
+                f"{product_name}: {rewritten} lessons rewritten with improvements",
+            )
+
+        return {"applied": applied, "total_pending": len(pending)}

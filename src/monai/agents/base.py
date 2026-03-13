@@ -49,6 +49,7 @@ class BaseAgent(ABC):
         self._provisioner = None  # Lazy-loaded
         self._reviewer = None  # Lazy-loaded
         self._api_provisioner = None  # Lazy-loaded
+        self._product_iterator = None  # Lazy-loaded
 
     @property
     def coder(self):
@@ -117,6 +118,18 @@ class BaseAgent(ABC):
     @api_provisioner.setter
     def api_provisioner(self, value):
         self._api_provisioner = value
+
+    @property
+    def product_iterator(self):
+        """Lazy-load product iterator — continuous product improvement engine."""
+        if self._product_iterator is None:
+            from monai.agents.product_iterator import ProductIterator
+            self._product_iterator = ProductIterator(self.config, self.db, self.llm)
+        return self._product_iterator
+
+    @product_iterator.setter
+    def product_iterator(self, value):
+        self._product_iterator = value
 
     def write_code(self, spec: str, project_dir: str | None = None,
                    language: str = "python") -> dict:

@@ -372,6 +372,95 @@ class DigitalProductsAgent(BaseAgent):
 
         return {"products_listed": listed}
 
+    def apply_improvements(self) -> dict[str, Any]:
+        """Apply pending improvements from ProductIterator to existing products.
+
+        For digital products, this means regenerating content sections based on
+        improvement feedback (competitor gaps, quality issues, etc.).
+        """
+        pending = self.product_iterator.get_pending_improvements(self.name)
+        if not pending:
+            return {"status": "no_pending_improvements"}
+
+        applied = 0
+        for improvement in pending[:2]:  # Max 2 per cycle
+            product_name = improvement["product_name"]
+            improvements_json = improvement.get("improvements", "[]")
+            try:
+                plan = json.loads(improvements_json) if isinstance(improvements_json, str) else improvements_json
+            except (json.JSONDecodeError, TypeError):
+                plan = {}
+
+            improvement_items = plan.get("improvements", []) if isinstance(plan, dict) else []
+
+            # Find the product file
+            product_path = None
+            product_data = None
+            for path in self.products_dir.glob("*.json"):
+                data = json.loads(path.read_text())
+                spec = data.get("spec", {})
+                title = spec.get("title", path.stem)
+                if title == product_name or path.stem == product_name:
+                    product_path = path
+                    product_data = data
+                    break
+
+            if not product_data or not product_path:
+                self.product_iterator.mark_applied(improvement["id"])
+                continue
+
+            # Regenerate content with improvements applied
+            spec = product_data.get("spec", {})
+            existing_content = product_data.get("content", [])
+            change_descriptions = [
+                f"- {item.get('area', 'general')}: {item.get('specific_change', item.get('current_issue', ''))}"
+                for item in improvement_items
+            ]
+            changes_text = "\n".join(change_descriptions) if change_descriptions else "General quality improvements"
+
+            improved_content = []
+            for section_data in existing_content:
+                section_name = section_data.get("section", "")
+                original_text = section_data.get("content", "")
+
+                revised = self.llm.chat(
+                    [
+                        {"role": "system", "content": (
+                            "You are improving an existing digital product section. "
+                            "Apply the required improvements while preserving the core "
+                            "content. The result must be premium quality — indistinguishable "
+                            "from expert human work."
+                        )},
+                        {"role": "user", "content": (
+                            f"Product: {spec.get('title', product_name)}\n"
+                            f"Section: {section_name}\n\n"
+                            f"CURRENT CONTENT:\n{original_text[:3000]}\n\n"
+                            f"REQUIRED IMPROVEMENTS:\n{changes_text}\n\n"
+                            "Rewrite this section incorporating the improvements. "
+                            "Keep what works, fix what doesn't, add what's missing."
+                        )},
+                    ],
+                    model=self.config.llm.model,
+                )
+                improved_content.append({"section": section_name, "content": revised})
+
+            product_data["content"] = improved_content
+            product_data["status"] = "created"  # Re-enter review pipeline
+            product_data.setdefault("iteration_history", []).append({
+                "iteration_id": improvement["id"],
+                "improvements_applied": change_descriptions,
+                "sections_rewritten": len(improved_content),
+            })
+            product_path.write_text(json.dumps(product_data, indent=2))
+            self.product_iterator.mark_applied(improvement["id"])
+            applied += 1
+            self.log_action(
+                "product_improved",
+                f"{product_name}: {len(improved_content)} sections rewritten with improvements",
+            )
+
+        return {"applied": applied, "total_pending": len(pending)}
+
     def _check_sales(self) -> dict[str, Any]:
         """Check real sales data from Gumroad."""
         if not self._ensure_gumroad_account():

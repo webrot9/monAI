@@ -424,3 +424,75 @@ class TelegramBotAgent(BaseAgent):
 
         self.log_action("deploy_bots_complete", f"{deployed} bots deployed")
         return {"bots_deployed": deployed}
+
+    def apply_improvements(self) -> dict[str, Any]:
+        """Apply pending improvements from ProductIterator to existing bots.
+
+        Rebuilds bot code via the Coder agent based on improvement plans.
+        """
+        pending = self.product_iterator.get_pending_improvements(self.name)
+        if not pending:
+            return {"status": "no_pending_improvements"}
+
+        applied = 0
+        for improvement in pending[:2]:  # Max 2 per cycle
+            product_name = improvement["product_name"]
+            improvements_json = improvement.get("improvements", "[]")
+            try:
+                plan = json.loads(improvements_json) if isinstance(improvements_json, str) else improvements_json
+            except (json.JSONDecodeError, TypeError):
+                plan = {}
+
+            improvement_items = plan.get("improvements", []) if isinstance(plan, dict) else []
+
+            # Find the bot file
+            bot_path = None
+            bot_data = None
+            for path in self.bots_dir.glob("*.json"):
+                data = json.loads(path.read_text())
+                design = data.get("design", {})
+                name = design.get("name", path.stem)
+                if name == product_name or path.stem == product_name:
+                    bot_path = path
+                    bot_data = data
+                    break
+
+            if not bot_data or not bot_path:
+                self.product_iterator.mark_applied(improvement["id"])
+                continue
+
+            design = bot_data.get("design", {})
+            change_descriptions = [
+                f"- {item.get('area', 'general')}: {item.get('specific_change', item.get('current_issue', ''))}"
+                for item in improvement_items
+            ]
+            changes_text = "\n".join(change_descriptions) if change_descriptions else "General quality improvements"
+
+            rebuild_spec = (
+                f"Improve the Telegram bot: {product_name}\n"
+                f"Original spec: {json.dumps(design, default=str)[:2000]}\n\n"
+                f"REQUIRED IMPROVEMENTS:\n{changes_text}\n\n"
+                f"Rebuild the bot with these improvements applied. "
+                f"Keep existing commands and functionality working."
+            )
+
+            build_result = self.coder.generate_module(rebuild_spec)
+
+            if build_result.get("status") == "success":
+                bot_data["build"] = build_result
+                bot_data["status"] = "built"  # Re-enter review pipeline
+                bot_data.setdefault("iteration_history", []).append({
+                    "iteration_id": improvement["id"],
+                    "improvements_applied": change_descriptions,
+                    "rebuild_status": "success",
+                })
+                bot_path.write_text(json.dumps(bot_data, indent=2))
+                applied += 1
+                self.log_action(
+                    "bot_improved",
+                    f"{product_name}: rebuilt with {len(improvement_items)} improvements",
+                )
+
+            self.product_iterator.mark_applied(improvement["id"])
+
+        return {"applied": applied, "total_pending": len(pending)}

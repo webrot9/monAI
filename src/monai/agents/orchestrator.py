@@ -1500,7 +1500,7 @@ class Orchestrator(BaseAgent):
         try:
             result = self.product_iterator.run()
 
-            # Feed pending improvements back to strategy agents
+            # Apply pending improvements to actual products via strategy agents
             for name, agent in self._strategy_agents.items():
                 pending = self.product_iterator.get_pending_improvements(name)
                 if pending:
@@ -1508,10 +1508,23 @@ class Orchestrator(BaseAgent):
                         "product_improvements_pending",
                         f"{name}: {len(pending)} improvement(s) queued",
                     )
-                    # Mark as applied — the strategy will pick up review feedback
-                    # on its next cycle via the product_reviews table
-                    for p in pending:
-                        self.product_iterator.mark_applied(p["id"])
+                    # Call the strategy's apply_improvements() to rebuild code/content
+                    if hasattr(agent, "apply_improvements"):
+                        try:
+                            apply_result = agent.apply_improvements()
+                            self.log_action(
+                                "product_improvements_applied",
+                                f"{name}: {json.dumps(apply_result, default=str)[:300]}",
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to apply improvements for {name}: {e}")
+                            # Mark remaining pending as applied to prevent infinite retry
+                            for p in pending:
+                                self.product_iterator.mark_applied(p["id"])
+                    else:
+                        # Strategy doesn't support improvements yet — mark as applied
+                        for p in pending:
+                            self.product_iterator.mark_applied(p["id"])
 
             self.log_action("product_iteration", json.dumps(result, default=str)[:500])
             return result
