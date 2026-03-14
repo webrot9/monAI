@@ -215,3 +215,18 @@
   1. `smart_fill_form()` must discover page elements UPFRONT and batch-match ALL selectors in a single LLM call BEFORE attempting to type.
   2. One LLM call for N fields, not N calls for N fields.
   3. Only attempt `smart_type()` with already-resolved selectors.
+
+### 2026-03-14 - Pass full step objects, not just action strings
+- **Mistake**: `_execute_provisioning(step.action)` only passed the action string (e.g., "register_platform_account") to the executor. The LLM was then asked to "extract the platform name" from this string and returned "platform" literally.
+- **Root cause**: Data structure not propagated — `ProvisioningStep` has `.platform` field with real names (Upwork, Fiverr) but only `.action` was passed downstream.
+- **Rule**: Always pass the full data object when the callee needs multiple fields. Never ask an LLM to extract info that's already structured in a variable.
+
+### 2026-03-14 - Validate inputs before expensive operations
+- **Mistake**: Domain registration attempted with empty string when name validator returned empty. Empty/invalid domain names wasted an executor cycle.
+- **Root cause**: No guard clause on extracted domain name before passing to `register_domain()`.
+- **Rule**: Always validate extracted/generated values (not empty, correct format) before passing to expensive operations (executor tasks, API calls, browser automation).
+
+### 2026-03-14 - Deduplicate identical failing steps in provisioning loops
+- **Mistake**: Constraint planner generated multiple `register_platform_account` steps (Upwork, Fiverr, etc.) that all failed identically with "Missing platform URL". Each failure wasted an LLM call + executor cycle, creating a doom loop.
+- **Root cause**: No deduplication or early-exit when the same action type fails repeatedly.
+- **Rule**: Track failed action types in provisioning loops. If an action type fails, skip subsequent steps with the same action type in the same cycle instead of retrying them all.

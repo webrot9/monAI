@@ -12,7 +12,7 @@ from typing import Any
 
 from monai.agents.asset_aware import AssetManager
 from monai.agents.base import BaseAgent
-from monai.agents.constraint_planner import ConstraintPlanner
+from monai.agents.constraint_planner import ConstraintPlanner, ProvisioningStep
 from monai.agents.email_verifier import EmailVerifier
 from monai.agents.executor import AutonomousExecutor
 from monai.agents.identity import IdentityManager
@@ -88,6 +88,7 @@ class Provisioner(BaseAgent):
 
         # Execute in dependency order
         results = graph_results = {}
+        failed_actions: set[str] = set()  # Track failed action types to avoid retrying identical steps
         max_rounds = len(graph.steps) * 2  # safety cap
 
         for _ in range(max_rounds):
@@ -96,8 +97,17 @@ class Provisioner(BaseAgent):
                 break
 
             for step in ready:
-                step_result = self._execute_provisioning(step.action)
-                results[step.action] = step_result
+                # Dedup: skip steps whose action already failed (prevents doom loops
+                # where multiple register_platform_account steps all fail identically)
+                if step.action in failed_actions:
+                    logger.info(
+                        f"Skipping '{step.action}' for {step.platform} — "
+                        f"same action type already failed this cycle")
+                    graph.mark_failed(step.id, f"Skipped: {step.action} already failed")
+                    continue
+
+                step_result = self._execute_provisioning(step)
+                results[f"{step.action}:{step.platform}"] = step_result
 
                 if isinstance(step_result, dict) and step_result.get("status") in (
                     "completed", "already_registered", "already_exists", "already_have",
@@ -110,6 +120,7 @@ class Provisioner(BaseAgent):
                         step.id,
                         step_result.get("reason", step_result.get("status", "unknown")),
                     )
+                    failed_actions.add(step.action)
                 else:
                     # Assume success if not explicitly failed
                     graph.mark_completed(step.id)
@@ -413,30 +424,38 @@ class Provisioner(BaseAgent):
         result = await self.executor.execute_task(task, json.dumps(identity, default=str))
         return result
 
-    def _execute_provisioning(self, step: str) -> dict[str, Any]:
+    def _execute_provisioning(self, step: ProvisioningStep) -> dict[str, Any]:
         """Execute a provisioning step (sync wrapper for async operations)."""
+        action = step.action
+        platform = step.platform
+
         # Pre-check: verify assets exist before attempting registration
-        missing = AssetManager(self.db).get_missing_prerequisites(step)
+        missing = AssetManager(self.db).get_missing_prerequisites(action)
         if missing:
-            logger.warning(f"Cannot execute '{step}': missing {missing}")
+            logger.warning(f"Cannot execute '{action}' ({platform}): missing {missing}")
             return {"status": "blocked", "missing_prerequisites": missing}
 
-        if "register" in step.lower() and "platform" in step.lower():
-            platform = self.think(
-                f"Extract just the platform name from this step: '{step}'. "
-                "Reply with just the platform name, lowercase."
-            ).strip().lower()
-            return self._run_async(self.register_on_platform(platform))
-        elif "email" in step.lower():
+        if "register" in action.lower() and "platform" in action.lower():
+            # Use platform directly from the step — no LLM extraction needed
+            if not platform or platform.lower() in ("platform", "unknown", ""):
+                logger.error(f"Step '{action}' has no valid platform name: '{platform}'")
+                return {"status": "failed", "reason": f"No valid platform name for step '{action}'"}
+            return self._run_async(self.register_on_platform(platform.lower()))
+        elif "email" in action.lower():
             return self._run_async(self.setup_email())
-        elif "domain" in step.lower():
+        elif "domain" in action.lower():
             # Extract or generate a domain, then validate before registering
             domain_name = self.think(
-                f"Extract just the domain name from this step: '{step}'. "
+                f"Extract just the domain name from this step: '{action}'. "
                 "Reply with only the domain name (e.g. 'example.com'). "
                 "If no specific domain is mentioned, generate a unique, "
                 "professional name (e.g. 'nexifydigital.com')."
             ).strip().strip("'\"").lower()
+
+            # Guard: don't attempt registration with empty or invalid domain
+            if not domain_name or "." not in domain_name or len(domain_name) < 4:
+                logger.error(f"Invalid domain name extracted: '{domain_name}'")
+                return {"status": "failed", "reason": f"Invalid domain name: '{domain_name}'"}
 
             # Validate and find an available domain
             try:
@@ -455,9 +474,9 @@ class Provisioner(BaseAgent):
                 logger.warning(f"Domain validation failed ({e}), using original: {domain_name}")
 
             return self._run_async(self.register_domain(domain_name))
-        elif "api" in step.lower():
-            return self._run_async(self.acquire_api_key(step))
+        elif "api" in action.lower():
+            return self._run_async(self.acquire_api_key(action))
         else:
             return self._run_async(
-                self.executor.execute_task(step, json.dumps(self.identity.get_identity(), default=str))
+                self.executor.execute_task(action, json.dumps(self.identity.get_identity(), default=str))
             )
