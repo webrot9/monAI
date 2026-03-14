@@ -262,6 +262,12 @@ class BrowserLearner:
 
             effective = resolved_fields.get(selector, selector)
 
+            # Handle multi-step forms: if the target element is hidden,
+            # try to reveal it (scroll into view, click next/continue)
+            result = await self._reveal_if_hidden(effective, domain)
+            if result.get("revealed"):
+                logger.info(f"Revealed hidden field '{effective}' on {domain}")
+
             result = await self.smart_type(effective, value, domain,
                                            human_like=True)
 
@@ -440,15 +446,105 @@ class BrowserLearner:
         except Exception:
             return {"action": "retry_with_longer_wait", "success": False}
 
+    async def _reveal_if_hidden(self, selector: str, domain: str) -> dict[str, Any]:
+        """Try to reveal a hidden form element (multi-step signup forms).
+
+        Many signup pages (LinkedIn, Gumroad, LemonSqueezy) have fields that
+        exist in the DOM but are hidden until you scroll down, click "Join",
+        or progress through a wizard step. This method detects hidden elements
+        and tries common patterns to reveal them.
+        """
+        try:
+            page = await self.browser._get_page()
+            # Check if the element exists but is hidden
+            is_hidden = await page.evaluate(f"""(sel) => {{
+                const el = document.querySelector(sel);
+                if (!el) return null;  // Element doesn't exist
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return {{
+                    exists: true,
+                    visible: rect.width > 0 && rect.height > 0,
+                    display: style.display,
+                    visibility: style.visibility
+                }};
+            }}""", selector)
+
+            if not is_hidden or is_hidden.get("visible"):
+                return {"revealed": False, "reason": "already_visible_or_missing"}
+
+            # Element exists but is hidden — try to reveal it
+            logger.info(f"Element '{selector}' is hidden on {domain}, attempting reveal")
+
+            # Strategy 1: Scroll element into view
+            try:
+                await page.evaluate(f"""(sel) => {{
+                    const el = document.querySelector(sel);
+                    if (el) el.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+                }}""", selector)
+                await asyncio.sleep(0.5)
+
+                # Check if now visible
+                vis_check = await page.evaluate(f"""(sel) => {{
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                }}""", selector)
+                if vis_check:
+                    return {"revealed": True, "strategy": "scroll_into_view"}
+            except Exception:
+                pass
+
+            # Strategy 2: Click common "next step" buttons
+            next_buttons = [
+                'button[type="submit"]',
+                'button:has-text("Join")',
+                'button:has-text("Continue")',
+                'button:has-text("Next")',
+                'button:has-text("Sign up")',
+                'button:has-text("Get started")',
+                'a:has-text("Join now")',
+            ]
+            for btn_selector in next_buttons:
+                try:
+                    btn = page.locator(btn_selector).first
+                    if await btn.is_visible():
+                        await btn.click()
+                        await asyncio.sleep(1.0)
+
+                        # Check if target is now visible
+                        vis_check = await page.evaluate(f"""(sel) => {{
+                            const el = document.querySelector(sel);
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            return rect.width > 0 && rect.height > 0;
+                        }}""", selector)
+                        if vis_check:
+                            return {"revealed": True, "strategy": f"clicked:{btn_selector}"}
+                except Exception:
+                    continue
+
+            return {"revealed": False, "reason": "could_not_reveal"}
+        except Exception as e:
+            logger.debug(f"Reveal check failed for '{selector}': {e}")
+            return {"revealed": False, "error": str(e)}
+
     # ── Self-Healing Selectors ────────────────────────────────────
 
     async def _discover_form_elements(self, domain: str) -> list[dict]:
-        """Extract all interactive form elements from the current page."""
+        """Extract all interactive form elements from the current page.
+
+        Includes BOTH visible AND hidden elements (for multi-step forms where
+        fields like input#first-name exist in DOM but are hidden until a step
+        transition). The `isVisible` flag lets callers distinguish them.
+        """
         page = await self.browser._get_page()
         elements = await page.evaluate("""() => {
             const els = document.querySelectorAll('input, textarea, select, button');
             return Array.from(els).map(el => {
                 const rect = el.getBoundingClientRect();
+                const isVis = rect.width > 0 && rect.height > 0;
                 return {
                     tag: el.tagName.toLowerCase(),
                     type: el.getAttribute('type') || '',
@@ -462,9 +558,13 @@ class BrowserLearner:
                         x: rect.x, y: rect.y,
                         width: rect.width, height: rect.height
                     },
-                    isVisible: rect.width > 0 && rect.height > 0
+                    isVisible: isVis
                 };
-            }).filter(e => e.isVisible);
+            }).filter(e => {
+                // Include visible elements AND hidden elements that have a
+                // name or id (likely real form fields in a multi-step flow)
+                return e.isVisible || e.name || e.id;
+            });
         }""")
         logger.debug(f"Discovered {len(elements)} form elements on {domain}")
         return elements

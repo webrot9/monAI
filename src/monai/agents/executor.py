@@ -370,7 +370,12 @@ class AutonomousExecutor:
             "- If a domain is blocked, try a DIFFERENT domain or approach\n"
             "- If 3+ actions have failed, call done() or fail() instead of burning more steps\n"
             "- read_page/screenshot do NOT count as progress — only use them when genuinely needed\n"
-            "- Be efficient. Change strategy when things aren't working."
+            "- Be efficient. Change strategy when things aren't working.\n"
+            "- NEVER post to example.com or made-up/placeholder URLs — they don't exist\n"
+            "- NEVER create accounts on platforms NOT mentioned in the task\n"
+            "- NEVER run diagnostic loops (checking IP, proxy status, SSL) unless the task requires it\n"
+            "- STAY ON TASK. If the task is 'register on X', only interact with X — not Y or Z\n"
+            "- If the core action is impossible (site blocked, missing credentials), call fail() immediately"
         )
 
         # Temperature can be tuned by self-improvement experiments
@@ -390,9 +395,11 @@ class AutonomousExecutor:
                     "When writing code, use write_code tool — it generates AND tests code. "
                     "NEVER produce sloppy work. Everything must be production quality.\n\n"
                     "LEARN FROM FAILURES: When an action fails, analyze WHY and try a "
-                    "fundamentally different approach. Do NOT just retry the same thing. "
-                    "If a site blocks access via proxy, call fail() immediately — do NOT "
-                    "keep visiting the same blocked site."
+                    "fundamentally different approach. Do NOT just retry the same thing.\n"
+                    "IMPORTANT: Always ATTEMPT the task before deciding it's impossible. "
+                    "Navigate to the URL first — do NOT preemptively call fail() based on "
+                    "learned lessons alone. Only call fail() after you've actually tried "
+                    "and received a concrete error (e.g., 403, timeout, all proxies blocked)."
                 )},
                 {"role": "user", "content": prompt},
             ],
@@ -440,18 +447,11 @@ class AutonomousExecutor:
         except Exception:
             pass
 
-        # 3. Blocked domains — tell the LLM what's already known to be blocked
-        try:
-            fallback = self._anonymizer.fallback_chain
-            status = fallback.get_domain_status()
-            blocked = status.get("blocked", {})
-            if blocked:
-                blocked_text = ", ".join(
-                    f"{d} ({', '.join(types)})" for d, types in blocked.items()
-                )
-                parts.append(f"CURRENTLY BLOCKED DOMAINS: {blocked_text}")
-        except Exception:
-            pass
+        # 3. Blocked domains — NOTE: Do NOT inject this into the LLM prompt.
+        # Domain blocks are transient (TTL-based) and the proxy fallback chain
+        # handles them at runtime. Telling the LLM about blocks causes it to
+        # preemptively call fail() at Step 1 without even trying to navigate.
+        # The browser layer will raise AllProxiesBlockedError if truly blocked.
 
         if parts:
             return "LEARNED CONTEXT:\n" + "\n".join(parts) + "\n\n"
@@ -1178,18 +1178,11 @@ class AutonomousExecutor:
         """
         action_lower = action.lower()
 
-        # Store domain-specific blocklists
-        if failed_domains and ("skip" in action_lower or "avoid" in action_lower
-                                or "block" in action_lower):
-            for domain in failed_domains:
-                self.memory.store_knowledge(
-                    category="warning",
-                    topic=f"domain_blocked:{domain}",
-                    content=f"Domain {domain} should be avoided: {action}",
-                    source_agent="executor",
-                    confidence=0.9,
-                    tags=["domain_block", domain],
-                )
+        # NOTE: Do NOT store domain blocklists in the knowledge base.
+        # Domain blocks are transient (proxy rotations, Tor circuit changes)
+        # and the proxy fallback chain handles them at runtime with TTLs.
+        # Permanently marking domains as "blocked" causes the executor to
+        # preemptively fail on Step 1 without even trying to navigate.
 
         # Store as an executor-specific rule that gets injected into _think()
         try:

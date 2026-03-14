@@ -872,7 +872,22 @@ class APIProvisioner(BaseAgent):
             )
             return ms_result["address"]
 
-        # Fallback: mail.tm temp email (less reliable, may be rejected)
+        # Fallback: reuse ANY existing active temp email to avoid burning
+        # through mail.tm rate limits (creating N emails for N brands).
+        # Cross-brand email reuse is acceptable for temp emails since they're
+        # disposable and used only for initial signup verification.
+        any_temp = self.db.execute(
+            "SELECT identifier, credentials FROM identities "
+            "WHERE type = 'email' AND metadata LIKE '%temp%' AND status = 'active' "
+            "ORDER BY created_at DESC LIMIT 1",
+        )
+        if any_temp:
+            existing_email = any_temp[0]["identifier"]
+            logger.info(f"Reusing existing temp email '{existing_email}' for brand '{brand}' "
+                        "to avoid mail.tm rate limit")
+            return existing_email
+
+        # Last resort: create ONE new temp email via mail.tm
         temp = self.email_verifier.create_temp_email()
         if temp.get("status") == "created":
             self.identity.store_account(
@@ -885,6 +900,12 @@ class APIProvisioner(BaseAgent):
             logger.warning(f"Using temp email for brand '{brand}' — "
                            "Mailslurp unavailable, falling back to mail.tm")
             return temp["address"]
+
+        # If mail.tm also fails, try reusing the primary email as last resort
+        primary = self.identity.get_account("email")
+        if primary:
+            logger.warning(f"All email providers exhausted, reusing primary email for brand '{brand}'")
+            return primary["identifier"]
 
         raise RuntimeError(
             f"Cannot provision email for brand '{brand}': "
