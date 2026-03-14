@@ -255,3 +255,19 @@
 - **Mistake**: `_execute_provisioning()` only matched `register_*_platform*` patterns. The constraint planner's hardcoded rules also generate `platform_signup` (from `_STANDARD_RULES`), which fell through to the generic executor — failing because the generic handler has no platform context.
 - **Root cause**: Hybrid step generation (hardcoded + LLM) produces different action names for the same operation. The executor handler only matched one naming pattern.
 - **Rule**: Match ALL known variants: `register_platform_account`, `register_on_platform`, `platform_signup`, `platform_registration`, and any action with "signup" when a platform is specified.
+
+### 2026-03-14 - Multi-step signup forms have hidden fields that break form filling
+- **Mistake**: `_discover_form_elements()` filtered with `.filter(e => e.isVisible)`, removing all hidden DOM elements. LinkedIn's signup has `input#first-name` that exists but is hidden (display:none) until you scroll or click "Join now". The pre-healing LLM never saw the field, couldn't match it, and the type attempt timed out at 30s.
+- **Root cause**: Visibility filter was too aggressive — real form fields in multi-step flows are hidden but present in DOM.
+- **Rules**:
+  1. `_discover_form_elements()` must include elements with name/id even if hidden (they're real form fields).
+  2. Before typing into a field, check if it's hidden and try to reveal it (scrollIntoView, click "Join"/"Continue"/"Next" buttons).
+  3. The `_reveal_if_hidden()` method tries scroll + common step-progression buttons.
+
+### 2026-03-14 - Sub-agents need explicit constraints, not just a task string
+- **Mistake**: Spawner gave sub-agents only a vague task + identity info. No constraints on what NOT to do. Sub-agents signed up on LinkedIn/Facebook/Twitter, wrote marketing files, posted to example.com, ran diagnostic loops — all completely off-task.
+- **Root cause**: The sub-agent context had zero guardrails. "You can register new accounts on platforms as needed" was practically an invitation to go wild.
+- **Rules**:
+  1. Sub-agent context must include explicit CONSTRAINTS: stay on task, don't create unrelated accounts, don't post to placeholder URLs, don't run diagnostic loops.
+  2. If core action is impossible, fail() immediately — don't burn 15+ steps trying alternatives.
+  3. Default max_steps reduced from 30 to 15 — most tasks that will succeed do so in <10 steps.

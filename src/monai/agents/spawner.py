@@ -43,8 +43,19 @@ class SubAgent:
             f"You are sub-agent '{self.name}' of the monAI system.\n"
             f"Agent identity: {json.dumps(agent_identity, default=str)}\n"
             f"Available accounts: {json.dumps([{'platform': a['platform'], 'identifier': a['identifier']} for a in accounts], default=str)}\n"
-            f"You can register new accounts on platforms as needed.\n"
-            f"Use the agent identity for any registrations.\n"
+            f"Use the agent identity for any registrations.\n\n"
+            "SUB-AGENT CONSTRAINTS (MANDATORY):\n"
+            "- STAY ON TASK: Only perform actions directly related to your assigned task.\n"
+            "- Do NOT create accounts on platforms unless the task explicitly requires it.\n"
+            "- Do NOT sign up for LinkedIn, Facebook, Twitter, Instagram, or other social "
+            "media unless the task specifically says to.\n"
+            "- Do NOT write marketing emails, strategy docs, or files unless the task says to.\n"
+            "- Do NOT post to example.com, placeholder URLs, or made-up API endpoints.\n"
+            "- Do NOT run diagnostic loops (checking IPs, proxy status, SSL certificates).\n"
+            "- If the core action is IMPOSSIBLE (site blocked, missing credentials, access "
+            "denied), call fail() immediately — do NOT burn steps trying random alternatives.\n"
+            "- If you've tried 3 different approaches and all failed, call fail() with a "
+            "clear explanation rather than continuing to waste steps.\n"
         )
 
         self.result = await self.executor.execute_task(self.task, context)
@@ -63,7 +74,7 @@ class AgentSpawner:
         self.active_agents: dict[str, SubAgent] = {}
         self._executor_pool = ThreadPoolExecutor(max_workers=5)
 
-    def spawn(self, name: str, task: str, max_steps: int = 30) -> SubAgent:
+    def spawn(self, name: str, task: str, max_steps: int = 15) -> SubAgent:
         """Spawn a new sub-agent to handle a task."""
         executor = AutonomousExecutor(
             self.config, self.db, self.llm,
@@ -78,7 +89,7 @@ class AgentSpawner:
         logger.info(f"Spawned sub-agent: {name}")
         return agent
 
-    async def spawn_and_run(self, name: str, task: str, max_steps: int = 30) -> dict[str, Any]:
+    async def spawn_and_run(self, name: str, task: str, max_steps: int = 15) -> dict[str, Any]:
         """Spawn a sub-agent and run it immediately."""
         agent = self.spawn(name, task, max_steps)
         result = await agent.run()
@@ -86,7 +97,7 @@ class AgentSpawner:
         return result
 
     async def run_parallel(self, tasks: list[dict[str, str]],
-                           max_steps: int = 30) -> dict[str, dict[str, Any]]:
+                           max_steps: int = 15) -> dict[str, dict[str, Any]]:
         """Run multiple sub-agents in parallel.
 
         Args:
