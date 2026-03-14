@@ -684,42 +684,48 @@ class AutonomousExecutor:
             from monai.agents.ethics import (
                 PRIVACY_RULES, SELF_IMPROVEMENT_RULES,
             )
-            review = self.llm.quick(
-                f"SECURITY & ETHICS AUDIT — review this Python code that an AI agent "
-                f"wants to create as a reusable tool.\n\n"
-                f"Tool name: {name}\n"
-                f"Description: {description}\n"
-                f"Code:\n```python\n{code}\n```\n\n"
-                f"=== SECURITY CHECKS ===\n"
-                f"1. File system access (read/write/delete)\n"
-                f"2. Network access (HTTP, sockets, DNS)\n"
-                f"3. Process execution (shell, subprocess)\n"
-                f"4. Python sandbox escapes (__class__, __mro__, __subclasses__, "
-                f"__globals__, __builtins__, type(), getattr on dunder attrs)\n"
-                f"5. Privacy violations (accessing credentials, tokens, keys)\n"
-                f"6. Resource exhaustion (infinite loops, huge allocations)\n"
-                f"7. Code injection (eval, exec, compile)\n\n"
-                f"=== ETHICS CHECKS (MANDATORY) ===\n"
-                f"The tool MUST comply with these rules:\n"
-                f"{PRIVACY_RULES}\n"
-                f"{SELF_IMPROVEMENT_RULES}\n\n"
-                f"Specifically verify:\n"
-                f"8. No exposure of creator identity (IP, hostname, timezone, MAC)\n"
-                f"9. No bypassing proxy/Tor for network traffic\n"
-                f"10. No weakening of ethics rules or guardrails\n"
-                f"11. No unauthorized spending or financial commitments\n"
-                f"12. No deceptive practices or misrepresentation\n"
-                f"13. No accessing illegal content or services\n\n"
-                f"Reply with EXACTLY one line:\n"
-                f"SAFE: <reason> — if the code passes ALL security AND ethics checks\n"
-                f"UNSAFE: <reason> — if ANY security or ethics risk is found\n\n"
-                f"Be paranoid. When in doubt, say UNSAFE.",
-                system=(
-                    "You are a security and ethics auditor for an autonomous AI agent system. "
-                    "Be extremely strict. The creator's safety and anonymity are paramount. "
-                    "Any tool that could leak identity, bypass privacy protections, or violate "
-                    "ethical boundaries MUST be rejected."
-                ),
+            audit_model = self.llm.get_model(LLM.TIER_AUDIT)
+            review = self.llm.chat(
+                [
+                    {"role": "system", "content": (
+                        "You are a security and ethics auditor for an autonomous AI agent system. "
+                        "Be extremely strict. The creator's safety and anonymity are paramount. "
+                        "Any tool that could leak identity, bypass privacy protections, or violate "
+                        "ethical boundaries MUST be rejected."
+                    )},
+                    {"role": "user", "content": (
+                        f"SECURITY & ETHICS AUDIT — review this Python code that an AI agent "
+                        f"wants to create as a reusable tool.\n\n"
+                        f"Tool name: {name}\n"
+                        f"Description: {description}\n"
+                        f"Code:\n```python\n{code}\n```\n\n"
+                        f"=== SECURITY CHECKS ===\n"
+                        f"1. File system access (read/write/delete)\n"
+                        f"2. Network access (HTTP, sockets, DNS)\n"
+                        f"3. Process execution (shell, subprocess)\n"
+                        f"4. Python sandbox escapes (__class__, __mro__, __subclasses__, "
+                        f"__globals__, __builtins__, type(), getattr on dunder attrs)\n"
+                        f"5. Privacy violations (accessing credentials, tokens, keys)\n"
+                        f"6. Resource exhaustion (infinite loops, huge allocations)\n"
+                        f"7. Code injection (eval, exec, compile)\n\n"
+                        f"=== ETHICS CHECKS (MANDATORY) ===\n"
+                        f"The tool MUST comply with these rules:\n"
+                        f"{PRIVACY_RULES}\n"
+                        f"{SELF_IMPROVEMENT_RULES}\n\n"
+                        f"Specifically verify:\n"
+                        f"8. No exposure of creator identity (IP, hostname, timezone, MAC)\n"
+                        f"9. No bypassing proxy/Tor for network traffic\n"
+                        f"10. No weakening of ethics rules or guardrails\n"
+                        f"11. No unauthorized spending or financial commitments\n"
+                        f"12. No deceptive practices or misrepresentation\n"
+                        f"13. No accessing illegal content or services\n\n"
+                        f"Reply with EXACTLY one line:\n"
+                        f"SAFE: <reason> — if the code passes ALL security AND ethics checks\n"
+                        f"UNSAFE: <reason> — if ANY security or ethics risk is found\n\n"
+                        f"Be paranoid. When in doubt, say UNSAFE."
+                    )},
+                ],
+                model=audit_model,
             )
             review = review.strip()
             if review.upper().startswith("SAFE"):

@@ -63,6 +63,7 @@ class LLMConfig:
     provider: str = "openai"  # openai, anthropic, ollama
     model: str = "gpt-4o"
     model_mini: str = "gpt-4o-mini"
+    model_audit: str = ""  # Dedicated model for security/ethics audits. Falls back to model (main) if empty.
     api_key: str = ""
     api_base: str = ""  # Custom API base URL (for Ollama, etc.)
     max_tokens: int = 4096
@@ -306,6 +307,7 @@ class Config:
                 "provider": self.llm.provider,
                 "model": self.llm.model,
                 "model_mini": self.llm.model_mini,
+                "model_audit": self.llm.model_audit,
                 "api_base": self.llm.api_base,
                 "max_tokens": self.llm.max_tokens,
                 "temperature": self.llm.temperature,

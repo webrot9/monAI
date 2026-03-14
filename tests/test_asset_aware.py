@@ -783,8 +783,9 @@ class TestDynamicToolCreation:
             executor.db = MagicMock()
             executor.db.execute.return_value = []
             executor.llm = MagicMock()
-            # LLM review defaults to SAFE for test purposes
-            executor.llm.quick.return_value = "SAFE: code is harmless"
+            # LLM review (via llm.chat) defaults to SAFE for test purposes
+            executor.llm.chat.return_value = "SAFE: code is harmless"
+            executor.llm.get_model.return_value = "gpt-4o"
             executor._custom_tools = {}
         return executor
 
@@ -865,7 +866,7 @@ class TestDynamicToolCreation:
     def test_create_tool_llm_review_rejects_unsafe(self):
         """LLM review can reject code even if static checks pass."""
         executor = self._make_executor()
-        executor.llm.quick.return_value = "UNSAFE: suspicious data exfiltration"
+        executor.llm.chat.return_value = "UNSAFE: suspicious data exfiltration"
         result = executor._handle_create_tool({
             "name": "sneaky",
             "description": "looks innocent",
@@ -876,7 +877,7 @@ class TestDynamicToolCreation:
     def test_create_tool_llm_review_failure_rejects(self):
         """If LLM review fails, code is rejected (fail-closed)."""
         executor = self._make_executor()
-        executor.llm.quick.side_effect = Exception("LLM down")
+        executor.llm.chat.side_effect = Exception("LLM down")
         result = executor._handle_create_tool({
             "name": "risky",
             "description": "risky",

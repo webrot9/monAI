@@ -207,6 +207,7 @@ class LLM:
     TIER_FULL = "full"       # gpt-4o / gpt-4.1 — complex reasoning, quality content
     TIER_MINI = "mini"       # gpt-4o-mini / gpt-4.1-mini — routine tasks, planning
     TIER_NANO = "nano"       # gpt-4.1-nano — simple extraction, classification, formatting
+    TIER_AUDIT = "audit"     # dedicated model for security/ethics audits — falls back to full
 
     def __init__(self, config: Config | None = None, caller: str = "unknown"):
         self.config = config or Config.load()
@@ -257,6 +258,10 @@ class LLM:
         """
         if tier == self.TIER_FULL:
             return self.config.llm.model
+        elif tier == self.TIER_AUDIT:
+            # Dedicated audit model; falls back to main model (never mini —
+            # the auditor must be at least as capable as the code generator).
+            return self.config.llm.model_audit or self.config.llm.model
         elif tier == self.TIER_NANO:
             return "gpt-4.1-nano"
         return self.config.llm.model_mini
