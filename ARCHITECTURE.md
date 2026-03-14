@@ -221,7 +221,7 @@ The ProductIterator runs every 5 cycles to identify underperformers and trigger 
 | `base.py` | Base agent class with lazy-loaded mixins (coder, executor, identity, provisioner) |
 | `api_provisioner.py` | Autonomous payment provider API key self-provisioning |
 | `captcha_solver.py` | Autonomous CAPTCHA solving for account registration |
-| `email_verifier.py` | Email verification and temporary email management |
+| `email_verifier.py` | Email verification (Mailslurp API primary, IMAP fallback, mail.tm legacy) |
 | `eng_team/` | Engineering team (tech lead + engineers) |
 | `research_team/` | Research team (market, trends, competitors) |
 | `marketing_team/` | Marketing team (content, growth, outreach) |
@@ -383,6 +383,7 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 - **Strategy state machine**: Formal lifecycle (pending→active→paused→stopped) prevents invalid transitions
 - **Zero simulation**: All strategies use real browser/API actions, never LLM hallucination for market data
 - **Only OpenAI key provided**: Agents self-provision all other credentials via browser automation
+- **Mailslurp for email**: API-based persistent inboxes instead of browser-based Gmail/Outlook signup (which fails via Tor). Requires MAILSLURP_API_KEY env var or config.
 
 ## Recent Changes
 

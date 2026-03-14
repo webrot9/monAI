@@ -560,11 +560,9 @@ class TestSelfHealingFormFill:
         learner = self._make_learner()
         learner.db.execute.return_value = []  # no known selectors
 
-        # First call fails, second (with healed selector) succeeds
-        learner.smart_type = AsyncMock(side_effect=[
-            {"success": False, "error": "not found"},  # original fails
-            {"success": True},  # healed selector works
-        ])
+        # Pre-healing resolves selector, so smart_type is called once
+        # with the healed selector and succeeds
+        learner.smart_type = AsyncMock(return_value={"success": True})
 
         mock_page = AsyncMock()
         mock_page.evaluate.return_value = [
@@ -575,13 +573,18 @@ class TestSelfHealingFormFill:
              "isVisible": True},
         ]
         learner.browser._get_page = AsyncMock(return_value=mock_page)
-        learner.llm.quick.return_value = "#email-field"
+        # Batch match returns the healed selector for the broken one
+        learner.llm.quick.return_value = '{"#broken_selector": "#email-field"}'
         learner._update_playbook_selector = MagicMock()
 
         result = await learner.smart_fill_form(
             {"#broken_selector": "test@test.com"}, domain="example.com"
         )
         assert result["success"]
+        # smart_type should be called with the pre-healed selector
+        learner.smart_type.assert_called_once()
+        call_args = learner.smart_type.call_args
+        assert call_args[0][0] == "#email-field"
         # Should have stored the healed selector
         learner._update_playbook_selector.assert_called_once_with(
             "example.com", "#broken_selector", "#email-field"

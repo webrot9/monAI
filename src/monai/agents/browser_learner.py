@@ -231,39 +231,45 @@ class BrowserLearner:
 
     async def smart_fill_form(self, fields: dict[str, str],
                               domain: str = "") -> dict[str, Any]:
-        """Fill a form with human-like behavior and self-healing selectors."""
-        results = {}
-        discovered_elements: list[dict] | None = None
+        """Fill a form with human-like behavior and self-healing selectors.
 
+        Uses a pre-healing strategy: discovers page elements upfront and
+        resolves all selectors BEFORE attempting to type, avoiding costly
+        30s timeouts per field when selectors don't match.
+        """
+        results = {}
+
+        # --- Pre-healing: resolve all selectors upfront ---
+        resolved_fields = self._pre_resolve_selectors(fields, domain)
+        unresolved = [s for s, r in resolved_fields.items() if r == s
+                      and not self._get_known_selector(domain, s)]
+
+        if unresolved:
+            # Discover real page elements and batch-match all unresolved fields
+            discovered = await self._discover_form_elements(domain)
+            if discovered:
+                batch_map = self._llm_batch_match_selectors(
+                    unresolved, discovered)
+                for orig, healed in batch_map.items():
+                    if healed:
+                        resolved_fields[orig] = healed
+                        logger.info(
+                            f"Pre-healed selector: '{orig}' → '{healed}'")
+
+        # --- Fill each field with the resolved selector ---
         for selector, value in fields.items():
             await self._human_delay(short=True)
 
-            # Check if we already learned a better selector for this field
-            effective_selector = self._get_known_selector(domain, selector) or selector
+            effective = resolved_fields.get(selector, selector)
 
-            result = await self.smart_type(effective_selector, value, domain,
+            result = await self.smart_type(effective, value, domain,
                                            human_like=True)
 
-            if not result.get("success"):
-                # Self-healing: discover actual page elements and ask LLM
-                logger.info(f"Selector '{effective_selector}' failed, attempting "
-                            f"self-healing for field '{selector}'")
-                if discovered_elements is None:
-                    discovered_elements = await self._discover_form_elements(domain)
-
-                llm_selector = self._llm_match_selector(selector,
-                                                       discovered_elements)
-                if llm_selector:
-                    logger.info(f"LLM suggested selector '{llm_selector}' "
-                                f"for field '{selector}'")
-                    retry_result = await self.smart_type(llm_selector, value,
-                                                        domain, human_like=True)
-                    if retry_result.get("success"):
-                        self._update_playbook_selector(domain, selector,
-                                                       llm_selector)
-                        result = retry_result
-                        result["healed_selector"] = llm_selector
-                        result["original_selector"] = selector
+            if result.get("success") and effective != selector:
+                # Cache the successful healing for future use
+                self._update_playbook_selector(domain, selector, effective)
+                result["healed_selector"] = effective
+                result["original_selector"] = selector
 
             results[selector] = result
 
@@ -494,6 +500,58 @@ class BrowserLearner:
             selectors = json.loads(rows[0]["known_selectors"] or "{}")
             return selectors.get(original_selector)
         return None
+
+    # ------------------------------------------------------------------
+    #  Pre-healing helpers — resolve selectors before attempting to type
+    # ------------------------------------------------------------------
+
+    def _pre_resolve_selectors(
+        self, fields: dict[str, str], domain: str
+    ) -> dict[str, str]:
+        """Fast, local resolution of selectors using playbook + heuristics.
+
+        Returns a dict mapping original selector → best-guess selector.
+        If no better option is found, the original selector is returned as-is.
+        """
+        resolved: dict[str, str] = {}
+        for selector in fields:
+            # 1. Playbook (previously learned for this domain)
+            known = self._get_known_selector(domain, selector)
+            if known:
+                resolved[selector] = known
+            else:
+                resolved[selector] = selector
+        return resolved
+
+    def _llm_batch_match_selectors(
+        self, field_selectors: list[str], elements: list[dict]
+    ) -> dict[str, str | None]:
+        """Single LLM call to match ALL unresolved fields to page elements."""
+        elements_summary = json.dumps(elements, indent=2)
+        fields_list = "\n".join(f"- {s}" for s in field_selectors)
+        prompt = (
+            f"Given these interactive form elements on a web page:\n"
+            f"{elements_summary}\n\n"
+            f"Match each of these form field selectors to the best element:\n"
+            f"{fields_list}\n\n"
+            f"Return a JSON object mapping each selector to its best CSS "
+            f"selector match. Use precise selectors (prefer id-based, then "
+            f"name-based, then type+placeholder). "
+            f"If no match exists, map to null.\n"
+            f"Return ONLY the raw JSON, no markdown fences."
+        )
+        try:
+            response = self.llm.quick(prompt)
+            # Strip any markdown fencing
+            text = response.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            mapping = json.loads(text)
+            return {k: v for k, v in mapping.items()
+                    if isinstance(v, str) or v is None}
+        except Exception as e:
+            logger.warning(f"LLM batch selector match failed: {e}")
+            return {}
 
     def _generate_fallback_selectors(self, text: str) -> list[str]:
         """Generate fallback selectors based on text content."""

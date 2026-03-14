@@ -175,3 +175,20 @@
   3. After every task, analyze failures and store lessons in SharedMemory — visible to ALL agents.
   4. When hitting 3+ failures mid-task, PAUSE and reflect: ask the LLM to analyze WHY things are failing and suggest a different approach before continuing.
   5. NEVER build new capabilities without wiring them into the components that need them. A feature that isn't connected is the same as no feature.
+
+### 2026-03-14 - Email provisioning must use API, not browser automation
+- **Mistake**: `setup_email()` told the executor to "Create a free email account on Gmail/Outlook/ProtonMail" via browser automation through Tor. Gmail requires phone verification, Outlook has CAPTCHAs, ProtonMail detects bots — ALL fail via Tor. The executor then hallucinated credentials (fake passwords like `SecurePass123!`, non-existent usernames) and looped 12 steps trying each provider.
+- **Root cause**: Tried to browser-automate account creation on platforms that are designed to prevent exactly this. Meanwhile, `mail.tm` API creates working temp emails in <1 second with zero browser needed.
+- **Rules**:
+  1. `setup_email()` must use `create_temp_email()` (mail.tm API) — no browser automation for email creation.
+  2. Platform registrations must include the actual email in the task context — executor must NEVER fabricate credentials.
+  3. The `api_provisioner._get_brand_email()` fallback must never generate fake Gmail addresses — retry mail.tm or raise an error.
+  4. Executor system prompt must explicitly forbid credential fabrication: if no email/password is provided, call `fail()` explaining what's missing.
+
+### 2026-03-14 - Pre-heal form selectors before typing, not after timeout
+- **Mistake**: `smart_fill_form()` tried each selector, waited 30s for timeout, then discovered page elements and asked LLM — per field. For a form with 3 wrong selectors = ~3min of timeouts + 6 LLM calls.
+- **Root cause**: Reactive healing (fix after failure) instead of proactive healing (match before attempting).
+- **Rules**:
+  1. `smart_fill_form()` must discover page elements UPFRONT and batch-match ALL selectors in a single LLM call BEFORE attempting to type.
+  2. One LLM call for N fields, not N calls for N fields.
+  3. Only attempt `smart_type()` with already-resolved selectors.

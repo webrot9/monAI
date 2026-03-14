@@ -13,6 +13,7 @@ from typing import Any
 from monai.agents.asset_aware import AssetManager
 from monai.agents.base import BaseAgent
 from monai.agents.constraint_planner import ConstraintPlanner
+from monai.agents.email_verifier import EmailVerifier
 from monai.agents.executor import AutonomousExecutor
 from monai.agents.identity import IdentityManager
 from monai.config import Config
@@ -37,6 +38,7 @@ class Provisioner(BaseAgent):
         self.identity = IdentityManager(config, db, llm)
         self.executor = AutonomousExecutor(config, db, llm)
         self.constraint_planner = ConstraintPlanner(db, llm)
+        self.email_verifier = EmailVerifier(config, db)
 
     def plan(self) -> list[str]:
         """Determine what needs to be provisioned."""
@@ -120,17 +122,26 @@ class Provisioner(BaseAgent):
         if self.identity.has_account(platform):
             return {"status": "already_registered", "platform": platform}
 
+        # Ensure we have an email before attempting registration
+        email_account = self.identity.get_account("email")
+        if not email_account:
+            return {"status": "blocked", "reason": "No email account available"}
+        email = email_account["identifier"]
+
         identity = self.identity.get_identity()
         password = self.identity.generate_password()
 
         task = (
             f"Register a new account on {platform}. "
             f"Use these details:\n"
+            f"- Email: {email}\n"
             f"- Name/Company: {identity.get('name', 'monAI')}\n"
             f"- Username: {identity.get('preferred_username', 'monai')}\n"
             f"- Password: {password}\n"
             f"- Description: {identity.get('description', 'AI-powered digital services')}\n"
             f"Go to the {platform} registration page, fill in the form, and complete signup. "
+            f"IMPORTANT: Use ONLY the credentials above. Do NOT invent or fabricate any "
+            f"email addresses, passwords, or other credentials.\n"
             f"Take a screenshot after registration for verification."
         )
 
@@ -148,20 +159,40 @@ class Provisioner(BaseAgent):
         return result
 
     async def setup_email(self) -> dict[str, Any]:
-        """Set up an email account for the agent."""
+        """Set up a real email account via Mailslurp API.
+
+        Browser-based signup on Gmail/Outlook/ProtonMail is unreliable via Tor
+        (phone verification, CAPTCHAs, bot detection) and wastes entire cycles.
+        Mailslurp creates real, persistent inboxes via API — no browser needed.
+
+        Requires MAILSLURP_API_KEY in config or environment.
+        """
         if self.identity.has_account("email"):
             return {"status": "already_exists"}
 
         identity = self.identity.get_identity()
-        task = (
-            "Create a free email account for business use. "
-            "Options: Gmail, Outlook, ProtonMail. "
-            f"Preferred username: {identity.get('preferred_username', 'monai')}\n"
-            "Complete the full registration process."
-        )
+        inbox_name = identity.get("name", "monAI")
 
-        result = await self.executor.execute_task(task, json.dumps(identity, default=str))
-        return result
+        result = self.email_verifier.create_mailslurp_inbox(name=inbox_name)
+        if result.get("status") != "created":
+            logger.error(f"Mailslurp inbox creation failed: {result}")
+            return {
+                "status": "failed",
+                "reason": result.get("error", "Mailslurp API error"),
+            }
+
+        self.identity.store_account(
+            platform="email",
+            identifier=result["address"],
+            credentials={"inbox_id": result["inbox_id"]},
+            metadata={
+                "type": "mailslurp",
+                "inbox_id": result["inbox_id"],
+                "provider": "mailslurp",
+            },
+        )
+        logger.info(f"Email provisioned via Mailslurp: {result['address']}")
+        return {"status": "completed", "email": result["address"]}
 
     async def register_domain(self, domain: str, registrar: str = "namecheap") -> dict[str, Any]:
         """Register a domain name — only after validating availability."""
