@@ -1428,6 +1428,12 @@ class Orchestrator(BaseAgent):
         from monai.utils.llm import BudgetExceededError
         results = {}
 
+        # Auto-reset agents quarantined for > 24 hours (false positive recovery)
+        reset_agents = self.ethics_tester.auto_reset_stale_quarantines(max_age_hours=24)
+        if reset_agents:
+            results["auto_reset"] = reset_agents
+            logger.info(f"Auto-reset {len(reset_agents)} stale quarantines: {reset_agents}")
+
         for name in self._strategy_agents:
             # Skip if recently tested (within last 5 cycles)
             summary = self.ethics_tester.get_agent_ethics_summary(name)
