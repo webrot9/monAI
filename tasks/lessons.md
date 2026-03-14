@@ -188,6 +188,16 @@
   4. Platform registrations must include actual credentials — executor must NEVER fabricate any.
   5. `api_provisioner._get_brand_email()` prefers Mailslurp → mail.tm fallback → error (never fake Gmail).
 
+### 2026-03-14 - Executor hallucinated email creation (dollicons)
+- **Mistake**: Executor called `done()` claiming it created an email account, but zero evidence existed — no DB record, no action trail of actual form fills, nothing.
+- **Root cause**: The `done` tool was a simple passthrough — it returned whatever the LLM claimed with ZERO verification. An LLM that hallucinates success gets accepted as truth.
+- **Rules**:
+  1. `done()` is no longer a passthrough. The `ProofOfCompletion` module now intercepts every `done()` call and runs verification checks before accepting.
+  2. Checks: (a) action trail audit — must show productive actions, not just screenshots/reads; (b) asset verification — if task involves creating email/account/key, the DB must have a matching record; (c) hallucination pattern detection — claimed emails/accounts must appear in action history; (d) confirmation page check — browser should show success, not error.
+  3. If verification fails, `done()` is REJECTED and the executor gets feedback about what's wrong. It gets 3 attempts before being marked as failed.
+  4. Every verification failure is stored as a `hallucination` lesson in SharedMemory for cross-agent learning.
+  5. NEVER trust an LLM's word that it completed something. Always verify with external evidence.
+
 ### 2026-03-14 - Pre-heal form selectors before typing, not after timeout
 - **Mistake**: `smart_fill_form()` tried each selector, waited 30s for timeout, then discovered page elements and asked LLM — per field. For a form with 3 wrong selectors = ~3min of timeouts + 6 LLM calls.
 - **Root cause**: Reactive healing (fix after failure) instead of proactive healing (match before attempting).
