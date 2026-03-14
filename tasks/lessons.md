@@ -271,3 +271,22 @@
   1. Sub-agent context must include explicit CONSTRAINTS: stay on task, don't create unrelated accounts, don't post to placeholder URLs, don't run diagnostic loops.
   2. If core action is impossible, fail() immediately — don't burn 15+ steps trying alternatives.
   3. Default max_steps reduced from 30 to 15 — most tasks that will succeed do so in <10 steps.
+
+### 2026-03-15 - Orchestrator retries blocked platforms across strategies, wasting entire cycles
+- **Mistake**: `_ensure_strategy_payment_providers()` tried to provision Stripe 5 times (once per strategy: micro_saas, telegram_bots, course_creation, print_on_demand, saas). Stripe is blocked via Tor every time. Each attempt creates a new temp email, validates a new business name, launches a browser — enormous waste.
+- **Root cause**: No cycle-scoped dedup. The only check was "does this provider exist in brand_api_keys?" — which is always false if the first attempt failed.
+- **Rule**: Track `failed_providers` set within the cycle. After a provider fails once, skip it for all remaining strategies. One failure = blocked for this cycle.
+
+### 2026-03-15 - Empty domain name passed to domain registration
+- **Mistake**: `name_validator.generate_and_validate()` returned `identity` dict without `validated_domain` key when all attempts failed. Provisioner did `identity.get("validated_domain", domain_name)` which fell back to the original (empty) domain, then tried to register `''` on Namecheap.
+- **Root cause**: `validated_domain` was only set on the success path (line 524). The fallback "best attempt" path never set it.
+- **Rules**:
+  1. Always set `validated_domain` in identity dict before returning (even if empty string).
+  2. Provisioner must check for empty domain name and return failure early instead of launching a browser.
+
+### 2026-03-15 - Coder sandbox can't find Python in bwrap
+- **Mistake**: `coder._run_tests()` passed `sys.executable` (absolute venv path) to `sandbox_run()`. But `VIRTUAL_ENV` wasn't in `_SAFE_ENV_KEYS`, so `_make_clean_env()` didn't pass it through, and `_build_bwrap_cmd()` never bind-mounted the venv. The Python binary didn't exist inside the sandbox.
+- **Root cause**: `VIRTUAL_ENV` was missing from the env var whitelist, breaking the entire venv → bwrap → pytest chain.
+- **Rules**:
+  1. `VIRTUAL_ENV` must be in `_SAFE_ENV_KEYS` so the sandbox can bind-mount the venv and resolve `sys.executable`.
+  2. `coder._run_tests()` should fallback to `"python3"` if `sys.executable` doesn't exist on disk.

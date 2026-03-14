@@ -474,11 +474,14 @@ class Provisioner(BaseAgent):
                     identity, validation = validator.generate_and_validate(
                         domain_tlds=[".com", ".io", ".co", ".dev"],
                     )
-                    domain_name = identity.get("validated_domain", domain_name)
+                    domain_name = identity.get("validated_domain") or ""
                     logger.info(f"Original domain taken, using validated: {domain_name}")
                 validator.close()
             except Exception as e:
                 logger.warning(f"Domain validation failed ({e}), using original: {domain_name}")
+
+            if not domain_name:
+                return {"status": "failed", "reason": "No viable domain name found after validation"}
 
             return self._run_async(self.register_domain(domain_name))
         elif "api" in action.lower():

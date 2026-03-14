@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -227,8 +228,11 @@ class Coder:
 
     def _run_tests(self, test_path: Path, work_dir: Path) -> dict[str, Any]:
         from monai.utils.sandbox import sandbox_run
+        # Use "python3" from PATH instead of sys.executable — the absolute
+        # path may not exist inside the bwrap sandbox if venv layout differs
+        python = sys.executable if os.path.isfile(sys.executable) else "python3"
         result = sandbox_run(
-            [sys.executable, "-m", "pytest", str(test_path), "-v", "--tb=short"],
+            [python, "-m", "pytest", str(test_path), "-v", "--tb=short"],
             cwd=work_dir,
             timeout=60,
             allowed_paths=[work_dir],
