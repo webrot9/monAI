@@ -230,3 +230,28 @@
 - **Mistake**: Constraint planner generated multiple `register_platform_account` steps (Upwork, Fiverr, etc.) that all failed identically with "Missing platform URL". Each failure wasted an LLM call + executor cycle, creating a doom loop.
 - **Root cause**: No deduplication or early-exit when the same action type fails repeatedly.
 - **Rule**: Track failed action types in provisioning loops. If an action type fails, skip subsequent steps with the same action type in the same cycle instead of retrying them all.
+
+### 2026-03-14 - Don't let the executor preemptively fail based on learned domain blocks
+- **Mistake**: Executor stored "domain X is blocked" in knowledge base permanently. Next run, `_get_learned_context()` injected "CURRENTLY BLOCKED DOMAINS: dashboard.stripe.com" into the LLM prompt, and the system prompt said "If a site blocks access via proxy, call fail() immediately". Result: executor failed at Step 1 without even navigating.
+- **Root cause**: Domain blocks are transient (Tor circuit rotations, TTLs) but were stored as permanent knowledge. The system prompt was too aggressive about failing.
+- **Rules**:
+  1. Never store domain blocks in the knowledge base — the proxy fallback chain handles them at runtime with TTLs.
+  2. Never inject "CURRENTLY BLOCKED DOMAINS" into the executor prompt — it causes preemptive failure.
+  3. System prompt must say "ATTEMPT the task first" — only fail after a concrete error, not based on learned lessons.
+
+### 2026-03-14 - Don't create N temp emails for N brands — reuse across brands
+- **Mistake**: api_provisioner created a separate mail.tm account for each brand (digital_products, micro_saas, telegram_bots, etc.). 4+ brands × 2 API calls each = 8+ mail.tm calls per cycle, instantly hitting rate limits (429).
+- **Root cause**: `_get_brand_email()` only looked for brand-specific emails, never checking for reusable existing temp emails.
+- **Rule**: Before creating a new temp email, check for any existing active temp email in the identities table and reuse it. Temp emails are disposable — brand isolation doesn't matter for signup verification.
+
+### 2026-03-14 - Constrain executor sub-agents to stay on task
+- **Mistake**: Sub-agents went completely off-rails: "investigate" agent spent 30 steps checking IP addresses and posting to example.com; "marketing" agent tried signing up on LinkedIn/Facebook/Twitter and writing marketing strategy files to disk.
+- **Root cause**: Executor CRITICAL RULES didn't explicitly forbid posting to fake URLs, creating accounts on unrelated platforms, or running diagnostic loops.
+- **Rules**:
+  1. Add explicit rules: "NEVER post to example.com or placeholder URLs", "NEVER create accounts on platforms NOT in the task", "NEVER run diagnostic loops unless the task requires it", "STAY ON TASK".
+  2. If the core action is impossible, call fail() immediately — don't burn 30 steps trying alternatives.
+
+### 2026-03-14 - Handle all platform registration step name variants
+- **Mistake**: `_execute_provisioning()` only matched `register_*_platform*` patterns. The constraint planner's hardcoded rules also generate `platform_signup` (from `_STANDARD_RULES`), which fell through to the generic executor — failing because the generic handler has no platform context.
+- **Root cause**: Hybrid step generation (hardcoded + LLM) produces different action names for the same operation. The executor handler only matched one naming pattern.
+- **Rule**: Match ALL known variants: `register_platform_account`, `register_on_platform`, `platform_signup`, `platform_registration`, and any action with "signup" when a platform is specified.

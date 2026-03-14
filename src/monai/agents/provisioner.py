@@ -435,7 +435,14 @@ class Provisioner(BaseAgent):
             logger.warning(f"Cannot execute '{action}' ({platform}): missing {missing}")
             return {"status": "blocked", "missing_prerequisites": missing}
 
-        if "register" in action.lower() and "platform" in action.lower():
+        # Match any platform registration step: register_platform_account,
+        # register_on_platform, platform_signup, etc.
+        is_platform_reg = (
+            ("register" in action.lower() and "platform" in action.lower())
+            or action.lower() in ("platform_signup", "platform_registration")
+            or ("signup" in action.lower() and platform)
+        )
+        if is_platform_reg:
             # Use platform directly from the step — no LLM extraction needed
             if not platform or platform.lower() in ("platform", "unknown", ""):
                 logger.error(f"Step '{action}' has no valid platform name: '{platform}'")
