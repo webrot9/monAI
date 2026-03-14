@@ -175,3 +175,23 @@
   3. After every task, analyze failures and store lessons in SharedMemory — visible to ALL agents.
   4. When hitting 3+ failures mid-task, PAUSE and reflect: ask the LLM to analyze WHY things are failing and suggest a different approach before continuing.
   5. NEVER build new capabilities without wiring them into the components that need them. A feature that isn't connected is the same as no feature.
+
+### 2026-03-14 - Email provisioning must be fully autonomous via API
+- **Mistake 1**: `setup_email()` told the executor to "Create a free email account on Gmail/Outlook/ProtonMail" via browser automation through Tor — always fails (phone verification, CAPTCHAs, bot detection).
+- **Mistake 2**: After fixing to use mail.tm temp emails, was told "creare una temp email è FOLLE!" — temp emails expire, get rejected by platforms.
+- **Mistake 3**: After implementing Mailslurp API, told the user to manually set MAILSLURP_API_KEY — violates the "creator does NOTHING" principle. The only key the creator provides is OpenAI.
+- **Root cause**: Incremental fixes instead of thinking through the full autonomous pipeline end-to-end.
+- **Rules**:
+  1. `setup_email()` self-provisions Mailslurp API key if missing: temp email (mail.tm) → browser signup on mailslurp.com → extract API key → save to config. The temp email is disposable — only used for this one-time bootstrap.
+  2. After bootstrap, all email creation uses Mailslurp API (persistent, real inboxes).
+  3. The creator provides ZERO keys except OpenAI. Everything else is self-provisioned.
+  4. Platform registrations must include actual credentials — executor must NEVER fabricate any.
+  5. `api_provisioner._get_brand_email()` prefers Mailslurp → mail.tm fallback → error (never fake Gmail).
+
+### 2026-03-14 - Pre-heal form selectors before typing, not after timeout
+- **Mistake**: `smart_fill_form()` tried each selector, waited 30s for timeout, then discovered page elements and asked LLM — per field. For a form with 3 wrong selectors = ~3min of timeouts + 6 LLM calls.
+- **Root cause**: Reactive healing (fix after failure) instead of proactive healing (match before attempting).
+- **Rules**:
+  1. `smart_fill_form()` must discover page elements UPFRONT and batch-match ALL selectors in a single LLM call BEFORE attempting to type.
+  2. One LLM call for N fields, not N calls for N fields.
+  3. Only attempt `smart_type()` with already-resolved selectors.

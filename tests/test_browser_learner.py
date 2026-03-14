@@ -143,3 +143,39 @@ class TestBrowserLearner:
         assert playbook is not None
         selectors = json.loads(playbook["known_selectors"])
         assert selectors["#old-btn"] == "button:has-text('Submit')"
+
+    def test_pre_resolve_uses_playbook(self, config, db, mock_llm):
+        bl = BrowserLearner(config, db, mock_llm)
+        bl._update_playbook_selector("test.com", "#email", "#real-email")
+        resolved = bl._pre_resolve_selectors(
+            {"#email": "a@b.com", "#password": "x"}, domain="test.com"
+        )
+        assert resolved["#email"] == "#real-email"
+        assert resolved["#password"] == "#password"  # no playbook entry
+
+    def test_pre_resolve_no_domain(self, config, db, mock_llm):
+        bl = BrowserLearner(config, db, mock_llm)
+        resolved = bl._pre_resolve_selectors(
+            {"#email": "a@b.com"}, domain=""
+        )
+        assert resolved["#email"] == "#email"
+
+    def test_llm_batch_match_parses_json(self, config, db, mock_llm):
+        bl = BrowserLearner(config, db, mock_llm)
+        mock_llm.quick.return_value = '{"#email": "#real-email", "#name": null}'
+        elements = [{"tag": "input", "id": "real-email"}]
+        result = bl._llm_batch_match_selectors(["#email", "#name"], elements)
+        assert result["#email"] == "#real-email"
+        assert result["#name"] is None
+
+    def test_llm_batch_match_handles_markdown_fences(self, config, db, mock_llm):
+        bl = BrowserLearner(config, db, mock_llm)
+        mock_llm.quick.return_value = '```json\n{"#email": "#real-email"}\n```'
+        result = bl._llm_batch_match_selectors(["#email"], [])
+        assert result["#email"] == "#real-email"
+
+    def test_llm_batch_match_handles_error(self, config, db, mock_llm):
+        bl = BrowserLearner(config, db, mock_llm)
+        mock_llm.quick.side_effect = Exception("LLM down")
+        result = bl._llm_batch_match_selectors(["#email"], [])
+        assert result == {}

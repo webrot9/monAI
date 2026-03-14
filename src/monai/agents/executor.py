@@ -335,12 +335,17 @@ class AutonomousExecutor:
                     f"{CORE_DIRECTIVES}\n\n"
                     "You are an autonomous AI executor. You complete tasks by using tools. "
                     "Think step by step. Be resourceful and creative. "
-                    "When registering on platforms, use the provided identity info. "
+                    "When registering on platforms, use ONLY the credentials provided in the "
+                    "task context (email, password, name). NEVER invent, fabricate, or guess "
+                    "credentials — if no email/password is provided, call fail() explaining "
+                    "what's missing instead of making one up.\n"
                     "Always check results before proceeding. Take screenshots when unsure. "
                     "When writing code, use write_code tool — it generates AND tests code. "
                     "NEVER produce sloppy work. Everything must be production quality.\n\n"
                     "LEARN FROM FAILURES: When an action fails, analyze WHY and try a "
-                    "fundamentally different approach. Do NOT just retry the same thing."
+                    "fundamentally different approach. Do NOT just retry the same thing. "
+                    "If a site blocks access via proxy, call fail() immediately — do NOT "
+                    "keep visiting the same blocked site."
                 )},
                 {"role": "user", "content": prompt},
             ],

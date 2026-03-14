@@ -860,45 +860,89 @@ class APIProvisioner(BaseAgent):
             domain = base_email.split("@")[1]
             return self.identity.generate_email_alias(domain)
 
-        # Last resort: create a temp email
+        # Preferred: create a Mailslurp inbox (real, persistent, API-based)
+        ms_result = self.email_verifier.create_mailslurp_inbox(name=brand)
+        if ms_result.get("status") == "created":
+            self.identity.store_account(
+                platform="email",
+                identifier=ms_result["address"],
+                credentials={"inbox_id": ms_result["inbox_id"]},
+                metadata={"brand": brand, "type": "mailslurp",
+                          "inbox_id": ms_result["inbox_id"]},
+            )
+            return ms_result["address"]
+
+        # Fallback: mail.tm temp email (less reliable, may be rejected)
         temp = self.email_verifier.create_temp_email()
         if temp.get("status") == "created":
-            # Store it for the brand
             self.identity.store_account(
                 platform="email",
                 identifier=temp["address"],
                 credentials={"password": temp["password"]},
-                metadata={"brand": brand, "type": "temp", "domain": temp.get("domain", "")},
+                metadata={"brand": brand, "type": "temp",
+                          "domain": temp.get("domain", "")},
             )
+            logger.warning(f"Using temp email for brand '{brand}' — "
+                           "Mailslurp unavailable, falling back to mail.tm")
             return temp["address"]
 
-        # Absolute fallback
-        username = identity.get("preferred_username", "monai")
-        return f"{username}.{brand.replace(' ', '').lower()}@gmail.com"
+        raise RuntimeError(
+            f"Cannot provision email for brand '{brand}': "
+            "both Mailslurp and mail.tm unavailable"
+        )
 
     def _complete_email_verification(self, email: str, platform: str,
                                      identity: dict[str, Any]) -> dict[str, Any]:
         """Handle email verification after provider signup.
 
-        Tries IMAP first (if we have credentials), then temp email API,
+        Tries Mailslurp API first (if inbox_id available), then IMAP,
         then falls back to browser-based verification via the executor.
         """
+        result: dict[str, Any] = {"status": "not_found"}
+
         # Get stored email credentials
         email_account = self.identity.get_account("email")
+        inbox_id = ""
         imap_password = ""
-        imap_host = ""
         if email_account and email_account.get("credentials"):
             creds = email_account["credentials"]
+            inbox_id = creds.get("inbox_id", "")
             imap_password = creds.get("password", "")
 
-        # Try automated verification
-        result = self.email_verifier.wait_for_verification(
-            email_address=email,
-            platform=platform,
-            imap_password=imap_password,
-            timeout=120,
-            poll_interval=8,
-        )
+        # Also check brand-specific email metadata for inbox_id
+        if not inbox_id:
+            brand_emails = self.db.execute(
+                "SELECT metadata FROM identities "
+                "WHERE type = 'email' AND identifier = ? AND status = 'active'",
+                (email,),
+            )
+            if brand_emails:
+                import json as _json
+                meta = _json.loads(brand_emails[0]["metadata"] or "{}")
+                inbox_id = meta.get("inbox_id", "")
+
+        # Try Mailslurp API first (fastest, most reliable)
+        if inbox_id:
+            ms_result = self.email_verifier.mailslurp_wait_for_email(
+                inbox_id=inbox_id, timeout_ms=120_000)
+            if ms_result.get("status") == "received":
+                code = ms_result.get("verification_code")
+                link = ms_result.get("verification_link")
+                result = {
+                    "status": "found",
+                    "verification_type": "code" if code else ("link" if link else None),
+                    "verification_value": code or link,
+                }
+
+        # Fallback: IMAP polling
+        if result.get("status") != "found" and imap_password:
+            result = self.email_verifier.wait_for_verification(
+                email_address=email,
+                platform=platform,
+                imap_password=imap_password,
+                timeout=120,
+                poll_interval=8,
+            )
 
         if result.get("status") == "found":
             # If it's a verification link, click it

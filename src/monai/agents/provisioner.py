@@ -13,6 +13,7 @@ from typing import Any
 from monai.agents.asset_aware import AssetManager
 from monai.agents.base import BaseAgent
 from monai.agents.constraint_planner import ConstraintPlanner
+from monai.agents.email_verifier import EmailVerifier
 from monai.agents.executor import AutonomousExecutor
 from monai.agents.identity import IdentityManager
 from monai.config import Config
@@ -37,6 +38,7 @@ class Provisioner(BaseAgent):
         self.identity = IdentityManager(config, db, llm)
         self.executor = AutonomousExecutor(config, db, llm)
         self.constraint_planner = ConstraintPlanner(db, llm)
+        self.email_verifier = EmailVerifier(config, db)
 
     def plan(self) -> list[str]:
         """Determine what needs to be provisioned."""
@@ -120,17 +122,26 @@ class Provisioner(BaseAgent):
         if self.identity.has_account(platform):
             return {"status": "already_registered", "platform": platform}
 
+        # Ensure we have an email before attempting registration
+        email_account = self.identity.get_account("email")
+        if not email_account:
+            return {"status": "blocked", "reason": "No email account available"}
+        email = email_account["identifier"]
+
         identity = self.identity.get_identity()
         password = self.identity.generate_password()
 
         task = (
             f"Register a new account on {platform}. "
             f"Use these details:\n"
+            f"- Email: {email}\n"
             f"- Name/Company: {identity.get('name', 'monAI')}\n"
             f"- Username: {identity.get('preferred_username', 'monai')}\n"
             f"- Password: {password}\n"
             f"- Description: {identity.get('description', 'AI-powered digital services')}\n"
             f"Go to the {platform} registration page, fill in the form, and complete signup. "
+            f"IMPORTANT: Use ONLY the credentials above. Do NOT invent or fabricate any "
+            f"email addresses, passwords, or other credentials.\n"
             f"Take a screenshot after registration for verification."
         )
 
@@ -148,20 +159,155 @@ class Provisioner(BaseAgent):
         return result
 
     async def setup_email(self) -> dict[str, Any]:
-        """Set up an email account for the agent."""
+        """Set up a real email account via Mailslurp API.
+
+        Fully autonomous:
+        1. If no Mailslurp API key → self-provision one via browser
+           (sign up on mailslurp.com using a disposable mail.tm email)
+        2. Create a persistent inbox via Mailslurp API
+        3. Store credentials for all future operations
+
+        No manual config needed. The only key the creator provides is OpenAI.
+        """
         if self.identity.has_account("email"):
             return {"status": "already_exists"}
 
+        # Step 1: Self-provision Mailslurp API key if missing
+        if not self.config.comms.mailslurp_api_key:
+            logger.info("No Mailslurp API key — self-provisioning via browser")
+            provision_result = await self._provision_mailslurp_key()
+            if provision_result.get("status") != "completed":
+                return {
+                    "status": "failed",
+                    "reason": f"Mailslurp self-provisioning failed: "
+                              f"{provision_result.get('error', 'unknown')}",
+                }
+
+        # Step 2: Create inbox via API
         identity = self.identity.get_identity()
-        task = (
-            "Create a free email account for business use. "
-            "Options: Gmail, Outlook, ProtonMail. "
-            f"Preferred username: {identity.get('preferred_username', 'monai')}\n"
-            "Complete the full registration process."
+        inbox_name = identity.get("name", "monAI")
+
+        result = self.email_verifier.create_mailslurp_inbox(name=inbox_name)
+        if result.get("status") != "created":
+            logger.error(f"Mailslurp inbox creation failed: {result}")
+            return {
+                "status": "failed",
+                "reason": result.get("error", "Mailslurp API error"),
+            }
+
+        self.identity.store_account(
+            platform="email",
+            identifier=result["address"],
+            credentials={"inbox_id": result["inbox_id"]},
+            metadata={
+                "type": "mailslurp",
+                "inbox_id": result["inbox_id"],
+                "provider": "mailslurp",
+            },
+        )
+        logger.info(f"Email provisioned via Mailslurp: {result['address']}")
+        return {"status": "completed", "email": result["address"]}
+
+    async def _provision_mailslurp_key(self) -> dict[str, Any]:
+        """Self-provision a Mailslurp API key autonomously.
+
+        Uses a disposable mail.tm email ONLY for the Mailslurp signup.
+        After getting the API key, the temp email can expire — doesn't matter.
+        """
+        # Create throwaway email for Mailslurp signup
+        temp = self.email_verifier.create_temp_email()
+        if temp.get("status") != "created":
+            return {"status": "failed",
+                    "error": f"Cannot create bootstrap email: {temp.get('error')}"}
+
+        temp_email = temp["address"]
+        temp_password = temp["password"]
+        logger.info(f"Bootstrap temp email created: {temp_email}")
+
+        # Sign up on Mailslurp via browser automation
+        import secrets
+        ms_password = secrets.token_urlsafe(20)
+
+        signup_task = (
+            f"Go to https://app.mailslurp.com/sign-up/ and create a free account.\n"
+            f"Use these credentials:\n"
+            f"- Email: {temp_email}\n"
+            f"- Password: {ms_password}\n"
+            f"Complete the signup form and submit it.\n"
+            f"IMPORTANT: Use ONLY the credentials above. Do NOT invent any.\n"
+            f"After signup, you may need to verify the email. "
+            f"Report whether signup succeeded via done()."
+        )
+        signup_result = await self.executor.execute_task(signup_task)
+        if signup_result.get("status") != "completed":
+            return {"status": "failed",
+                    "error": f"Mailslurp signup failed: {signup_result}"}
+
+        # Check temp email for verification (if needed)
+        verification = self.email_verifier.wait_for_verification(
+            email_address=temp_email,
+            platform="mailslurp",
+            imap_password=temp_password,
+            timeout=60,
+            poll_interval=5,
+        )
+        if verification.get("status") == "found":
+            link = verification.get("verification_value", "")
+            if link and verification.get("verification_type") == "link":
+                await self.executor.execute_task(
+                    f"Navigate to this verification link and confirm: {link}\n"
+                    f"Click any 'Confirm' or 'Verify' buttons on the page.\n"
+                    f"Return the result via done()."
+                )
+
+        # Extract API key from Mailslurp dashboard
+        extract_task = (
+            f"Go to https://app.mailslurp.com/\n"
+            f"If not logged in, log in with:\n"
+            f"- Email: {temp_email}\n"
+            f"- Password: {ms_password}\n"
+            f"Navigate to the API key section (usually in account settings or "
+            f"displayed on the dashboard).\n"
+            f"Copy the API key and return it via done() in this exact format:\n"
+            f"API_KEY: <the key here>\n"
+            f"IMPORTANT: Return the ACTUAL API key from the page. Do NOT fabricate one."
+        )
+        extract_result = await self.executor.execute_task(extract_task)
+        if extract_result.get("status") != "completed":
+            return {"status": "failed",
+                    "error": f"API key extraction failed: {extract_result}"}
+
+        # Parse API key from executor response
+        result_text = json.dumps(extract_result, default=str)
+        import re
+        api_key_match = re.search(
+            r'API_KEY:\s*([a-f0-9-]{30,})', result_text, re.IGNORECASE)
+        if not api_key_match:
+            # Try UUID format
+            api_key_match = re.search(
+                r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})',
+                result_text, re.IGNORECASE,
+            )
+        if not api_key_match:
+            return {"status": "failed",
+                    "error": "Could not parse API key from Mailslurp dashboard"}
+
+        api_key = api_key_match.group(1)
+
+        # Store in config (encrypted)
+        self.config.comms.mailslurp_api_key = api_key
+        self.config.save()
+        logger.info("Mailslurp API key self-provisioned and saved to config")
+
+        # Also store the Mailslurp account for reference
+        self.identity.store_account(
+            platform="mailslurp",
+            identifier=temp_email,
+            credentials={"password": ms_password, "api_key": api_key},
+            metadata={"type": "service_account", "provider": "mailslurp"},
         )
 
-        result = await self.executor.execute_task(task, json.dumps(identity, default=str))
-        return result
+        return {"status": "completed", "api_key_length": len(api_key)}
 
     async def register_domain(self, domain: str, registrar: str = "namecheap") -> dict[str, Any]:
         """Register a domain name — only after validating availability."""

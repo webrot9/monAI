@@ -116,6 +116,13 @@ class CommsConfig:
     imap_password: str = ""
     from_name: str = "monAI"
     from_email: str = ""
+    # Mailslurp — API-based email provider for autonomous inbox creation.
+    # Set the API key via config or MAILSLURP_API_KEY env var.
+    mailslurp_api_key: str = ""
+
+    def __post_init__(self):
+        if not self.mailslurp_api_key:
+            self.mailslurp_api_key = os.environ.get("MAILSLURP_API_KEY", "")
 
 
 @dataclass
@@ -328,6 +335,7 @@ class Config:
                 "imap_port": self.comms.imap_port,
                 "from_name": self.comms.from_name,
                 "from_email": self.comms.from_email,
+                "mailslurp_api_key": self.comms.mailslurp_api_key,
             },
             "privacy": {
                 "proxy_type": self.privacy.proxy_type,

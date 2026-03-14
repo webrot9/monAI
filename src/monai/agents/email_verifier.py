@@ -424,3 +424,102 @@ class EmailVerifier:
         except Exception as e:
             logger.error(f"Temp email creation failed: {e}")
             return {"status": "error", "error": str(e)}
+
+    # ── Mailslurp API ─────────────────────────────────────────────
+
+    _MAILSLURP_BASE = "https://api.mailslurp.com"
+
+    def _mailslurp_key(self) -> str:
+        return self.config.comms.mailslurp_api_key
+
+    def _mailslurp_headers(self) -> dict[str, str]:
+        return {"x-api-key": self._mailslurp_key()}
+
+    def create_mailslurp_inbox(self, name: str = "") -> dict[str, Any]:
+        """Create a persistent email inbox via Mailslurp API.
+
+        Returns:
+            {"status": "created", "inbox_id": str, "address": str} or error.
+        """
+        key = self._mailslurp_key()
+        if not key:
+            return {"status": "error",
+                    "error": "MAILSLURP_API_KEY not configured"}
+        try:
+            params: dict[str, Any] = {"inboxType": "HTTP_INBOX"}
+            if name:
+                params["name"] = name
+            resp = self._http.post(
+                f"{self._MAILSLURP_BASE}/inboxes",
+                headers=self._mailslurp_headers(),
+                params=params,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            inbox_id = data["id"]
+            address = data["emailAddress"]
+            logger.info(f"Mailslurp inbox created: {address} ({inbox_id})")
+            return {
+                "status": "created",
+                "inbox_id": inbox_id,
+                "address": address,
+            }
+        except Exception as e:
+            logger.error(f"Mailslurp inbox creation failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def mailslurp_wait_for_email(self, inbox_id: str, timeout_ms: int = 60_000,
+                                  subject_filter: str = "") -> dict[str, Any]:
+        """Wait for an email to arrive in a Mailslurp inbox.
+
+        Returns:
+            {"status": "received", "subject": str, "body": str, "from": str,
+             "verification_code": str | None, "verification_link": str | None}
+        """
+        key = self._mailslurp_key()
+        if not key:
+            return {"status": "error",
+                    "error": "MAILSLURP_API_KEY not configured"}
+        try:
+            params: dict[str, Any] = {
+                "inboxId": inbox_id,
+                "timeout": timeout_ms,
+                "unreadOnly": True,
+            }
+            resp = self._http.get(
+                f"{self._MAILSLURP_BASE}/waitForLatestEmail",
+                headers=self._mailslurp_headers(),
+                params=params,
+                timeout=max(timeout_ms // 1000 + 10, 30),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            subject = data.get("subject", "")
+            body = data.get("body", "")
+            sender = (data.get("from") or "")
+
+            # Extract verification code / link
+            verification = self._extract_verification(
+                subject + "\n" + body)
+
+            return {
+                "status": "received",
+                "subject": subject,
+                "body": body[:2000],
+                "from": sender,
+                "verification_code": (
+                    verification["value"]
+                    if verification and verification["type"] == "code"
+                    else None
+                ),
+                "verification_link": (
+                    verification["value"]
+                    if verification and verification["type"] == "link"
+                    else None
+                ),
+            }
+        except Exception as e:
+            logger.error(f"Mailslurp wait_for_email failed: {e}")
+            return {"status": "error", "error": str(e)}
