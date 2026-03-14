@@ -212,6 +212,28 @@ class AutonomousExecutor:
                     "result": result_str[:1000],
                 })
 
+                # Watchdog: detect stuck loops (same non-failing tool+args+result 4+ times)
+                # Only fires when the LLM keeps doing the exact same thing with same outcome
+                if len(self.action_history) >= 4 and not is_failure:
+                    last4 = self.action_history[-4:]
+                    sigs = [
+                        (a["tool"], json.dumps(a["args"], sort_keys=True), a["result"][:200])
+                        for a in last4
+                    ]
+                    if len(set(sigs)) == 1:
+                        reason = (
+                            f"Stuck loop: {tool} called 4 times with identical "
+                            f"args and result — aborting to prevent waste"
+                        )
+                        logger.warning(reason)
+                        self._log_task(task, "stuck_loop", reason)
+                        return {
+                            "status": "failed",
+                            "reason": reason,
+                            "steps": step + 1,
+                            "history": self.action_history,
+                        }
+
                 # Check if task is done
                 if tool == "done":
                     self._log_task(task, "completed", result)
@@ -425,7 +447,16 @@ class AutonomousExecutor:
                     if not result.get("success"):
                         return f"ERROR: Click failed: {result.get('error', 'unknown')}"
                     await asyncio.sleep(1)
-                    return await self.browser.get_page_info()
+                    page_info = await self.browser.get_page_info()
+                    # Self-healing: auto-solve CAPTCHA after click
+                    failure = self._learner._detect_failure(page_info)
+                    if failure == "captcha":
+                        logger.info("CAPTCHA detected after click, auto-solving")
+                        captcha_result = await self._learner._handle_captcha(domain)
+                        if captcha_result.get("success"):
+                            await asyncio.sleep(2)
+                            page_info = await self.browser.get_page_info()
+                    return page_info
                 else:
                     await self.browser.click(args.get("selector", ""))
                     await asyncio.sleep(1)
@@ -508,7 +539,18 @@ class AutonomousExecutor:
                     except Exception as e:
                         return f"ERROR: Submit failed: {e}"
                 await asyncio.sleep(2)
-                return await self.browser.get_page_info()
+                # Self-healing: check for CAPTCHA after submit
+                page_info = await self.browser.get_page_info()
+                if self._learner:
+                    failure = self._learner._detect_failure(page_info)
+                    if failure == "captcha":
+                        logger.info("CAPTCHA detected after submit, auto-solving")
+                        captcha_result = await self._learner._handle_captcha(
+                            urlparse(page.url).netloc if hasattr(page, 'url') else "")
+                        if captcha_result.get("success"):
+                            await asyncio.sleep(2)
+                            page_info = await self.browser.get_page_info()
+                return page_info
 
             elif tool == "read_page":
                 return await self.browser.get_text()
@@ -681,26 +723,51 @@ class AutonomousExecutor:
         Returns (is_safe, reason).
         """
         try:
-            review = self.llm.quick(
-                f"SECURITY AUDIT — review this Python code that an AI agent wants "
-                f"to create as a reusable tool.\n\n"
-                f"Tool name: {name}\n"
-                f"Description: {description}\n"
-                f"Code:\n```python\n{code}\n```\n\n"
-                f"Check for:\n"
-                f"1. File system access (read/write/delete)\n"
-                f"2. Network access (HTTP, sockets, DNS)\n"
-                f"3. Process execution (shell, subprocess)\n"
-                f"4. Python sandbox escapes (__class__, __mro__, __subclasses__, "
-                f"__globals__, __builtins__, type(), getattr on dunder attrs)\n"
-                f"5. Privacy violations (accessing credentials, tokens, keys)\n"
-                f"6. Resource exhaustion (infinite loops, huge allocations)\n"
-                f"7. Code injection (eval, exec, compile)\n\n"
-                f"Reply with EXACTLY one line:\n"
-                f"SAFE: <reason> — if the code is safe\n"
-                f"UNSAFE: <reason> — if ANY risk is found\n\n"
-                f"Be paranoid. When in doubt, say UNSAFE.",
-                system="You are a security auditor. Be extremely strict.",
+            from monai.agents.ethics import (
+                PRIVACY_RULES, SELF_IMPROVEMENT_RULES,
+            )
+            audit_model = self.llm.get_model(LLM.TIER_AUDIT)
+            review = self.llm.chat(
+                [
+                    {"role": "system", "content": (
+                        "You are a security and ethics auditor for an autonomous AI agent system. "
+                        "Be extremely strict. The creator's safety and anonymity are paramount. "
+                        "Any tool that could leak identity, bypass privacy protections, or violate "
+                        "ethical boundaries MUST be rejected."
+                    )},
+                    {"role": "user", "content": (
+                        f"SECURITY & ETHICS AUDIT — review this Python code that an AI agent "
+                        f"wants to create as a reusable tool.\n\n"
+                        f"Tool name: {name}\n"
+                        f"Description: {description}\n"
+                        f"Code:\n```python\n{code}\n```\n\n"
+                        f"=== SECURITY CHECKS ===\n"
+                        f"1. File system access (read/write/delete)\n"
+                        f"2. Network access (HTTP, sockets, DNS)\n"
+                        f"3. Process execution (shell, subprocess)\n"
+                        f"4. Python sandbox escapes (__class__, __mro__, __subclasses__, "
+                        f"__globals__, __builtins__, type(), getattr on dunder attrs)\n"
+                        f"5. Privacy violations (accessing credentials, tokens, keys)\n"
+                        f"6. Resource exhaustion (infinite loops, huge allocations)\n"
+                        f"7. Code injection (eval, exec, compile)\n\n"
+                        f"=== ETHICS CHECKS (MANDATORY) ===\n"
+                        f"The tool MUST comply with these rules:\n"
+                        f"{PRIVACY_RULES}\n"
+                        f"{SELF_IMPROVEMENT_RULES}\n\n"
+                        f"Specifically verify:\n"
+                        f"8. No exposure of creator identity (IP, hostname, timezone, MAC)\n"
+                        f"9. No bypassing proxy/Tor for network traffic\n"
+                        f"10. No weakening of ethics rules or guardrails\n"
+                        f"11. No unauthorized spending or financial commitments\n"
+                        f"12. No deceptive practices or misrepresentation\n"
+                        f"13. No accessing illegal content or services\n\n"
+                        f"Reply with EXACTLY one line:\n"
+                        f"SAFE: <reason> — if the code passes ALL security AND ethics checks\n"
+                        f"UNSAFE: <reason> — if ANY security or ethics risk is found\n\n"
+                        f"Be paranoid. When in doubt, say UNSAFE."
+                    )},
+                ],
+                model=audit_model,
             )
             review = review.strip()
             if review.upper().startswith("SAFE"):

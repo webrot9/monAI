@@ -71,6 +71,15 @@ class FreelanceWritingAgent(BaseAgent):
         if active_jobs > 0:
             return ["write_content"]
 
+        # Check for reviewed content ready for delivery
+        reviewed = self.db.execute(
+            "SELECT COUNT(*) as c FROM projects WHERE status = 'reviewed' "
+            "AND strategy_id = (SELECT id FROM strategies WHERE name = ?)",
+            (self.name,),
+        )
+        if reviewed and reviewed[0]["c"] > 0:
+            return ["deliver_work"]
+
         # Check for written content needing review before delivery
         written = self.db.execute(
             "SELECT COUNT(*) as c FROM projects WHERE status = 'written' "
@@ -231,6 +240,17 @@ class FreelanceWritingAgent(BaseAgent):
                 ],
                 model=self.config.llm.model,  # Use full model for quality
             )
+            # Save content to disk so review and delivery can read it
+            content_path = self.config.data_dir / "deliverables" / f"project_{p['id']}.txt"
+            content_path.parent.mkdir(parents=True, exist_ok=True)
+            content_path.write_text(content)
+
+            # Update project status to 'written'
+            self.db.execute(
+                "UPDATE projects SET status = 'written' WHERE id = ?",
+                (p["id"],),
+            )
+
             # Track API cost as expense
             self.record_expense(
                 0.05, "api_cost", f"Content generation for project {p['id']}",
@@ -271,6 +291,10 @@ class FreelanceWritingAgent(BaseAgent):
             )
 
             if result.verdict == "approved":
+                self.db.execute(
+                    "UPDATE projects SET status = 'reviewed' WHERE id = ?",
+                    (p["id"],),
+                )
                 self.log_action("content_reviewed", f"Project {p['id']}: APPROVED")
                 reviewed += 1
             elif result.verdict == "rejected":
@@ -286,6 +310,10 @@ class FreelanceWritingAgent(BaseAgent):
                 revised_text = revised.get("revised_content", content)
                 if revised_text and content_path.exists():
                     content_path.write_text(revised_text)
+                self.db.execute(
+                    "UPDATE projects SET status = 'reviewed' WHERE id = ?",
+                    (p["id"],),
+                )
                 self.log_action("content_revised", f"Project {p['id']}: REVISED")
                 reviewed += 1
 
@@ -298,7 +326,7 @@ class FreelanceWritingAgent(BaseAgent):
             "c.notes as client_notes FROM projects p "
             "JOIN contacts c ON p.contact_id = c.id "
             "WHERE p.strategy_id = (SELECT id FROM strategies WHERE name = ?) "
-            "AND p.status = 'written'",
+            "AND p.status = 'reviewed'",
             (self.name,),
         )
         delivered = 0

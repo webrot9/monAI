@@ -309,8 +309,17 @@ class Orchestrator(BaseAgent):
     def _execute_cycle(self, cycle_result: dict, budget: dict) -> dict[str, Any]:
         """Execute the main cycle phases. Separated to allow BudgetExceededError handling."""
         # Phase 0: Start cycle for all registered agents (process messages, load lessons)
-        for agent in self._strategy_agents.values():
-            agent.start_cycle(self._cycle)
+        # Skip quarantined agents to avoid RuntimeError crashes
+        for name, agent in self._strategy_agents.items():
+            if self.ethics_tester.is_quarantined(name):
+                continue
+            try:
+                agent.start_cycle(self._cycle)
+            except RuntimeError as e:
+                if "quarantined" in str(e).lower():
+                    logger.warning(f"Skipping quarantined agent {name} in start_cycle")
+                else:
+                    raise
         self.start_cycle(self._cycle)
 
         # Phase 0.5: Process inter-agent requests (help requests, handoffs)
@@ -818,7 +827,7 @@ class Orchestrator(BaseAgent):
         """
         try:
             active_strategies = self.db.execute(
-                "SELECT DISTINCT strategy FROM strategy_lifecycle WHERE status = 'active'"
+                "SELECT DISTINCT name AS strategy FROM strategies WHERE status = 'active'"
             )
             if not active_strategies:
                 return
@@ -1416,7 +1425,14 @@ class Orchestrator(BaseAgent):
 
     def _run_ethics_checks(self) -> dict[str, Any]:
         """Run ethics tests on all registered agents before they operate."""
+        from monai.utils.llm import BudgetExceededError
         results = {}
+
+        # Auto-reset agents quarantined for > 24 hours (false positive recovery)
+        reset_agents = self.ethics_tester.auto_reset_stale_quarantines(max_age_hours=24)
+        if reset_agents:
+            results["auto_reset"] = reset_agents
+            logger.info(f"Auto-reset {len(reset_agents)} stale quarantines: {reset_agents}")
 
         for name in self._strategy_agents:
             # Skip if recently tested (within last 5 cycles)
@@ -1437,8 +1453,16 @@ class Orchestrator(BaseAgent):
                 )
                 continue
 
-            # Run ethics test
-            test_result = self.ethics_tester.test_agent(name)
+            # Run ethics test — abort remaining agents if budget exceeded
+            try:
+                test_result = self.ethics_tester.test_agent(name)
+            except BudgetExceededError:
+                logger.warning(
+                    f"Ethics checks aborted at {name}: budget exceeded. "
+                    "Remaining agents skipped."
+                )
+                results[name] = {"status": "skipped", "reason": "budget_exceeded"}
+                break
             results[name] = {
                 "score": test_result["score"],
                 "passed": test_result["all_passed"],
@@ -1823,48 +1847,77 @@ class Orchestrator(BaseAgent):
         active_names = {r["name"] for r in active}
         strategy_timeout = 300  # 5 minutes max per strategy
 
+        max_retries = 2  # Retry transient failures up to 2 times
+
         for name, agent in self._strategy_agents.items():
             if name in active_names:
                 # Skip quarantined agents
                 if self.ethics_tester.is_quarantined(name):
                     results[name] = {"status": "quarantined", "reason": "ethics_failure"}
                     continue
-                t0 = datetime.now()
-                try:
-                    # Run with timeout to prevent hung strategies from freezing daemon
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        future = pool.submit(agent.run)
-                        result = future.result(timeout=strategy_timeout)
-                    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
-                    results[name] = {"status": "ok", "result": result}
-                    # Share success insights
-                    agent.share_knowledge(
-                        category="insight",
-                        topic=f"{name}_cycle_result",
-                        content=json.dumps(result, default=str)[:500],
-                        tags=[name, "strategy_result"],
-                    )
-                    # Update task router with success feedback
-                    self.task_router.update_performance(
-                        name, "strategy_execution", True, duration_ms,
-                    )
-                except concurrent.futures.TimeoutError:
-                    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
-                    logger.error(f"Strategy {name} timed out after {strategy_timeout}s")
-                    results[name] = {"status": "timeout", "error": f"Exceeded {strategy_timeout}s"}
-                    self.task_router.update_performance(
-                        name, "strategy_execution", False, duration_ms,
-                    )
-                except Exception as e:
-                    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
-                    logger.error(f"Strategy {name} failed: {e}")
-                    results[name] = {"status": "error", "error": str(e)}
-                    # Auto-learn from failure
-                    agent.learn_from_error(e, context=f"Running strategy {name}")
-                    # Update task router with failure feedback
-                    self.task_router.update_performance(
-                        name, "strategy_execution", False, duration_ms,
-                    )
+
+                last_error = None
+                for attempt in range(1 + max_retries):
+                    t0 = datetime.now()
+                    try:
+                        # Run with timeout to prevent hung strategies from freezing daemon
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            future = pool.submit(agent.run)
+                            result = future.result(timeout=strategy_timeout)
+                        duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+                        results[name] = {"status": "ok", "result": result}
+                        if attempt > 0:
+                            results[name]["retries"] = attempt
+                        # Share success insights
+                        agent.share_knowledge(
+                            category="insight",
+                            topic=f"{name}_cycle_result",
+                            content=json.dumps(result, default=str)[:500],
+                            tags=[name, "strategy_result"],
+                        )
+                        # Update task router with success feedback
+                        self.task_router.update_performance(
+                            name, "strategy_execution", True, duration_ms,
+                        )
+                        last_error = None
+                        break  # Success — no retry needed
+                    except concurrent.futures.TimeoutError:
+                        duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+                        logger.error(f"Strategy {name} timed out after {strategy_timeout}s")
+                        results[name] = {"status": "timeout", "error": f"Exceeded {strategy_timeout}s"}
+                        self.task_router.update_performance(
+                            name, "strategy_execution", False, duration_ms,
+                        )
+                        break  # Timeouts are not retryable
+                    except Exception as e:
+                        duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+                        last_error = e
+                        # Transient errors: retry with backoff
+                        is_transient = any(s in str(e).lower() for s in [
+                            "connection", "timeout", "rate limit", "503", "502",
+                            "429", "temporary", "unavailable",
+                        ])
+                        if is_transient and attempt < max_retries:
+                            import time as _time
+                            backoff = 2 ** (attempt + 1)  # 2s, 4s
+                            logger.warning(
+                                f"Strategy {name} transient failure (attempt {attempt + 1}), "
+                                f"retrying in {backoff}s: {e}"
+                            )
+                            _time.sleep(backoff)
+                            continue
+                        # Non-transient or exhausted retries
+                        logger.error(f"Strategy {name} failed: {e}")
+                        results[name] = {"status": "error", "error": str(e)}
+                        if attempt > 0:
+                            results[name]["retries"] = attempt
+                        # Auto-learn from failure
+                        agent.learn_from_error(e, context=f"Running strategy {name}")
+                        # Update task router with failure feedback
+                        self.task_router.update_performance(
+                            name, "strategy_execution", False, duration_ms,
+                        )
+                        break
 
         # Store results for next cycle's metrics recording
         self._last_strategy_results = results

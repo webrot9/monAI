@@ -267,8 +267,25 @@ class BrowserLearner:
 
             results[selector] = result
 
-        return {"success": all(r.get("success") for r in results.values()),
-                "fields": results}
+        all_ok = all(r.get("success") for r in results.values())
+
+        # Self-healing: check for CAPTCHA after filling form
+        if all_ok:
+            try:
+                page_info = await self.browser.get_page_info()
+                failure = self._detect_failure(page_info)
+                if failure == "captcha":
+                    logger.info(f"CAPTCHA detected after form fill on {domain}")
+                    captcha_result = await self._handle_captcha(domain)
+                    if captcha_result.get("success"):
+                        return {"success": True, "fields": results,
+                                "captcha_solved": True}
+                    return {"success": False, "fields": results,
+                            "captcha_failed": True}
+            except Exception as e:
+                logger.debug(f"Post-fill CAPTCHA check error: {e}")
+
+        return {"success": all_ok, "fields": results}
 
     # ── Failure Detection ─────────────────────────────────────────
 
