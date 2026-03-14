@@ -833,10 +833,19 @@ class Orchestrator(BaseAgent):
                 return
 
             provisioned = []
+            failed_providers: set[str] = set()  # Track providers that failed this cycle
             for row in active_strategies:
                 strategy_name = row["strategy"]
                 needed_providers = self.STRATEGY_PAYMENT_PROVIDERS.get(strategy_name, [])
                 for provider in needed_providers:
+                    # Skip providers that already failed this cycle
+                    if provider in failed_providers:
+                        self.log_action(
+                            "auto_provision_payment",
+                            f"Strategy '{strategy_name}' needs {provider} — skipping (already failed this cycle)",
+                        )
+                        continue
+
                     # Check if this provider is already set up for any brand
                     existing = self.db.execute(
                         "SELECT 1 FROM brand_api_keys WHERE provider = ? AND status = 'active' LIMIT 1",
@@ -851,15 +860,20 @@ class Orchestrator(BaseAgent):
                             prov_result = self.api_provisioner._dispatch_provision(
                                 provider, strategy_name,
                             )
+                            status = prov_result.get("status", "error")
                             provisioned.append(f"{provider}:{strategy_name}")
                             self.log_action(
                                 "auto_provision_result",
-                                f"{provider} for {strategy_name}: {prov_result.get('status')}",
+                                f"{provider} for {strategy_name}: {status}",
                             )
+                            # If provision failed, don't retry for other strategies
+                            if status in ("error", "failed"):
+                                failed_providers.add(provider)
                         except Exception as e:
                             logger.warning(
                                 f"Auto-provision {provider} for {strategy_name} failed: {e}"
                             )
+                            failed_providers.add(provider)
 
             if provisioned:
                 result["auto_provisioned_providers"] = provisioned

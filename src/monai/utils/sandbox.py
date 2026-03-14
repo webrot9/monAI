@@ -43,6 +43,7 @@ _SAFE_ENV_KEYS = {
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "LC_CTYPE",
     "TERM", "SHELL", "TMPDIR", "TZ",
     "PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED",
+    "VIRTUAL_ENV",  # Needed so bwrap can bind-mount the venv
     "NODE_PATH", "NODE_ENV",
     "PIP_NO_WARN_SCRIPT_LOCATION",
     "VIRTUAL_ENV",

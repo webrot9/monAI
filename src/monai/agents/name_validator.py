@@ -537,6 +537,9 @@ class NameValidator:
             f"Could not find viable identity after {max_attempts} attempts. "
             f"Returning best attempt with {len(best_attempt[1].blockers)} blockers."
         )
+        # Ensure validated_domain is always set (even if empty)
+        if "validated_domain" not in best_attempt[0]:
+            best_attempt[0]["validated_domain"] = ""
         return best_attempt[0], best_attempt[1]
 
     # ── Internal Helpers ────────────────────────────────────────
