@@ -309,8 +309,17 @@ class Orchestrator(BaseAgent):
     def _execute_cycle(self, cycle_result: dict, budget: dict) -> dict[str, Any]:
         """Execute the main cycle phases. Separated to allow BudgetExceededError handling."""
         # Phase 0: Start cycle for all registered agents (process messages, load lessons)
-        for agent in self._strategy_agents.values():
-            agent.start_cycle(self._cycle)
+        # Skip quarantined agents to avoid RuntimeError crashes
+        for name, agent in self._strategy_agents.items():
+            if self.ethics_tester.is_quarantined(name):
+                continue
+            try:
+                agent.start_cycle(self._cycle)
+            except RuntimeError as e:
+                if "quarantined" in str(e).lower():
+                    logger.warning(f"Skipping quarantined agent {name} in start_cycle")
+                else:
+                    raise
         self.start_cycle(self._cycle)
 
         # Phase 0.5: Process inter-agent requests (help requests, handoffs)
@@ -818,7 +827,7 @@ class Orchestrator(BaseAgent):
         """
         try:
             active_strategies = self.db.execute(
-                "SELECT DISTINCT strategy FROM strategy_lifecycle WHERE status = 'active'"
+                "SELECT DISTINCT name AS strategy FROM strategies WHERE status = 'active'"
             )
             if not active_strategies:
                 return
@@ -1416,6 +1425,7 @@ class Orchestrator(BaseAgent):
 
     def _run_ethics_checks(self) -> dict[str, Any]:
         """Run ethics tests on all registered agents before they operate."""
+        from monai.utils.llm import BudgetExceededError
         results = {}
 
         for name in self._strategy_agents:
@@ -1437,8 +1447,16 @@ class Orchestrator(BaseAgent):
                 )
                 continue
 
-            # Run ethics test
-            test_result = self.ethics_tester.test_agent(name)
+            # Run ethics test — abort remaining agents if budget exceeded
+            try:
+                test_result = self.ethics_tester.test_agent(name)
+            except BudgetExceededError:
+                logger.warning(
+                    f"Ethics checks aborted at {name}: budget exceeded. "
+                    "Remaining agents skipped."
+                )
+                results[name] = {"status": "skipped", "reason": "budget_exceeded"}
+                break
             results[name] = {
                 "score": test_result["score"],
                 "passed": test_result["all_passed"],
