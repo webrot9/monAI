@@ -183,7 +183,22 @@ class Provisioner(BaseAgent):
                               f"{provision_result.get('error', 'unknown')}",
                 }
 
-        # Step 2: Create inbox via API
+        # Step 2: Verify the API key actually works BEFORE creating an inbox
+        key = self.config.comms.mailslurp_api_key
+        if not key:
+            return {"status": "failed", "reason": "No Mailslurp API key available"}
+
+        key_valid = self.email_verifier.verify_mailslurp_key(key)
+        if not key_valid:
+            logger.error("Mailslurp API key is invalid — clearing and failing")
+            self.config.comms.mailslurp_api_key = ""
+            self.config.save()
+            return {
+                "status": "failed",
+                "reason": "Mailslurp API key failed verification (likely hallucinated)",
+            }
+
+        # Step 3: Create inbox via API
         identity = self.identity.get_identity()
         inbox_name = identity.get("name", "monAI")
 
@@ -193,6 +208,18 @@ class Provisioner(BaseAgent):
             return {
                 "status": "failed",
                 "reason": result.get("error", "Mailslurp API error"),
+            }
+
+        # Step 4: Verify the inbox actually exists by reading it back
+        inbox_verified = self.email_verifier.verify_mailslurp_inbox(
+            result["inbox_id"])
+        if not inbox_verified:
+            logger.error(
+                f"Mailslurp inbox {result['inbox_id']} created but "
+                f"verification read-back failed — not storing as primary email")
+            return {
+                "status": "failed",
+                "reason": "Inbox creation claimed success but read-back failed",
             }
 
         self.identity.store_account(
@@ -205,7 +232,7 @@ class Provisioner(BaseAgent):
                 "provider": "mailslurp",
             },
         )
-        logger.info(f"Email provisioned via Mailslurp: {result['address']}")
+        logger.info(f"Email provisioned via Mailslurp (verified): {result['address']}")
         return {"status": "completed", "email": result["address"]}
 
     async def _provision_mailslurp_key(self) -> dict[str, Any]:
@@ -213,6 +240,9 @@ class Provisioner(BaseAgent):
 
         Uses a disposable mail.tm email ONLY for the Mailslurp signup.
         After getting the API key, the temp email can expire — doesn't matter.
+
+        IMPORTANT: The temp email is NEVER stored as the agent's primary email.
+        It is disposable bootstrap infrastructure only.
         """
         # Create throwaway email for Mailslurp signup
         temp = self.email_verifier.create_temp_email()
@@ -294,10 +324,21 @@ class Provisioner(BaseAgent):
 
         api_key = api_key_match.group(1)
 
-        # Store in config (encrypted)
+        # VERIFY the API key before trusting it — the executor could have
+        # hallucinated the key extraction from the Mailslurp dashboard
+        if not self.email_verifier.verify_mailslurp_key(api_key):
+            logger.error(
+                "Extracted API key failed verification — executor likely "
+                "hallucinated the key extraction. NOT storing.")
+            return {
+                "status": "failed",
+                "error": "Extracted Mailslurp API key is invalid (verification failed)",
+            }
+
+        # Store in config (encrypted) — verified to be real
         self.config.comms.mailslurp_api_key = api_key
         self.config.save()
-        logger.info("Mailslurp API key self-provisioned and saved to config")
+        logger.info("Mailslurp API key self-provisioned, VERIFIED, and saved to config")
 
         # Also store the Mailslurp account for reference
         self.identity.store_account(

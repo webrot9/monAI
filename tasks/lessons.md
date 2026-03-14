@@ -198,6 +198,16 @@
   4. Every verification failure is stored as a `hallucination` lesson in SharedMemory for cross-agent learning.
   5. NEVER trust an LLM's word that it completed something. Always verify with external evidence.
 
+### 2026-03-14 - Verify API keys and inboxes before trusting them
+- **Mistake**: The Mailslurp provisioning pipeline stored API keys and created inboxes without verifying they were real. The executor could hallucinate extracting an API key from the dashboard, and the system would store a fake key and try to create inboxes with it. The `monai.xxx@dollicons.com` email was a mail.tm temp address shown as the agent's primary email because the Mailslurp pipeline failed silently.
+- **Root cause**: No verification step between "executor says it found the key" and "system stores the key as truth".
+- **Rules**:
+  1. Every extracted API key MUST be verified via a real API call before storing. `verify_mailslurp_key()` hits `/inboxes` to confirm the key works.
+  2. Every created inbox MUST be verified via read-back. `verify_mailslurp_inbox()` does a GET on the inbox ID to confirm it exists.
+  3. If verification fails, the key/inbox is NOT stored and the pipeline fails cleanly.
+  4. Temp emails (mail.tm) are bootstrap-only and NEVER stored as the agent's primary email.
+  5. Pattern: NEVER trust executor output → always verify with independent API call.
+
 ### 2026-03-14 - Pre-heal form selectors before typing, not after timeout
 - **Mistake**: `smart_fill_form()` tried each selector, waited 30s for timeout, then discovered page elements and asked LLM — per field. For a form with 3 wrong selectors = ~3min of timeouts + 6 LLM calls.
 - **Root cause**: Reactive healing (fix after failure) instead of proactive healing (match before attempting).

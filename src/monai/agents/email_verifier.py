@@ -469,6 +469,57 @@ class EmailVerifier:
             logger.error(f"Mailslurp inbox creation failed: {e}")
             return {"status": "error", "error": str(e)}
 
+    def verify_mailslurp_key(self, api_key: str) -> bool:
+        """Verify a Mailslurp API key is valid by hitting the /inboxes endpoint.
+
+        Returns True if the key works, False otherwise.
+        This prevents hallucinated API keys from poisoning the pipeline.
+        """
+        try:
+            resp = self._http.get(
+                f"{self._MAILSLURP_BASE}/inboxes",
+                headers={"x-api-key": api_key},
+                params={"size": 1},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                logger.info("Mailslurp API key verified successfully")
+                return True
+            logger.warning(
+                f"Mailslurp API key verification failed: HTTP {resp.status_code}")
+            return False
+        except Exception as e:
+            logger.warning(f"Mailslurp API key verification error: {e}")
+            return False
+
+    def verify_mailslurp_inbox(self, inbox_id: str) -> bool:
+        """Verify a Mailslurp inbox exists by reading it back via API.
+
+        This catches the case where create_mailslurp_inbox returned
+        success but the inbox doesn't actually exist (e.g. fake API key).
+        """
+        key = self._mailslurp_key()
+        if not key:
+            return False
+        try:
+            resp = self._http.get(
+                f"{self._MAILSLURP_BASE}/inboxes/{inbox_id}",
+                headers=self._mailslurp_headers(),
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                address = data.get("emailAddress", "")
+                logger.info(
+                    f"Mailslurp inbox verified: {address} ({inbox_id})")
+                return True
+            logger.warning(
+                f"Mailslurp inbox verification failed: HTTP {resp.status_code}")
+            return False
+        except Exception as e:
+            logger.warning(f"Mailslurp inbox verification error: {e}")
+            return False
+
     def mailslurp_wait_for_email(self, inbox_id: str, timeout_ms: int = 60_000,
                                   subject_filter: str = "") -> dict[str, Any]:
         """Wait for an email to arrive in a Mailslurp inbox.
