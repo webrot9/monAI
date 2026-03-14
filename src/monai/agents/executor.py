@@ -625,14 +625,38 @@ class AutonomousExecutor:
             return f"ERROR: {e}"
 
     # ── Dynamic Tool Factory ─────────────────────────────────────
+    #
+    # Security model (defense in depth):
+    # 1. LLM code review — a second LLM call audits the code for risks
+    # 2. Static blocklist — catches obvious dangerous patterns
+    # 3. Subprocess sandbox — code runs in an isolated process via sandbox_run
+    #    (bubblewrap > unshare > plain subprocess, same as shell tool)
+    # 4. Timeout + memory limits — prevents resource exhaustion
+    # 5. No object introspection leaks — subprocess has no access to
+    #    executor internals, DB, browser, or HTTP client
+    #
+    # The old approach (exec with __builtins__={}) was bypassable via
+    # Python introspection (e.g. ().__class__.__mro__[-1].__subclasses__()).
+    # Subprocess isolation is the only real sandbox in Python.
 
-    # Dangerous patterns that custom tools must NOT contain
+    # Patterns that trigger immediate rejection (before LLM review)
     _TOOL_BLOCKLIST = [
-        "import os", "import subprocess", "os.system", "subprocess.",
-        "eval(", "exec(", "__import__", "open(",
-        "shutil.rmtree", "os.remove", "os.unlink",
-        "requests.", "urllib.", "httpx.",  # use executor's proxied http instead
+        "import os", "import subprocess", "import shutil",
+        "os.system", "subprocess.", "shutil.rmtree",
+        "os.remove", "os.unlink", "os.rmdir",
+        "__import__", "__subclasses__", "__mro__",
+        "__class__.__bases__", "__globals__",
+        "eval(", "exec(", "compile(",
+        "open(", "open (",
+        "requests.", "urllib.", "httpx.",
+        "socket.", "import socket",
+        "ctypes.", "import ctypes",
     ]
+
+    # Max size for custom tool code (chars)
+    _MAX_TOOL_CODE_SIZE = 5000
+    # Subprocess timeout for custom tool execution (seconds)
+    _TOOL_EXEC_TIMEOUT = 30
 
     def _load_custom_tools(self) -> None:
         """Load previously created custom tools from the database."""
@@ -651,14 +675,47 @@ class AutonomousExecutor:
         except Exception:
             pass  # Table might not exist yet
 
+    def _llm_review_tool_code(self, name: str, description: str, code: str) -> tuple[bool, str]:
+        """Use a second LLM call to audit custom tool code for security risks.
+
+        Returns (is_safe, reason).
+        """
+        try:
+            review = self.llm.quick(
+                f"SECURITY AUDIT — review this Python code that an AI agent wants "
+                f"to create as a reusable tool.\n\n"
+                f"Tool name: {name}\n"
+                f"Description: {description}\n"
+                f"Code:\n```python\n{code}\n```\n\n"
+                f"Check for:\n"
+                f"1. File system access (read/write/delete)\n"
+                f"2. Network access (HTTP, sockets, DNS)\n"
+                f"3. Process execution (shell, subprocess)\n"
+                f"4. Python sandbox escapes (__class__, __mro__, __subclasses__, "
+                f"__globals__, __builtins__, type(), getattr on dunder attrs)\n"
+                f"5. Privacy violations (accessing credentials, tokens, keys)\n"
+                f"6. Resource exhaustion (infinite loops, huge allocations)\n"
+                f"7. Code injection (eval, exec, compile)\n\n"
+                f"Reply with EXACTLY one line:\n"
+                f"SAFE: <reason> — if the code is safe\n"
+                f"UNSAFE: <reason> — if ANY risk is found\n\n"
+                f"Be paranoid. When in doubt, say UNSAFE.",
+                system="You are a security auditor. Be extremely strict.",
+            )
+            review = review.strip()
+            if review.upper().startswith("SAFE"):
+                return True, review
+            return False, review
+        except Exception as e:
+            # If LLM review fails, reject the code (fail-closed)
+            return False, f"LLM review failed: {e}"
+
     def _handle_create_tool(self, args: dict) -> str:
         """Create a new reusable tool at runtime.
 
-        The tool code must be a pure Python function body that:
-        - Takes a single `args` dict parameter
-        - Returns a string result
-        - Does NOT import dangerous modules or perform I/O directly
-        - Can use self.http_client for HTTP (proxied), self.browser for browsing
+        Security: LLM code review + static blocklist + subprocess sandbox.
+        The tool code is a pure Python script that receives `args` as a JSON
+        string via stdin and must print its result to stdout.
         """
         name = args.get("name", "").strip()
         description = args.get("description", "").strip()
@@ -675,19 +732,28 @@ class AutonomousExecutor:
         ):
             return f"ERROR: invalid or reserved tool name: {name}"
 
-        # Security: block dangerous code patterns
+        if len(code) > self._MAX_TOOL_CODE_SIZE:
+            return f"ERROR: tool code exceeds {self._MAX_TOOL_CODE_SIZE} char limit"
+
+        # Layer 1: Static blocklist (fast, catches obvious stuff)
         code_lower = code.lower()
         for blocked in self._TOOL_BLOCKLIST:
             if blocked.lower() in code_lower:
                 return f"BLOCKED: tool code contains forbidden pattern: {blocked}"
 
-        # Validate the code compiles
+        # Layer 2: Validate the code compiles
         try:
             compile(code, f"<custom_tool:{name}>", "exec")
         except SyntaxError as e:
             return f"ERROR: syntax error in tool code: {e}"
 
-        # Store in registry
+        # Layer 3: LLM security review
+        is_safe, review_reason = self._llm_review_tool_code(name, description, code)
+        if not is_safe:
+            logger.warning(f"Tool '{name}' rejected by LLM review: {review_reason}")
+            return f"BLOCKED by security review: {review_reason}"
+
+        # All checks passed — store
         self._custom_tools[name] = {
             "description": description,
             "code": code,
@@ -720,26 +786,49 @@ class AutonomousExecutor:
         return f"Tool '{name}' created successfully. It is now available for use."
 
     async def _run_custom_tool(self, tool_name: str, args: dict) -> str:
-        """Execute a custom tool in a restricted namespace."""
+        """Execute a custom tool in a sandboxed subprocess.
+
+        The tool code runs as a standalone Python script in an isolated process:
+        - Receives args as JSON via stdin
+        - Prints result to stdout
+        - No access to executor internals, DB, browser, or HTTP client
+        - Killed after _TOOL_EXEC_TIMEOUT seconds
+        - Uses the same sandbox_run infrastructure as the shell tool
+        """
         tool_def = self._custom_tools.get(tool_name)
         if not tool_def:
             return f"ERROR: custom tool '{tool_name}' not found"
 
         code = tool_def["code"]
 
-        # Build restricted namespace — give access to args and safe utilities
-        namespace = {
-            "args": args,
-            "result": "",
-            "json": json,
-            "logger": logger,
-        }
+        # Wrap the tool code in a standalone script that reads args from stdin
+        wrapper = (
+            "import sys, json\n"
+            "args = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}\n"
+            "result = ''\n"
+            f"{code}\n"
+            "print(str(result))\n"
+        )
 
+        # Execute in sandboxed subprocess
         try:
-            exec(code, {"__builtins__": {}}, namespace)
-            return str(namespace.get("result", "Tool executed (no result)"))
+            proc_result = sandbox_run(
+                [sys.executable, "-c", wrapper],
+                timeout=self._TOOL_EXEC_TIMEOUT,
+            )
+            stdout = proc_result.get("stdout", "").strip()
+            stderr = proc_result.get("stderr", "").strip()
+            returncode = proc_result.get("returncode", -1)
+
+            if returncode != 0:
+                error_msg = stderr[:500] if stderr else f"exit code {returncode}"
+                logger.warning(f"Custom tool '{tool_name}' failed: {error_msg}")
+                return f"ERROR: custom tool '{tool_name}' failed: {error_msg}"
+
+            return stdout if stdout else "Tool executed (no output)"
+
         except Exception as e:
-            logger.error(f"Custom tool '{tool_name}' failed: {e}")
+            logger.error(f"Custom tool '{tool_name}' execution error: {e}")
             return f"ERROR: custom tool '{tool_name}' failed: {e}"
 
     def _get_tool_descriptions(self) -> str:
