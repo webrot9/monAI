@@ -97,5 +97,11 @@
 - [x] Experiment results → SharedMemory (knowledge + lessons for cross-agent learning)
 - [x] Total: 1669 tests, all passing
 
+- [x] Self-healing form fill: CAPTCHA auto-solve after click, submit, fill_form in executor
+- [x] Freelance pipeline fix: _write_content saves to disk, _review_content updates status, plan() includes deliver_work
+- [x] Orchestrator strategy auto-retry with exponential backoff for transient failures
+- [x] BrowserLearner CAPTCHA detection after form fill
+- [x] Executor stuck-loop watchdog (aborts on 4 identical non-failing actions)
+
 ## Next Up
 - [ ] First real deployment test (end-to-end with a real Ko-fi page)

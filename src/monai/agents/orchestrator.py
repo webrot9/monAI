@@ -1823,48 +1823,77 @@ class Orchestrator(BaseAgent):
         active_names = {r["name"] for r in active}
         strategy_timeout = 300  # 5 minutes max per strategy
 
+        max_retries = 2  # Retry transient failures up to 2 times
+
         for name, agent in self._strategy_agents.items():
             if name in active_names:
                 # Skip quarantined agents
                 if self.ethics_tester.is_quarantined(name):
                     results[name] = {"status": "quarantined", "reason": "ethics_failure"}
                     continue
-                t0 = datetime.now()
-                try:
-                    # Run with timeout to prevent hung strategies from freezing daemon
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        future = pool.submit(agent.run)
-                        result = future.result(timeout=strategy_timeout)
-                    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
-                    results[name] = {"status": "ok", "result": result}
-                    # Share success insights
-                    agent.share_knowledge(
-                        category="insight",
-                        topic=f"{name}_cycle_result",
-                        content=json.dumps(result, default=str)[:500],
-                        tags=[name, "strategy_result"],
-                    )
-                    # Update task router with success feedback
-                    self.task_router.update_performance(
-                        name, "strategy_execution", True, duration_ms,
-                    )
-                except concurrent.futures.TimeoutError:
-                    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
-                    logger.error(f"Strategy {name} timed out after {strategy_timeout}s")
-                    results[name] = {"status": "timeout", "error": f"Exceeded {strategy_timeout}s"}
-                    self.task_router.update_performance(
-                        name, "strategy_execution", False, duration_ms,
-                    )
-                except Exception as e:
-                    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
-                    logger.error(f"Strategy {name} failed: {e}")
-                    results[name] = {"status": "error", "error": str(e)}
-                    # Auto-learn from failure
-                    agent.learn_from_error(e, context=f"Running strategy {name}")
-                    # Update task router with failure feedback
-                    self.task_router.update_performance(
-                        name, "strategy_execution", False, duration_ms,
-                    )
+
+                last_error = None
+                for attempt in range(1 + max_retries):
+                    t0 = datetime.now()
+                    try:
+                        # Run with timeout to prevent hung strategies from freezing daemon
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            future = pool.submit(agent.run)
+                            result = future.result(timeout=strategy_timeout)
+                        duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+                        results[name] = {"status": "ok", "result": result}
+                        if attempt > 0:
+                            results[name]["retries"] = attempt
+                        # Share success insights
+                        agent.share_knowledge(
+                            category="insight",
+                            topic=f"{name}_cycle_result",
+                            content=json.dumps(result, default=str)[:500],
+                            tags=[name, "strategy_result"],
+                        )
+                        # Update task router with success feedback
+                        self.task_router.update_performance(
+                            name, "strategy_execution", True, duration_ms,
+                        )
+                        last_error = None
+                        break  # Success — no retry needed
+                    except concurrent.futures.TimeoutError:
+                        duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+                        logger.error(f"Strategy {name} timed out after {strategy_timeout}s")
+                        results[name] = {"status": "timeout", "error": f"Exceeded {strategy_timeout}s"}
+                        self.task_router.update_performance(
+                            name, "strategy_execution", False, duration_ms,
+                        )
+                        break  # Timeouts are not retryable
+                    except Exception as e:
+                        duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+                        last_error = e
+                        # Transient errors: retry with backoff
+                        is_transient = any(s in str(e).lower() for s in [
+                            "connection", "timeout", "rate limit", "503", "502",
+                            "429", "temporary", "unavailable",
+                        ])
+                        if is_transient and attempt < max_retries:
+                            import time as _time
+                            backoff = 2 ** (attempt + 1)  # 2s, 4s
+                            logger.warning(
+                                f"Strategy {name} transient failure (attempt {attempt + 1}), "
+                                f"retrying in {backoff}s: {e}"
+                            )
+                            _time.sleep(backoff)
+                            continue
+                        # Non-transient or exhausted retries
+                        logger.error(f"Strategy {name} failed: {e}")
+                        results[name] = {"status": "error", "error": str(e)}
+                        if attempt > 0:
+                            results[name]["retries"] = attempt
+                        # Auto-learn from failure
+                        agent.learn_from_error(e, context=f"Running strategy {name}")
+                        # Update task router with failure feedback
+                        self.task_router.update_performance(
+                            name, "strategy_execution", False, duration_ms,
+                        )
+                        break
 
         # Store results for next cycle's metrics recording
         self._last_strategy_results = results

@@ -212,6 +212,28 @@ class AutonomousExecutor:
                     "result": result_str[:1000],
                 })
 
+                # Watchdog: detect stuck loops (same non-failing tool+args+result 4+ times)
+                # Only fires when the LLM keeps doing the exact same thing with same outcome
+                if len(self.action_history) >= 4 and not is_failure:
+                    last4 = self.action_history[-4:]
+                    sigs = [
+                        (a["tool"], json.dumps(a["args"], sort_keys=True), a["result"][:200])
+                        for a in last4
+                    ]
+                    if len(set(sigs)) == 1:
+                        reason = (
+                            f"Stuck loop: {tool} called 4 times with identical "
+                            f"args and result — aborting to prevent waste"
+                        )
+                        logger.warning(reason)
+                        self._log_task(task, "stuck_loop", reason)
+                        return {
+                            "status": "failed",
+                            "reason": reason,
+                            "steps": step + 1,
+                            "history": self.action_history,
+                        }
+
                 # Check if task is done
                 if tool == "done":
                     self._log_task(task, "completed", result)
@@ -425,7 +447,16 @@ class AutonomousExecutor:
                     if not result.get("success"):
                         return f"ERROR: Click failed: {result.get('error', 'unknown')}"
                     await asyncio.sleep(1)
-                    return await self.browser.get_page_info()
+                    page_info = await self.browser.get_page_info()
+                    # Self-healing: auto-solve CAPTCHA after click
+                    failure = self._learner._detect_failure(page_info)
+                    if failure == "captcha":
+                        logger.info("CAPTCHA detected after click, auto-solving")
+                        captcha_result = await self._learner._handle_captcha(domain)
+                        if captcha_result.get("success"):
+                            await asyncio.sleep(2)
+                            page_info = await self.browser.get_page_info()
+                    return page_info
                 else:
                     await self.browser.click(args.get("selector", ""))
                     await asyncio.sleep(1)
@@ -508,7 +539,18 @@ class AutonomousExecutor:
                     except Exception as e:
                         return f"ERROR: Submit failed: {e}"
                 await asyncio.sleep(2)
-                return await self.browser.get_page_info()
+                # Self-healing: check for CAPTCHA after submit
+                page_info = await self.browser.get_page_info()
+                if self._learner:
+                    failure = self._learner._detect_failure(page_info)
+                    if failure == "captcha":
+                        logger.info("CAPTCHA detected after submit, auto-solving")
+                        captcha_result = await self._learner._handle_captcha(
+                            urlparse(page.url).netloc if hasattr(page, 'url') else "")
+                        if captcha_result.get("success"):
+                            await asyncio.sleep(2)
+                            page_info = await self.browser.get_page_info()
+                return page_info
 
             elif tool == "read_page":
                 return await self.browser.get_text()
