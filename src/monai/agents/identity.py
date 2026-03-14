@@ -55,8 +55,17 @@ class IdentityManager:
         self.config = config
         self.db = db
         self.llm = llm
+        self._validator = None  # Lazy-loaded
         self._init_schema()
         self._ensure_base_identity()
+
+    @property
+    def validator(self):
+        """Lazy-load NameValidator to avoid circular imports."""
+        if self._validator is None:
+            from monai.agents.name_validator import NameValidator
+            self._validator = NameValidator(self.config, self.db, self.llm)
+        return self._validator
 
     def _init_schema(self):
         with self.db.connect() as conn:
@@ -77,12 +86,19 @@ class IdentityManager:
             )
             logger.info(f"Created base identity: {identity['name']}")
 
-    def _generate_identity(self, platform: str = "") -> dict[str, Any]:
-        """Use LLM to generate a professional business identity.
+    def _generate_identity(self, platform: str = "",
+                           validate: bool = True) -> dict[str, Any]:
+        """Generate a professional business identity and validate it.
 
-        Each platform gets a UNIQUE identity to prevent cross-platform
-        correlation.  The base identity is used only as an internal
-        reference.
+        Uses generate → validate → retry loop. If a name is taken,
+        the LLM gets feedback about WHY it failed and generates a
+        different name. Each platform gets a UNIQUE identity to
+        prevent cross-platform correlation.
+
+        Args:
+            platform: Target platform (empty for base identity).
+            validate: Whether to run real-world validation checks.
+                      Set to False only in tests or when offline.
         """
         platform_hint = ""
         if platform:
@@ -93,6 +109,32 @@ class IdentityManager:
                 "description. No overlap."
             )
 
+        if validate:
+            try:
+                # Use the validator's generate-and-validate loop
+                platforms_to_check = [platform] if platform else []
+                identity, validation = self.validator.generate_and_validate(
+                    platforms=platforms_to_check or None,
+                    context=platform_hint,
+                )
+
+                if not validation.overall_viable:
+                    logger.warning(
+                        f"Identity '{identity.get('name')}' has blockers: "
+                        f"{validation.blockers}. Using anyway (best attempt)."
+                    )
+                else:
+                    logger.info(
+                        f"Identity '{identity.get('name')}' validated successfully"
+                    )
+
+                return identity
+            except Exception as e:
+                logger.warning(
+                    f"Validation failed ({e}), falling back to unvalidated generation"
+                )
+
+        # Fallback: generate without validation
         result = self.llm.quick_json(
             "Generate a professional business identity for a digital services company. "
             "The name must be unique and creative — NOT generic like 'Digital Solutions'. "

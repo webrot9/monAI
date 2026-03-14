@@ -442,13 +442,73 @@ class BaseAgent(ABC):
         self.log_action("think_cheap_json", prompt[:200], str(response)[:500])
         return response
 
+    def get_agent_config(self, key: str, default: Any = None) -> Any:
+        """Read a config value set by self-improvement experiments.
+
+        This is how deployed improvements actually change agent behavior.
+        The SelfImprover writes to agent_config, and agents read from it
+        to adjust parameters, prompts, and strategies at runtime.
+        """
+        try:
+            rows = self.db.execute(
+                "SELECT config_value FROM agent_config "
+                "WHERE agent_name = ? AND config_key = ?",
+                (self.name, key),
+            )
+            if rows:
+                val = rows[0]["config_value"]
+                try:
+                    return json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    return val
+        except Exception:
+            pass  # Table may not exist yet
+        return default
+
+    def get_all_agent_config(self) -> dict[str, Any]:
+        """Read all config values set by self-improvement for this agent."""
+        try:
+            rows = self.db.execute(
+                "SELECT config_key, config_value FROM agent_config "
+                "WHERE agent_name = ?",
+                (self.name,),
+            )
+            result = {}
+            for row in rows:
+                try:
+                    result[row["config_key"]] = json.loads(row["config_value"])
+                except (json.JSONDecodeError, TypeError):
+                    result[row["config_key"]] = row["config_value"]
+            return result
+        except Exception:
+            return {}
+
     def _build_system_prompt(self) -> str:
-        """Build system prompt with ethics, identity, role, and learned rules."""
+        """Build system prompt with ethics, identity, role, learned rules,
+        AND deployed self-improvement configs.
+
+        This is the critical link: self-improvement writes to agent_config
+        and lessons → _build_system_prompt reads them → LLM behavior changes.
+        """
         # Ethics are ALWAYS first — non-negotiable
         learned_rules = self.memory.get_rules_for_agent(self.name)
         learned_text = ""
         if learned_rules:
             learned_text = "\n\nLEARNED RULES:\n" + "\n".join(f"- {r}" for r in learned_rules)
+
+        # Read deployed config changes from self-improvement
+        config_text = ""
+        agent_config = self.get_all_agent_config()
+        if agent_config:
+            # Filter out non-prompt configs (parameters are applied directly)
+            prompt_configs = {
+                k: v for k, v in agent_config.items()
+                if isinstance(v, str) and k.startswith(("strategy_", "approach_", "prompt_"))
+            }
+            if prompt_configs:
+                config_text = "\n\nDEPLOYED IMPROVEMENTS:\n" + "\n".join(
+                    f"- {k}: {v}" for k, v in prompt_configs.items()
+                )
 
         return (
             f"{CORE_DIRECTIVES}\n\n"
@@ -459,6 +519,7 @@ class BaseAgent(ABC):
             "You collaborate with other agents — share discoveries and ask for help when needed. "
             "Everything you produce must be HIGH QUALITY — no AI slop, no shortcuts, no filler."
             f"{learned_text}"
+            f"{config_text}"
         )
 
     def _get_context_enrichment(self, prompt: str) -> str:

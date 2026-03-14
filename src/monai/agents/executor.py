@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from monai.agents.asset_aware import AssetManager
 from monai.agents.ethics import CORE_DIRECTIVES, is_action_blocked, requires_risk_check
 from monai.agents.memory import SharedMemory
 from monai.config import Config
@@ -32,8 +33,8 @@ from monai.utils.sandbox import is_path_allowed, safe_read, safe_write, sandbox_
 
 logger = logging.getLogger(__name__)
 
-# Tools the executor can use — described for the LLM
-TOOL_DESCRIPTIONS = """
+# Built-in tools the executor can use — described for the LLM
+BUILTIN_TOOL_DESCRIPTIONS = """
 Available tools:
 1. browse(url) — Navigate to a URL and return page content + interactive elements
 2. click(selector) — Click an element on the page
@@ -51,9 +52,13 @@ Available tools:
 14. run_tests(path) — Run tests for a code file
 15. wait(seconds) — Wait for a specified time
 16. wait_for(selector, timeout) — Wait for an element to appear on the page (timeout in seconds, default 10)
-17. done(result) — Signal task completion with a result
-18. fail(reason) — Signal task failure with a reason
+17. create_tool(name, description, code) — Create a new reusable tool at runtime
+18. done(result) — Signal task completion with a result
+19. fail(reason) — Signal task failure with a reason
 """
+
+# Backward-compat alias
+TOOL_DESCRIPTIONS = BUILTIN_TOOL_DESCRIPTIONS
 
 
 class AutonomousExecutor:
@@ -80,6 +85,10 @@ class AutonomousExecutor:
         self.action_history: list[dict] = []
         self._reflection_count = 0  # Cap reflections per task
         self.memory = SharedMemory(db)
+
+        # Dynamic tool registry — agents can create tools at runtime
+        self._custom_tools: dict[str, dict] = {}
+        self._load_custom_tools()
 
         # Use BrowserLearner (adaptive) instead of raw Browser.
         # Falls back to raw Browser if BrowserLearner can't be created.
@@ -235,6 +244,24 @@ class AutonomousExecutor:
             except Exception as e:
                 logger.warning(f"Error closing HTTP client: {e}")
 
+    def _get_executor_config(self, key: str, default: Any = None) -> Any:
+        """Read executor-specific config from agent_config (set by self-improvement)."""
+        try:
+            rows = self.db.execute(
+                "SELECT config_value FROM agent_config "
+                "WHERE agent_name = 'executor' AND config_key = ?",
+                (key,),
+            )
+            if rows:
+                import json as _json
+                try:
+                    return _json.loads(rows[0]["config_value"])
+                except (json.JSONDecodeError, TypeError):
+                    return rows[0]["config_value"]
+        except Exception:
+            pass
+        return default
+
     def _think(self, task: str, context: str, step: int) -> dict[str, Any]:
         """Use LLM to decide the next action, enriched with learned context."""
         history_summary = ""
@@ -248,13 +275,25 @@ class AutonomousExecutor:
         # Inject learned context: domain playbooks, past failures, lessons
         learned_context = self._get_learned_context(task)
 
+        # Read deployed improvements for executor behavior
+        custom_rules = self._get_executor_config("custom_rules", "")
+        custom_rules_text = f"\nDEPLOYED RULES:\n{custom_rules}\n" if custom_rules else ""
+
+        # Inject asset inventory so the LLM knows what resources are REAL
+        try:
+            asset_context = AssetManager(self.db).get_inventory().to_context() + "\n\n"
+        except Exception:
+            asset_context = ""
+
         prompt = (
             f"TASK: {task}\n\n"
             f"CONTEXT: {context}\n\n"
             f"STEP: {step + 1}/{self.max_steps}\n\n"
             f"PREVIOUS ACTIONS:\n{history_summary or 'None yet'}\n\n"
             f"{learned_context}"
-            f"{TOOL_DESCRIPTIONS}\n\n"
+            f"{asset_context}"
+            f"{custom_rules_text}"
+            f"{self._get_tool_descriptions()}\n\n"
             "Decide the next action. Return JSON: "
             '{"reasoning": "why this action", "tool": "tool_name", "args": {...}}\n\n'
             "CRITICAL RULES:\n"
@@ -264,6 +303,9 @@ class AutonomousExecutor:
             "- read_page/screenshot do NOT count as progress — only use them when genuinely needed\n"
             "- Be efficient. Change strategy when things aren't working."
         )
+
+        # Temperature can be tuned by self-improvement experiments
+        temperature = self._get_executor_config("temperature", 0.3)
 
         response = self.llm.chat_json(
             [
@@ -280,7 +322,7 @@ class AutonomousExecutor:
                 )},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.3,
+            temperature=temperature,
         )
         return response
 
@@ -563,6 +605,9 @@ class AutonomousExecutor:
                 await self.browser.wait_for(selector, timeout=timeout_s * 1000)
                 return f"Element '{selector}' appeared"
 
+            elif tool == "create_tool":
+                return self._handle_create_tool(args)
+
             elif tool == "done":
                 return args.get("result", "Task completed")
 
@@ -570,11 +615,237 @@ class AutonomousExecutor:
                 return args.get("reason", "Task failed")
 
             else:
+                # Try custom tools before giving up
+                if tool in self._custom_tools:
+                    return await self._run_custom_tool(tool, args)
                 return f"Unknown tool: {tool}"
 
         except Exception as e:
             logger.error(f"Tool {tool} failed: {e}")
             return f"ERROR: {e}"
+
+    # ── Dynamic Tool Factory ─────────────────────────────────────
+    #
+    # Security model (defense in depth):
+    # 1. LLM code review — a second LLM call audits the code for risks
+    # 2. Static blocklist — catches obvious dangerous patterns
+    # 3. Subprocess sandbox — code runs in an isolated process via sandbox_run
+    #    (bubblewrap > unshare > plain subprocess, same as shell tool)
+    # 4. Timeout + memory limits — prevents resource exhaustion
+    # 5. No object introspection leaks — subprocess has no access to
+    #    executor internals, DB, browser, or HTTP client
+    #
+    # The old approach (exec with __builtins__={}) was bypassable via
+    # Python introspection (e.g. ().__class__.__mro__[-1].__subclasses__()).
+    # Subprocess isolation is the only real sandbox in Python.
+
+    # Patterns that trigger immediate rejection (before LLM review)
+    _TOOL_BLOCKLIST = [
+        "import os", "import subprocess", "import shutil",
+        "os.system", "subprocess.", "shutil.rmtree",
+        "os.remove", "os.unlink", "os.rmdir",
+        "__import__", "__subclasses__", "__mro__",
+        "__class__.__bases__", "__globals__",
+        "eval(", "exec(", "compile(",
+        "open(", "open (",
+        "requests.", "urllib.", "httpx.",
+        "socket.", "import socket",
+        "ctypes.", "import ctypes",
+    ]
+
+    # Max size for custom tool code (chars)
+    _MAX_TOOL_CODE_SIZE = 5000
+    # Subprocess timeout for custom tool execution (seconds)
+    _TOOL_EXEC_TIMEOUT = 30
+
+    def _load_custom_tools(self) -> None:
+        """Load previously created custom tools from the database."""
+        try:
+            rows = self.db.execute(
+                "SELECT tool_name, description, code, args_schema "
+                "FROM custom_tools WHERE status = 'active'"
+            )
+            for row in rows:
+                r = dict(row)
+                self._custom_tools[r["tool_name"]] = {
+                    "description": r["description"],
+                    "code": r["code"],
+                    "args_schema": r.get("args_schema", ""),
+                }
+        except Exception:
+            pass  # Table might not exist yet
+
+    def _llm_review_tool_code(self, name: str, description: str, code: str) -> tuple[bool, str]:
+        """Use a second LLM call to audit custom tool code for security risks.
+
+        Returns (is_safe, reason).
+        """
+        try:
+            review = self.llm.quick(
+                f"SECURITY AUDIT — review this Python code that an AI agent wants "
+                f"to create as a reusable tool.\n\n"
+                f"Tool name: {name}\n"
+                f"Description: {description}\n"
+                f"Code:\n```python\n{code}\n```\n\n"
+                f"Check for:\n"
+                f"1. File system access (read/write/delete)\n"
+                f"2. Network access (HTTP, sockets, DNS)\n"
+                f"3. Process execution (shell, subprocess)\n"
+                f"4. Python sandbox escapes (__class__, __mro__, __subclasses__, "
+                f"__globals__, __builtins__, type(), getattr on dunder attrs)\n"
+                f"5. Privacy violations (accessing credentials, tokens, keys)\n"
+                f"6. Resource exhaustion (infinite loops, huge allocations)\n"
+                f"7. Code injection (eval, exec, compile)\n\n"
+                f"Reply with EXACTLY one line:\n"
+                f"SAFE: <reason> — if the code is safe\n"
+                f"UNSAFE: <reason> — if ANY risk is found\n\n"
+                f"Be paranoid. When in doubt, say UNSAFE.",
+                system="You are a security auditor. Be extremely strict.",
+            )
+            review = review.strip()
+            if review.upper().startswith("SAFE"):
+                return True, review
+            return False, review
+        except Exception as e:
+            # If LLM review fails, reject the code (fail-closed)
+            return False, f"LLM review failed: {e}"
+
+    def _handle_create_tool(self, args: dict) -> str:
+        """Create a new reusable tool at runtime.
+
+        Security: LLM code review + static blocklist + subprocess sandbox.
+        The tool code is a pure Python script that receives `args` as a JSON
+        string via stdin and must print its result to stdout.
+        """
+        name = args.get("name", "").strip()
+        description = args.get("description", "").strip()
+        code = args.get("code", "").strip()
+
+        if not name or not description or not code:
+            return "ERROR: create_tool requires name, description, and code"
+
+        if not name.isidentifier() or name in (
+            "browse", "click", "type", "screenshot", "fill_form", "submit",
+            "read_page", "http_get", "http_post", "shell", "write_file",
+            "read_file", "write_code", "run_tests", "wait", "wait_for",
+            "done", "fail", "create_tool",
+        ):
+            return f"ERROR: invalid or reserved tool name: {name}"
+
+        if len(code) > self._MAX_TOOL_CODE_SIZE:
+            return f"ERROR: tool code exceeds {self._MAX_TOOL_CODE_SIZE} char limit"
+
+        # Layer 1: Static blocklist (fast, catches obvious stuff)
+        code_lower = code.lower()
+        for blocked in self._TOOL_BLOCKLIST:
+            if blocked.lower() in code_lower:
+                return f"BLOCKED: tool code contains forbidden pattern: {blocked}"
+
+        # Layer 2: Validate the code compiles
+        try:
+            compile(code, f"<custom_tool:{name}>", "exec")
+        except SyntaxError as e:
+            return f"ERROR: syntax error in tool code: {e}"
+
+        # Layer 3: LLM security review
+        is_safe, review_reason = self._llm_review_tool_code(name, description, code)
+        if not is_safe:
+            logger.warning(f"Tool '{name}' rejected by LLM review: {review_reason}")
+            return f"BLOCKED by security review: {review_reason}"
+
+        # All checks passed — store
+        self._custom_tools[name] = {
+            "description": description,
+            "code": code,
+        }
+
+        # Persist to database
+        try:
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS custom_tools ("
+                "  tool_name TEXT PRIMARY KEY,"
+                "  description TEXT NOT NULL,"
+                "  code TEXT NOT NULL,"
+                "  args_schema TEXT DEFAULT '',"
+                "  status TEXT DEFAULT 'active',"
+                "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                ")"
+            )
+            self.db.execute(
+                "INSERT INTO custom_tools (tool_name, description, code) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(tool_name) DO UPDATE "
+                "SET description = excluded.description, "
+                "    code = excluded.code",
+                (name, description, code),
+            )
+        except Exception as e:
+            logger.warning(f"Could not persist custom tool '{name}': {e}")
+
+        logger.info(f"Custom tool created: {name} — {description}")
+        return f"Tool '{name}' created successfully. It is now available for use."
+
+    async def _run_custom_tool(self, tool_name: str, args: dict) -> str:
+        """Execute a custom tool in a sandboxed subprocess.
+
+        The tool code runs as a standalone Python script in an isolated process:
+        - Receives args as JSON via stdin
+        - Prints result to stdout
+        - No access to executor internals, DB, browser, or HTTP client
+        - Killed after _TOOL_EXEC_TIMEOUT seconds
+        - Uses the same sandbox_run infrastructure as the shell tool
+        """
+        tool_def = self._custom_tools.get(tool_name)
+        if not tool_def:
+            return f"ERROR: custom tool '{tool_name}' not found"
+
+        code = tool_def["code"]
+
+        # Wrap the tool code in a standalone script that reads args from stdin
+        wrapper = (
+            "import sys, json\n"
+            "args = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}\n"
+            "result = ''\n"
+            f"{code}\n"
+            "print(str(result))\n"
+        )
+
+        # Execute in sandboxed subprocess
+        try:
+            proc_result = sandbox_run(
+                [sys.executable, "-c", wrapper],
+                timeout=self._TOOL_EXEC_TIMEOUT,
+            )
+            stdout = proc_result.get("stdout", "").strip()
+            stderr = proc_result.get("stderr", "").strip()
+            returncode = proc_result.get("returncode", -1)
+
+            if returncode != 0:
+                error_msg = stderr[:500] if stderr else f"exit code {returncode}"
+                logger.warning(f"Custom tool '{tool_name}' failed: {error_msg}")
+                return f"ERROR: custom tool '{tool_name}' failed: {error_msg}"
+
+            return stdout if stdout else "Tool executed (no output)"
+
+        except Exception as e:
+            logger.error(f"Custom tool '{tool_name}' execution error: {e}")
+            return f"ERROR: custom tool '{tool_name}' failed: {e}"
+
+    def _get_tool_descriptions(self) -> str:
+        """Get full tool descriptions including custom tools."""
+        desc = BUILTIN_TOOL_DESCRIPTIONS
+        if self._custom_tools:
+            custom_lines = []
+            idx = 20  # Start numbering after builtins
+            for name, tool_def in self._custom_tools.items():
+                custom_lines.append(
+                    f"{idx}. {name}(args) — {tool_def['description']}"
+                )
+                idx += 1
+            if custom_lines:
+                desc += "\nCustom tools (created by agent):\n"
+                desc += "\n".join(custom_lines) + "\n"
+        return desc
 
     def _reflect_on_failures(self, task: str, context: str) -> str | None:
         """When hitting repeated failures, pause and analyze what's going wrong.
@@ -625,9 +896,14 @@ class AutonomousExecutor:
             return None
 
     def _post_task_learn(self, task: str, history: list[dict]) -> None:
-        """After task completion/failure, analyze what happened and store lessons.
+        """After task completion/failure, analyze and produce ACTIONABLE changes.
 
-        This is how the executor builds knowledge across tasks.
+        This is how the executor ACTUALLY improves — not just logging lessons,
+        but producing concrete behavioral changes:
+        1. Lessons → stored in SharedMemory → injected into future system prompts
+        2. Domain blocklists → prevent retrying known-broken sites
+        3. Successful patterns → stored as playbooks for future tasks
+        4. Parameter adjustments → written to agent_config for next run
         """
         if not history or len(history) < 3:
             return
@@ -638,7 +914,25 @@ class AutonomousExecutor:
                       and not a["result"].startswith("BLOCKED")]
         failure_rate = len(failures) / len(history) if history else 0
 
-        # Only learn from tasks with significant failures
+        # ── ALWAYS learn from successes too ────────────────────────
+        # Store successful tool sequences as playbooks
+        if not failures and len(successes) >= 3:
+            # Task completed cleanly — record the winning pattern
+            tool_sequence = " → ".join(a["tool"] for a in history if a["tool"] not in ("done", "fail"))
+            self.memory.store_knowledge(
+                category="playbook",
+                topic=f"successful_task_pattern",
+                content=json.dumps({
+                    "task_summary": task[:200],
+                    "tool_sequence": tool_sequence,
+                    "steps": len(history),
+                }),
+                source_agent="executor",
+                confidence=0.8,
+                tags=["playbook", "success"],
+            )
+
+        # Only deep-analyze tasks with significant failures
         if failure_rate < 0.3:
             return
 
@@ -653,7 +947,7 @@ class AutonomousExecutor:
                     failed_domains.add(domain)
 
         # Build failure summary
-        failure_types = {}
+        failure_types: dict[str, int] = {}
         for a in failures:
             result = a["result"][:100]
             failure_types[result] = failure_types.get(result, 0) + 1
@@ -661,22 +955,37 @@ class AutonomousExecutor:
         top_failures = sorted(failure_types.items(), key=lambda x: -x[1])[:3]
         failure_text = "; ".join(f"{msg} (x{n})" for msg, n in top_failures)
 
-        # Use cheap LLM to extract a lesson
+        # ── Extract lesson AND concrete action ─────────────────────
         try:
             lesson_response = self.llm.quick(
                 f"Task: {task[:200]}\n"
                 f"Steps: {len(history)}, Failures: {len(failures)} ({failure_rate:.0%})\n"
                 f"Top failures: {failure_text}\n"
-                f"Failed domains: {', '.join(failed_domains) or 'N/A'}\n\n"
-                "Extract a CONCISE lesson (1 sentence) and a CONCRETE rule "
-                "(1 sentence, actionable) to prevent this in future.\n"
-                "Format: LESSON: ...\nRULE: ...",
-                system="You analyze task execution outcomes and extract actionable lessons.",
+                f"Failed domains: {', '.join(failed_domains) or 'N/A'}\n"
+                f"Successful tools: {', '.join(a['tool'] for a in successes[:5])}\n\n"
+                "Extract:\n"
+                "LESSON: (1 sentence — what went wrong)\n"
+                "RULE: (1 sentence — concrete rule to prevent this)\n"
+                "ACTION: (1 sentence — specific parameter or approach change. "
+                "E.g. 'increase timeout to 30s', 'try API before browser', "
+                "'skip this domain', 'use different selector strategy')\n",
+                system="You analyze task failures and produce actionable improvements.",
             )
 
             # Parse response
-            lesson = lesson_response.split("RULE:")[0].replace("LESSON:", "").strip()
-            rule = lesson_response.split("RULE:")[-1].strip() if "RULE:" in lesson_response else ""
+            parts = lesson_response.split("RULE:")
+            lesson = parts[0].replace("LESSON:", "").strip()
+
+            rule = ""
+            action = ""
+            if len(parts) > 1:
+                rule_and_action = parts[1]
+                if "ACTION:" in rule_and_action:
+                    rule_parts = rule_and_action.split("ACTION:")
+                    rule = rule_parts[0].strip()
+                    action = rule_parts[1].strip()
+                else:
+                    rule = rule_and_action.strip()
 
             if lesson:
                 self.memory.record_lesson(
@@ -688,8 +997,74 @@ class AutonomousExecutor:
                     severity="high" if failure_rate > 0.7 else "medium",
                 )
                 logger.info(f"Post-task lesson stored: {lesson[:100]}")
+
+            # ── Apply concrete action if identified ────────────────
+            if action:
+                self._apply_learned_action(action, failed_domains, failure_rate)
+
         except Exception as e:
             logger.debug(f"Post-task learning failed (non-fatal): {e}")
+
+    def _apply_learned_action(
+        self, action: str, failed_domains: set[str], failure_rate: float
+    ) -> None:
+        """Convert a learned action into a concrete behavioral change.
+
+        This is what makes reflection REAL — not just words in a log,
+        but actual changes to how the executor operates next time.
+        """
+        action_lower = action.lower()
+
+        # Store domain-specific blocklists
+        if failed_domains and ("skip" in action_lower or "avoid" in action_lower
+                                or "block" in action_lower):
+            for domain in failed_domains:
+                self.memory.store_knowledge(
+                    category="warning",
+                    topic=f"domain_blocked:{domain}",
+                    content=f"Domain {domain} should be avoided: {action}",
+                    source_agent="executor",
+                    confidence=0.9,
+                    tags=["domain_block", domain],
+                )
+
+        # Store as an executor-specific rule that gets injected into _think()
+        try:
+            existing_rules = ""
+            try:
+                rows = self.db.execute(
+                    "SELECT config_value FROM agent_config "
+                    "WHERE agent_name = 'executor' AND config_key = 'custom_rules'"
+                )
+                if rows:
+                    existing_rules = rows[0]["config_value"]
+                    try:
+                        existing_rules = json.loads(existing_rules)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            except Exception:
+                pass
+
+            # Append new rule (cap at 10 rules to prevent bloat)
+            if existing_rules:
+                rules_list = existing_rules.split("\n") if isinstance(existing_rules, str) else [existing_rules]
+            else:
+                rules_list = []
+
+            rules_list.append(f"- {action[:200]}")
+            rules_list = rules_list[-10:]  # Keep last 10 rules
+
+            new_rules = "\n".join(rules_list)
+            self.db.execute(
+                "INSERT INTO agent_config (agent_name, config_key, config_value, updated_at) "
+                "VALUES ('executor', 'custom_rules', ?, datetime('now')) "
+                "ON CONFLICT(agent_name, config_key) DO UPDATE "
+                "SET config_value = excluded.config_value, updated_at = excluded.updated_at",
+                (json.dumps(new_rules),),
+            )
+            logger.info(f"Applied learned action to executor config: {action[:100]}")
+        except Exception as e:
+            logger.debug(f"Could not store learned action (non-fatal): {e}")
 
     def _log_task(self, task: str, status: str, result: Any):
         self.db.execute_insert(

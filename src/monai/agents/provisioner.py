@@ -10,7 +10,9 @@ import json
 import logging
 from typing import Any
 
+from monai.agents.asset_aware import AssetManager
 from monai.agents.base import BaseAgent
+from monai.agents.constraint_planner import ConstraintPlanner
 from monai.agents.executor import AutonomousExecutor
 from monai.agents.identity import IdentityManager
 from monai.config import Config
@@ -34,6 +36,7 @@ class Provisioner(BaseAgent):
         super().__init__(config, db, llm)
         self.identity = IdentityManager(config, db, llm)
         self.executor = AutonomousExecutor(config, db, llm)
+        self.constraint_planner = ConstraintPlanner(db, llm)
 
     def plan(self) -> list[str]:
         """Determine what needs to be provisioned."""
@@ -41,10 +44,17 @@ class Provisioner(BaseAgent):
         accounts = self.identity.get_all_accounts()
         resources_cost = self.identity.get_monthly_resource_costs()
 
+        # Include real asset inventory so the LLM knows what actually exists
+        try:
+            asset_inventory = AssetManager(self.db).get_inventory().to_context()
+        except Exception:
+            asset_inventory = ""
+
         context = (
             f"Identity: {json.dumps(identity, default=str)}\n"
             f"Existing accounts: {json.dumps([{'platform': a['platform'], 'type': a['type']} for a in accounts], default=str)}\n"
             f"Monthly resource costs: ${resources_cost:.2f}\n"
+            f"\n{asset_inventory}\n"
         )
 
         plan = self.think_json(
@@ -62,15 +72,45 @@ class Provisioner(BaseAgent):
         return [s["action"] for s in sorted(steps, key=lambda x: x.get("priority", 99))]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
-        """Run provisioning cycle — set up everything needed."""
+        """Run provisioning cycle with constraint-aware planning.
+
+        Uses the ConstraintPlanner to build a dependency graph, then executes
+        steps in topological order — prerequisites first, dependents after.
+        """
         self.log_action("run_start", "Starting provisioning cycle")
 
-        steps = self.plan()
-        results = {}
+        goals = self.plan()
+        graph = self.constraint_planner.plan(goals)
 
-        for step in steps:
-            result = self._execute_provisioning(step)
-            results[step] = result
+        self.log_action("constraint_plan", graph.summary()[:500])
+
+        # Execute in dependency order
+        results = graph_results = {}
+        max_rounds = len(graph.steps) * 2  # safety cap
+
+        for _ in range(max_rounds):
+            ready = graph.get_ready_steps()
+            if not ready:
+                break
+
+            for step in ready:
+                step_result = self._execute_provisioning(step.action)
+                results[step.action] = step_result
+
+                if isinstance(step_result, dict) and step_result.get("status") in (
+                    "completed", "already_registered", "already_exists", "already_have",
+                ):
+                    graph.mark_completed(step.id)
+                elif isinstance(step_result, dict) and step_result.get("status") in (
+                    "failed", "blocked", "skipped",
+                ):
+                    graph.mark_failed(
+                        step.id,
+                        step_result.get("reason", step_result.get("status", "unknown")),
+                    )
+                else:
+                    # Assume success if not explicitly failed
+                    graph.mark_completed(step.id)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results
@@ -124,7 +164,36 @@ class Provisioner(BaseAgent):
         return result
 
     async def register_domain(self, domain: str, registrar: str = "namecheap") -> dict[str, Any]:
-        """Register a domain name."""
+        """Register a domain name — only after validating availability."""
+        # Validate domain before attempting registration
+        try:
+            from monai.agents.name_validator import NameValidator
+            validator = NameValidator(self.config, self.db, self.llm)
+            check = validator.check_domain_whois(domain)
+            validator.close()
+
+            if check.available is False:
+                self.log_action(
+                    "register_domain_blocked",
+                    f"Domain '{domain}' is already taken: {check.details}",
+                )
+                # Ask LLM to suggest alternatives
+                alternatives = self.think_json(
+                    f"The domain '{domain}' is already taken. "
+                    "Suggest 5 alternative domain names that are similar but likely available. "
+                    "Try variations: different TLDs, prefixes, suffixes. "
+                    "Return: {\"alternatives\": [str]}",
+                )
+                alt_list = alternatives.get("alternatives", [])
+                return {
+                    "status": "domain_taken",
+                    "domain": domain,
+                    "details": check.details,
+                    "alternatives": alt_list,
+                }
+        except Exception as e:
+            logger.warning(f"Domain validation failed ({e}), proceeding with registration attempt")
+
         task = (
             f"Register the domain '{domain}' on {registrar}. "
             "Navigate to the registrar, search for the domain, "
@@ -159,6 +228,12 @@ class Provisioner(BaseAgent):
 
     def _execute_provisioning(self, step: str) -> dict[str, Any]:
         """Execute a provisioning step (sync wrapper for async operations)."""
+        # Pre-check: verify assets exist before attempting registration
+        missing = AssetManager(self.db).get_missing_prerequisites(step)
+        if missing:
+            logger.warning(f"Cannot execute '{step}': missing {missing}")
+            return {"status": "blocked", "missing_prerequisites": missing}
+
         if "register" in step.lower() and "platform" in step.lower():
             platform = self.think(
                 f"Extract just the platform name from this step: '{step}'. "
@@ -168,12 +243,30 @@ class Provisioner(BaseAgent):
         elif "email" in step.lower():
             return self._run_async(self.setup_email())
         elif "domain" in step.lower():
+            # Extract or generate a domain, then validate before registering
             domain_name = self.think(
                 f"Extract just the domain name from this step: '{step}'. "
                 "Reply with only the domain name (e.g. 'example.com'). "
-                "If no specific domain is mentioned, generate one that's "
-                "professional and available (e.g. 'nexifydigital.com')."
+                "If no specific domain is mentioned, generate a unique, "
+                "professional name (e.g. 'nexifydigital.com')."
             ).strip().strip("'\"").lower()
+
+            # Validate and find an available domain
+            try:
+                from monai.agents.name_validator import NameValidator
+                validator = NameValidator(self.config, self.db, self.llm)
+                check = validator.check_domain(domain_name)
+                if check.available is False:
+                    # Domain taken — generate and validate a new one
+                    identity, validation = validator.generate_and_validate(
+                        domain_tlds=[".com", ".io", ".co", ".dev"],
+                    )
+                    domain_name = identity.get("validated_domain", domain_name)
+                    logger.info(f"Original domain taken, using validated: {domain_name}")
+                validator.close()
+            except Exception as e:
+                logger.warning(f"Domain validation failed ({e}), using original: {domain_name}")
+
             return self._run_async(self.register_domain(domain_name))
         elif "api" in step.lower():
             return self._run_async(self.acquire_api_key(step))
