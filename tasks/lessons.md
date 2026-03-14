@@ -176,14 +176,17 @@
   4. When hitting 3+ failures mid-task, PAUSE and reflect: ask the LLM to analyze WHY things are failing and suggest a different approach before continuing.
   5. NEVER build new capabilities without wiring them into the components that need them. A feature that isn't connected is the same as no feature.
 
-### 2026-03-14 - Email provisioning must use API, not browser automation
-- **Mistake**: `setup_email()` told the executor to "Create a free email account on Gmail/Outlook/ProtonMail" via browser automation through Tor. Gmail requires phone verification, Outlook has CAPTCHAs, ProtonMail detects bots — ALL fail via Tor. The executor then hallucinated credentials (fake passwords like `SecurePass123!`, non-existent usernames) and looped 12 steps trying each provider.
-- **Root cause**: Tried to browser-automate account creation on platforms that are designed to prevent exactly this. Meanwhile, `mail.tm` API creates working temp emails in <1 second with zero browser needed.
+### 2026-03-14 - Email provisioning must be fully autonomous via API
+- **Mistake 1**: `setup_email()` told the executor to "Create a free email account on Gmail/Outlook/ProtonMail" via browser automation through Tor — always fails (phone verification, CAPTCHAs, bot detection).
+- **Mistake 2**: After fixing to use mail.tm temp emails, was told "creare una temp email è FOLLE!" — temp emails expire, get rejected by platforms.
+- **Mistake 3**: After implementing Mailslurp API, told the user to manually set MAILSLURP_API_KEY — violates the "creator does NOTHING" principle. The only key the creator provides is OpenAI.
+- **Root cause**: Incremental fixes instead of thinking through the full autonomous pipeline end-to-end.
 - **Rules**:
-  1. `setup_email()` must use `create_temp_email()` (mail.tm API) — no browser automation for email creation.
-  2. Platform registrations must include the actual email in the task context — executor must NEVER fabricate credentials.
-  3. The `api_provisioner._get_brand_email()` fallback must never generate fake Gmail addresses — retry mail.tm or raise an error.
-  4. Executor system prompt must explicitly forbid credential fabrication: if no email/password is provided, call `fail()` explaining what's missing.
+  1. `setup_email()` self-provisions Mailslurp API key if missing: temp email (mail.tm) → browser signup on mailslurp.com → extract API key → save to config. The temp email is disposable — only used for this one-time bootstrap.
+  2. After bootstrap, all email creation uses Mailslurp API (persistent, real inboxes).
+  3. The creator provides ZERO keys except OpenAI. Everything else is self-provisioned.
+  4. Platform registrations must include actual credentials — executor must NEVER fabricate any.
+  5. `api_provisioner._get_brand_email()` prefers Mailslurp → mail.tm fallback → error (never fake Gmail).
 
 ### 2026-03-14 - Pre-heal form selectors before typing, not after timeout
 - **Mistake**: `smart_fill_form()` tried each selector, waited 30s for timeout, then discovered page elements and asked LLM — per field. For a form with 3 wrong selectors = ~3min of timeouts + 6 LLM calls.
