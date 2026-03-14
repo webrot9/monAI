@@ -198,6 +198,16 @@
   4. Every verification failure is stored as a `hallucination` lesson in SharedMemory for cross-agent learning.
   5. NEVER trust an LLM's word that it completed something. Always verify with external evidence.
 
+### 2026-03-14 - Verify API keys and inboxes before trusting them
+- **Mistake**: The Mailslurp provisioning pipeline stored API keys and created inboxes without verifying they were real. The executor could hallucinate extracting an API key from the dashboard, and the system would store a fake key and try to create inboxes with it. The `monai.xxx@dollicons.com` email was a mail.tm temp address shown as the agent's primary email because the Mailslurp pipeline failed silently.
+- **Root cause**: No verification step between "executor says it found the key" and "system stores the key as truth".
+- **Rules**:
+  1. Every extracted API key MUST be verified via a real API call before storing. `verify_mailslurp_key()` hits `/inboxes` to confirm the key works.
+  2. Every created inbox MUST be verified via read-back. `verify_mailslurp_inbox()` does a GET on the inbox ID to confirm it exists.
+  3. If verification fails, the key/inbox is NOT stored and the pipeline fails cleanly.
+  4. Temp emails (mail.tm) are bootstrap-only and NEVER stored as the agent's primary email.
+  5. Pattern: NEVER trust executor output → always verify with independent API call.
+
 ### 2026-03-14 - Pre-heal form selectors before typing, not after timeout
 - **Mistake**: `smart_fill_form()` tried each selector, waited 30s for timeout, then discovered page elements and asked LLM — per field. For a form with 3 wrong selectors = ~3min of timeouts + 6 LLM calls.
 - **Root cause**: Reactive healing (fix after failure) instead of proactive healing (match before attempting).
@@ -205,3 +215,18 @@
   1. `smart_fill_form()` must discover page elements UPFRONT and batch-match ALL selectors in a single LLM call BEFORE attempting to type.
   2. One LLM call for N fields, not N calls for N fields.
   3. Only attempt `smart_type()` with already-resolved selectors.
+
+### 2026-03-14 - Pass full step objects, not just action strings
+- **Mistake**: `_execute_provisioning(step.action)` only passed the action string (e.g., "register_platform_account") to the executor. The LLM was then asked to "extract the platform name" from this string and returned "platform" literally.
+- **Root cause**: Data structure not propagated — `ProvisioningStep` has `.platform` field with real names (Upwork, Fiverr) but only `.action` was passed downstream.
+- **Rule**: Always pass the full data object when the callee needs multiple fields. Never ask an LLM to extract info that's already structured in a variable.
+
+### 2026-03-14 - Validate inputs before expensive operations
+- **Mistake**: Domain registration attempted with empty string when name validator returned empty. Empty/invalid domain names wasted an executor cycle.
+- **Root cause**: No guard clause on extracted domain name before passing to `register_domain()`.
+- **Rule**: Always validate extracted/generated values (not empty, correct format) before passing to expensive operations (executor tasks, API calls, browser automation).
+
+### 2026-03-14 - Deduplicate identical failing steps in provisioning loops
+- **Mistake**: Constraint planner generated multiple `register_platform_account` steps (Upwork, Fiverr, etc.) that all failed identically with "Missing platform URL". Each failure wasted an LLM call + executor cycle, creating a doom loop.
+- **Root cause**: No deduplication or early-exit when the same action type fails repeatedly.
+- **Rule**: Track failed action types in provisioning loops. If an action type fails, skip subsequent steps with the same action type in the same cycle instead of retrying them all.
