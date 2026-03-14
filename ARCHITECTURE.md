@@ -221,6 +221,7 @@ The ProductIterator runs every 5 cycles to identify underperformers and trigger 
 | `base.py` | Base agent class with lazy-loaded mixins (coder, executor, identity, provisioner) |
 | `api_provisioner.py` | Autonomous payment provider API key self-provisioning |
 | `captcha_solver.py` | Autonomous CAPTCHA solving for account registration |
+| `proof.py` | Proof-of-completion — catches executor hallucinations by verifying done() claims against DB, action trail, and page state |
 | `email_verifier.py` | Email verification (Mailslurp API primary, IMAP fallback, mail.tm legacy) |
 | `eng_team/` | Engineering team (tech lead + engineers) |
 | `research_team/` | Research team (market, trends, competitors) |

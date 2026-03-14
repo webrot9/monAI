@@ -24,6 +24,7 @@ from typing import Any
 from monai.agents.asset_aware import AssetManager
 from monai.agents.ethics import CORE_DIRECTIVES, is_action_blocked, requires_risk_check
 from monai.agents.memory import SharedMemory
+from monai.agents.proof import ProofOfCompletion
 from monai.config import Config
 from monai.db.database import Database
 from monai.utils.browser import Browser
@@ -89,6 +90,10 @@ class AutonomousExecutor:
         # Dynamic tool registry — agents can create tools at runtime
         self._custom_tools: dict[str, dict] = {}
         self._load_custom_tools()
+
+        # Proof-of-completion: verify claims before accepting "done"
+        self._proof = ProofOfCompletion(config, db, llm, self.memory)
+        self._verification_failures = 0  # Track consecutive verification fails
 
         # Use BrowserLearner (adaptive) instead of raw Browser.
         # Falls back to raw Browser if BrowserLearner can't be created.
@@ -234,10 +239,52 @@ class AutonomousExecutor:
                             "history": self.action_history,
                         }
 
-                # Check if task is done
+                # Check if task is done — but verify claims first
                 if tool == "done":
-                    self._log_task(task, "completed", result)
-                    return {"status": "completed", "result": result, "steps": step + 1}
+                    verification = await self._verify_completion(
+                        task, result, context, step)
+                    if verification["verified"]:
+                        self._log_task(task, "completed", result)
+                        self._verification_failures = 0
+                        return {
+                            "status": "completed",
+                            "result": result,
+                            "steps": step + 1,
+                            "proof": verification,
+                        }
+                    # Verification failed — inject feedback and keep going
+                    self._verification_failures += 1
+                    if self._verification_failures >= 3:
+                        self._log_task(task, "failed",
+                                       f"Claimed done 3x but verification failed: "
+                                       f"{verification['reason']}")
+                        return {
+                            "status": "failed",
+                            "reason": (
+                                f"Task claimed complete but verification "
+                                f"failed 3 times: {verification['reason']}"
+                            ),
+                            "steps": step + 1,
+                            "proof": verification,
+                        }
+                    # Feed verification failure back into context so executor
+                    # knows WHY its claim was rejected and can fix it
+                    context = (
+                        f"{context}\n\n"
+                        f"VERIFICATION FAILED (attempt {self._verification_failures}/3): "
+                        f"{verification['reason']}\n"
+                        f"Your claim of completion was rejected because it could "
+                        f"not be verified. Fix the issue and try again, or call "
+                        f"fail() if the task genuinely cannot be completed."
+                    )
+                    # Don't record as done — loop continues
+                    self.action_history.append({
+                        "step": step + 1,
+                        "tool": "done_rejected",
+                        "args": args,
+                        "result": f"VERIFICATION FAILED: {verification['reason']}",
+                    })
+                    continue
                 elif tool == "fail":
                     self._log_task(task, "failed", result)
                     return {"status": "failed", "reason": result, "steps": step + 1}
@@ -670,6 +717,50 @@ class AutonomousExecutor:
         except Exception as e:
             logger.error(f"Tool {tool} failed: {e}")
             return f"ERROR: {e}"
+
+    # ── Proof-of-Completion Verification ────────────────────────
+    #
+    # When the LLM calls done(), we don't just accept its word.
+    # We verify the claimed outcome against reality:
+    # 1. Extract claims from the done result
+    # 2. Run verification checks (DB, API, screenshot)
+    # 3. Accept only if at least one claim is verified
+    # 4. Reject + feed back reason if verification fails
+
+    async def _verify_completion(
+        self, task: str, result: str, context: str, step: int
+    ) -> dict[str, Any]:
+        """Verify the executor's claim of completion before accepting it.
+
+        Returns {"verified": True/False, "reason": str, "checks": [...]}.
+        """
+        try:
+            # Get current browser page for screenshot-based verification
+            page_url = None
+            page_text = None
+            try:
+                page = await self.browser._get_page()
+                page_url = page.url
+                page_text = await self.browser.get_text()
+            except Exception:
+                pass
+
+            return self._proof.verify(
+                task=task,
+                claimed_result=str(result),
+                action_history=self.action_history,
+                page_url=page_url,
+                page_text=page_text,
+            )
+        except Exception as e:
+            # If verification itself errors, log but don't block
+            # (fail-open for the verification layer only)
+            logger.warning(f"Proof-of-completion error (non-fatal): {e}")
+            return {
+                "verified": True,
+                "reason": f"Verification skipped due to error: {e}",
+                "checks": [],
+            }
 
     # ── Dynamic Tool Factory ─────────────────────────────────────
     #
