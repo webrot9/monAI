@@ -867,10 +867,11 @@ class Orchestrator(BaseAgent):
             # Guard: cap provisioning to 40% of cycle budget so strategies
             # get enough calls.  Provisioning is important but not if it
             # starves all revenue work.
-            calls_before = self.cost_tracker.cycle_calls
-            max_provisioning_calls = int(self.cost_tracker.max_cycle_calls * 0.4)
-            saved_limit = self.cost_tracker.max_cycle_calls
-            self.cost_tracker.max_cycle_calls = calls_before + max_provisioning_calls
+            tracker = get_cost_tracker()
+            calls_before = tracker.cycle_calls
+            max_provisioning_calls = int(tracker.max_cycle_calls * 0.4)
+            saved_limit = tracker.max_cycle_calls
+            tracker.max_cycle_calls = calls_before + max_provisioning_calls
             try:
                 result = self.provisioner.run()
             except BudgetExceededError:
@@ -879,7 +880,7 @@ class Orchestrator(BaseAgent):
                     "budget for strategy execution")
                 result = {"status": "budget_capped"}
             finally:
-                self.cost_tracker.max_cycle_calls = saved_limit
+                tracker.max_cycle_calls = saved_limit
 
         # Bootstrap funding phase check
         bootstrap_phase = self.bootstrap_wallet.get_funding_phase()
@@ -1595,7 +1596,8 @@ class Orchestrator(BaseAgent):
         results = {}
 
         # Skip ethics entirely if budget is low — strategies already ran
-        remaining = self.cost_tracker.max_cycle_calls - self.cost_tracker.cycle_calls
+        tracker = get_cost_tracker()
+        remaining = tracker.max_cycle_calls - tracker.cycle_calls
         if remaining < 30:
             logger.info(
                 f"Ethics checks skipped — only {remaining} calls remaining "
