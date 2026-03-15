@@ -624,6 +624,16 @@ class AutonomousExecutor:
                         return json.dumps(result.get("result", "Script executed"))
                     return f"ERROR: Script failed: {result.get('error', 'unknown')}"
                 else:
+                    # Ethics review before execution — even without BrowserLearner
+                    from monai.agents.ethics import is_script_ethical
+                    is_ethical, reason = is_script_ethical(
+                        script,
+                        context=f"run_page_script (no learner)",
+                        script_type="browser_js",
+                        llm=self.llm,
+                    )
+                    if not is_ethical:
+                        return f"BLOCKED: Script failed ethics review: {reason}"
                     # Fallback: execute directly on page
                     page = await self.browser._get_page()
                     try:
@@ -714,9 +724,18 @@ class AutonomousExecutor:
                 if is_action_blocked(cmd):
                     return "BLOCKED: dangerous command"
                 # Validate command against whitelist — no arbitrary shell execution
-                from monai.agents.ethics import is_shell_command_allowed
+                from monai.agents.ethics import is_shell_command_allowed, is_script_ethical
                 if not is_shell_command_allowed(cmd):
                     return "BLOCKED: command not in allowed list. Only safe commands permitted."
+                # Ethics/legal review of the command intent
+                # (whitelist checks syntax, this checks purpose)
+                is_ok, reason = is_script_ethical(
+                    cmd,
+                    context=f"Shell command in task: {self.action_history[-1]['tool'] if self.action_history else 'start'}",
+                    script_type="custom_tool",  # general-purpose check
+                )
+                if not is_ok:
+                    return f"BLOCKED: command failed ethics/legal review: {reason}"
                 # Parse and execute in OS-level sandbox (namespace isolation +
                 # sanitized env + forced cwd + no shell=True)
                 import shlex
@@ -730,7 +749,24 @@ class AutonomousExecutor:
                 path = args.get("path", "")
                 if not is_path_allowed(path):
                     return f"SANDBOX VIOLATION: Cannot write outside allowed directories"
-                safe_write(path, args.get("content", ""))
+                content = args.get("content", "")
+                # Ethics/legal review for code files
+                if any(path.endswith(ext) for ext in (
+                    ".py", ".js", ".ts", ".sh", ".bash", ".rb", ".php",
+                    ".pl", ".lua", ".go", ".rs", ".java", ".kt",
+                )):
+                    from monai.agents.ethics import is_script_ethical
+                    script_type = "python" if path.endswith(".py") else (
+                        "browser_js" if path.endswith((".js", ".ts")) else "custom_tool"
+                    )
+                    is_ok, reason = is_script_ethical(
+                        content,
+                        context=f"write_file: {path}",
+                        script_type=script_type,
+                    )
+                    if not is_ok:
+                        return f"BLOCKED: file content failed ethics/legal review: {reason}"
+                safe_write(path, content)
                 return f"Written: {path}"
 
             elif tool == "read_file":
@@ -966,12 +1002,23 @@ class AutonomousExecutor:
             "browse", "click", "type", "screenshot", "fill_form", "submit",
             "read_page", "http_get", "http_post", "shell", "write_file",
             "read_file", "write_code", "run_tests", "wait", "wait_for",
-            "done", "fail", "create_tool",
+            "run_page_script", "done", "fail", "create_tool",
         ):
             return f"ERROR: invalid or reserved tool name: {name}"
 
         if len(code) > self._MAX_TOOL_CODE_SIZE:
             return f"ERROR: tool code exceeds {self._MAX_TOOL_CODE_SIZE} char limit"
+
+        # Layer 0: Full ethics review (static + structural + LLM)
+        from monai.agents.ethics import is_script_ethical
+        is_ethical, reason = is_script_ethical(
+            code,
+            context=f"create_tool: {name} — {description}",
+            script_type="custom_tool",
+            llm=self.llm,
+        )
+        if not is_ethical:
+            return f"BLOCKED: tool code failed ethics review: {reason}"
 
         # Layer 1: Static blocklist (fast, catches obvious stuff)
         code_lower = code.lower()
@@ -1089,7 +1136,7 @@ class AutonomousExecutor:
         """When hitting repeated failures, pause and analyze what's going wrong.
 
         Uses a cheap LLM call to reason about the pattern of failures and
-        suggest a fundamentally different approach.
+        suggest a fundamentally different approach — including writing code.
         """
         if not self.action_history:
             return None
@@ -1105,6 +1152,22 @@ class AutonomousExecutor:
             f"- {a['tool']}({json.dumps(a['args'])[:100]}) → {a['result'][:150]}"
             for a in failures[-5:]
         )
+
+        # Detect if failures are browser/DOM related
+        browser_failures = sum(
+            1 for a in failures
+            if a["tool"] in ("click", "type", "fill_form", "submit", "wait_for")
+        )
+        code_hint = ""
+        if browser_failures >= 2:
+            code_hint = (
+                "\n\nCODE-FIRST HINT: Multiple browser interactions have failed. "
+                "Standard tools (click, type, fill_form) use CSS selectors that "
+                "may not match this page's DOM. Consider using run_page_script "
+                "to write custom JavaScript that reads the actual DOM structure "
+                "and interacts with elements directly. You are a CODER — when "
+                "standard tools fail, WRITE CODE to solve the problem."
+            )
 
         try:
             reflection = self.llm.quick(
@@ -1122,10 +1185,25 @@ class AutonomousExecutor:
                 "- wait(seconds): pause execution\n"
                 "- screenshot(name): capture current page state\n"
                 "- read_page(): get page text\n"
-                "- http_get/http_post: direct API calls\n"
+                "- run_page_script(script, args): WRITE AND EXECUTE custom JavaScript "
+                "on the current page. Use this when standard tools fail — read the DOM, "
+                "find elements, fill forms, click buttons, handle React/Vue apps, "
+                "navigate multi-step wizards, extract data. You write the code, "
+                "it runs in the page context.\n"
+                "- http_get/http_post: direct API calls (bypass the browser entirely)\n"
+                "- write_code(spec): generate a full Python module\n"
+                "- create_tool(name, description, code): create a reusable tool\n"
                 "- shell(command): run shell commands\n\n"
-                "Be specific and actionable — reference actual tools above. Max 3 sentences.",
-                system="You analyze task execution failures and suggest alternative strategies using the available tools.",
+                f"{code_hint}\n\n"
+                "Be specific and actionable. If the page DOM is the problem, suggest "
+                "writing code. Max 3 sentences.",
+                system=(
+                    "You analyze task execution failures and suggest alternative "
+                    "strategies. You strongly prefer writing code (run_page_script) "
+                    "over retrying the same failing tools. When browser interactions "
+                    "fail, the solution is almost always to write custom JS that "
+                    "inspects the DOM and handles the page's specific structure."
+                ),
             )
             logger.info(f"Mid-task reflection: {reflection[:200]}")
             return reflection

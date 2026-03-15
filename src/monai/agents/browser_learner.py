@@ -982,14 +982,17 @@ class BrowserLearner:
             # Strip markdown fencing if present
             if script.startswith("```"):
                 script = script.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            # Basic safety check
-            if any(danger in script.lower() for danger in [
-                "fetch(", "xmlhttprequest", "navigator.sendbeacon",
-                "window.location", "document.cookie",
-                "localstorage", "sessionstorage",
-            ]):
+            # Ethics review — every generated script must pass
+            from monai.agents.ethics import is_script_ethical
+            is_ethical, reason = is_script_ethical(
+                script,
+                context=f"Form fill on {domain}: {list(fields.keys())}",
+                script_type="browser_js",
+                llm=self.llm,
+            )
+            if not is_ethical:
                 logger.warning(
-                    "Generated form script contains dangerous patterns, rejecting")
+                    f"Generated form script BLOCKED by ethics review: {reason}")
                 return None
             return script
         except Exception as e:
@@ -1041,27 +1044,31 @@ class BrowserLearner:
             return {"success": False, "error": str(e), "codegen": True}
 
     async def run_page_script(self, script: str, args: dict | None = None) -> dict[str, Any]:
-        """Execute arbitrary Playwright JS on the current page.
+        """Execute Playwright JS on the current page.
 
         This is the public API that the executor's `run_page_script` tool
         calls.  It gives the agent the ability to write code and run it
         against any page, not just forms.
 
-        Safety: scripts run in the browser sandbox (no Node.js access,
-        no file system, no network beyond what the page can do).
+        Every script goes through full ethics review before execution.
         """
         page = await self.browser._get_page()
         domain = urlparse(page.url).netloc
 
-        # Safety check
-        dangerous = [
-            "fetch(", "xmlhttprequest", "navigator.sendbeacon",
-            "window.open", "document.cookie",
-        ]
-        if any(d in script.lower() for d in dangerous):
+        # Full ethics review — not just pattern matching
+        from monai.agents.ethics import is_script_ethical
+        is_ethical, reason = is_script_ethical(
+            script,
+            context=f"run_page_script on {domain} ({page.url})",
+            script_type="browser_js",
+            llm=self.llm,
+        )
+        if not is_ethical:
+            logger.warning(
+                f"run_page_script BLOCKED by ethics review on {domain}: {reason}")
             return {
                 "success": False,
-                "error": "Script contains blocked patterns (no network/cookie access)",
+                "error": f"Script blocked by ethics review: {reason}",
             }
 
         start = time.time()

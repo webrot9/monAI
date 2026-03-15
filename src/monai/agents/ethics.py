@@ -481,3 +481,252 @@ def requires_risk_check(action: str) -> bool:
     """Check if an action requires additional risk assessment."""
     action_lower = action.lower()
     return any(pattern in action_lower for pattern in REQUIRE_APPROVAL_PATTERNS)
+
+
+# ── Script / Generated Code Ethics Review ─────────────────────────
+#
+# Every piece of code the agent generates and executes — browser JS,
+# Playwright scripts, custom tools — MUST pass ethics review.
+# "Runs in a browser sandbox" is NOT sufficient: the agent could still
+# write code that exploits vulnerabilities, steals data, performs
+# unauthorized actions, or violates laws.
+
+# Patterns that are ALWAYS blocked in generated scripts, regardless of context.
+# Organized by violation type: LEGAL first (laws broken), then ETHICAL (harm caused).
+BLOCKED_SCRIPT_PATTERNS = [
+    # ── LEGAL VIOLATIONS ──────────────────────────────────────────
+    #
+    # Computer Fraud & Abuse (CFAA / EU Directive 2013/40/EU)
+    "sqlinjection", "sql injection", "xss", "cross-site",
+    "csrf", "clickjacking",
+    "exploit", "payload", "shellcode", "reverse.shell",
+    "privilege.escalat", "buffer.overflow", "heap.spray",
+    "brute.force", "brute_force", "password.crack",
+    "auth.bypass", "bypass.auth", "token.steal",
+    "session.hijack", "session_hijack",
+    "unauthorized.access", "bypass.security",
+    "vulnerability.scan", "port.scan", "nmap",
+    #
+    # GDPR / ePrivacy (EU Regulation 2016/679)
+    "scrape.email", "scrape.phone", "harvest.email",
+    "harvest.contact", "scrape.private",
+    "collect.personal.data", "extract.user.data",
+    "fingerprint.user", "track.user", "surveillance",
+    "deanonymize", "de-anonymize", "doxx", "dox",
+    "user.profiling", "behavioral.tracking",
+    #
+    # Anti-Spam (CAN-SPAM Act / EU ePrivacy Directive 2002/58/EC)
+    "mass.message", "mass.email", "spam",
+    "bulk.email", "email.bomb", "sms.flood",
+    #
+    # Fraud / Forgery (EU Directive 2001/413/EC)
+    "fake.review", "astroturf", "sock.puppet",
+    "impersonat", "spoof.identity",
+    "fake.login", "clone.page", "mirror.site",
+    "phish", "credential.harvest", "password.steal",
+    "forge.document", "fake.invoice", "fake.receipt",
+    #
+    # Copyright / IP (EU Directive 2019/790)
+    "download.protected", "bypass.drm", "crack.software",
+    "pirate", "warez", "keygen",
+    "scrape.copyrighted", "rip.content",
+    #
+    # Terms of Service circumvention (contractual, can be illegal under CFAA)
+    "bypass.rate.limit", "bypass.ratelimit",
+    "bypass.captcha",  # note: SOLVING captcha is OK, BYPASSING security is not
+    "bypass.paywall", "bypass.restriction",
+    "circumvent.ban", "evade.ban", "ban.evasion",
+    #
+    # ── ETHICAL VIOLATIONS ────────────────────────────────────────
+    #
+    # Keylogging / surveillance
+    "keylog", "keylogger", "screen.capture.covert",
+    "record.without.consent",
+    #
+    # Denial of service
+    "flood", "denial.of.service", "ddos", "dos.attack",
+    "resource.exhaustion",
+    #
+    # Crypto mining / resource abuse
+    "crypto.min", "coinhive", "cryptojack",
+    #
+    # Manipulation / deception
+    "click.fraud", "ad.fraud", "impression.fraud",
+    "vote.manipulat", "poll.manipulat",
+    "price.manipulat", "market.manipulat",
+]
+
+# JS-specific dangerous patterns (beyond the basic fetch/cookie checks)
+BLOCKED_JS_PATTERNS = [
+    # DOM manipulation for phishing/deception
+    "createelement('iframe')",       # hidden iframes for clickjacking
+    "srcdoc",                         # inline iframe content
+    "contenteditable",                # making page editable to fake content
+    # Event manipulation for keylogging (checked as combo in structural analysis)
+    "onkeydown", "onkeyup", "onkeypress",
+    # Form hijacking
+    "form.action",                    # redirecting form submissions
+    "formaction",
+    # Script injection
+    "createelement('script')",        # injecting external scripts
+    "innerhtml.*<script",             # XSS via innerHTML
+    "document.write",                 # legacy injection vector
+    "eval(", "function(",             # dynamic code execution
+    "settimeout(", "setinterval(",    # only when combined with strings (eval-like)
+    # Exfiltration
+    "navigator.sendbeacon",
+    "new image().src",                # pixel tracking / data exfil
+    "new audio().src",
+    "websocket",                      # covert channel
+    "eventsource",                    # SSE-based exfil
+    # Storage theft
+    "localstorage", "sessionstorage",
+    "indexeddb",
+    "document.cookie",
+    # Clipboard hijacking
+    "clipboard", "execcommand('copy",
+    # History/location manipulation
+    "history.pushstate", "history.replacestate",
+    "window.location.replace",        # silent redirects
+]
+
+
+def is_script_ethical(
+    script: str,
+    context: str = "",
+    script_type: str = "browser_js",
+    llm=None,
+) -> tuple[bool, str]:
+    """Review generated code for LEGAL and ETHICAL compliance.
+
+    Every piece of code the agent generates and executes must be:
+    - LEGAL: Compliant with EU law (GDPR, CFAA equiv, ePrivacy, Copyright,
+      Consumer Protection, anti-fraud, anti-spam)
+    - ETHICAL: No harm, no deception, no unauthorized actions, no
+      exploitation, no privacy violations
+    - SAFE FOR CREATOR: Cannot expose the creator to legal liability
+
+    Three layers of defense:
+    1. Static pattern matching — catches known illegal/unethical patterns
+    2. Structural analysis — detects suspicious combos and obfuscation
+    3. LLM review (optional) — deep semantic analysis of legal + ethical intent
+
+    Args:
+        script: The code to review
+        context: What the script is supposed to do (for LLM review)
+        script_type: One of 'browser_js', 'python', 'custom_tool'
+        llm: Optional LLM instance for deep review
+
+    Returns:
+        (is_legal_and_ethical, reason) — reason explains why it was blocked/approved
+    """
+    script_lower = script.lower().replace(" ", "").replace("_", ".")
+    script_readable = script.lower()
+
+    # Layer 1: blocked intent patterns (language-agnostic)
+    for pattern in BLOCKED_SCRIPT_PATTERNS:
+        normalized = pattern.replace(".", "").replace("_", "")
+        if normalized in script_lower.replace(".", "").replace("_", ""):
+            return False, f"Blocked pattern detected: '{pattern}' — violates ethics rules"
+
+    # Layer 2: language-specific dangerous patterns
+    if script_type == "browser_js":
+        for pattern in BLOCKED_JS_PATTERNS:
+            if pattern in script_readable:
+                return False, f"Blocked JS pattern: '{pattern}' — potential security risk"
+
+        # Structural checks for JS — combo patterns (individual parts are
+        # legitimate but together indicate malicious intent)
+        _combo_checks = [
+            # Keylogger: addEventListener + key event capture
+            (["addeventlistener", "key"], "keylogger pattern (addEventListener + key events)"),
+            # XSS via innerHTML with script tags
+            (["innerhtml", "<script"], "XSS pattern (innerHTML + script injection)"),
+            # Data exfiltration: read DOM data + send somewhere
+            (["queryselector", "new image"], "data exfiltration (DOM read + image beacon)"),
+            (["textcontent", "new image"], "data exfiltration (text scrape + image beacon)"),
+            # PII harvesting: selecting multiple elements + collecting emails/phones
+            (["queryselectorall", "mailto:"], "PII harvesting (bulk email scraping) — GDPR violation"),
+            (["queryselectorall", "innertext", "json.stringify"], "bulk data extraction — review for GDPR compliance"),
+        ]
+        for signals, description in _combo_checks:
+            if all(sig in script_readable for sig in signals):
+                return False, f"Blocked combo: {description}"
+
+        # Check for obfuscated eval: atob(), String.fromCharCode(), etc.
+        obfuscation_signals = [
+            "atob(", "btoa(",            # base64 encode/decode
+            "string.fromcharcode",        # char code construction
+            "unescape(",                  # URL decoding to hide strings
+            "\\x", "\\u00",              # hex/unicode escapes (excessive)
+            "charcodeat",
+        ]
+        obfusc_count = sum(
+            1 for sig in obfuscation_signals if sig in script_readable
+        )
+        if obfusc_count >= 2:
+            return False, (
+                f"Script uses {obfusc_count} obfuscation techniques — "
+                f"legitimate code doesn't need to hide its intent"
+            )
+
+    elif script_type in ("python", "custom_tool"):
+        python_dangerous = [
+            "os.system", "subprocess", "shutil.rmtree",
+            "__import__", "__subclasses__", "__mro__",
+            "exec(", "eval(", "compile(",
+            "open(", "importlib",
+            "socket.", "ctypes.",
+            "requests.", "urllib.", "httpx.",
+        ]
+        for pattern in python_dangerous:
+            if pattern in script_readable:
+                return False, f"Blocked Python pattern: '{pattern}'"
+
+    # Layer 3: LLM review (if available) — catches semantic violations
+    # that pattern matching misses
+    if llm is not None:
+        try:
+            review_prompt = (
+                f"LEGAL & ETHICS REVIEW of generated code.\n\n"
+                f"Context: {context}\n"
+                f"Script type: {script_type}\n"
+                f"Code:\n```\n{script[:3000]}\n```\n\n"
+                f"Review this code against BOTH legal and ethical standards.\n\n"
+                f"=== LEGAL COMPLIANCE (EU jurisdiction) ===\n"
+                f"1. CFAA/EU Computer Fraud (Directive 2013/40/EU): Does it access systems "
+                f"without authorization, exploit vulnerabilities, or bypass security measures?\n"
+                f"2. GDPR (Regulation 2016/679): Does it collect, process, or exfiltrate "
+                f"personal data without a legal basis? Does it scrape PII?\n"
+                f"3. ePrivacy (Directive 2002/58/EC): Does it send unsolicited messages, "
+                f"track users, or place tracking mechanisms?\n"
+                f"4. Copyright (Directive 2019/790): Does it copy, download, or scrape "
+                f"copyrighted content without authorization?\n"
+                f"5. Consumer Protection: Does it create fake reviews, manipulate ratings, "
+                f"or engage in deceptive commercial practices?\n"
+                f"6. Terms of Service: Does it circumvent rate limits, bans, paywalls, "
+                f"or other contractual restrictions?\n"
+                f"7. Fraud: Does it forge, impersonate, phish, or create deceptive content?\n\n"
+                f"=== ETHICAL COMPLIANCE ===\n"
+                f"8. HARM: Could this code cause harm to any person or system?\n"
+                f"9. CONSENT: Does it perform actions without user consent?\n"
+                f"10. DECEPTION: Does it deceive, manipulate, or mislead?\n"
+                f"11. CREATOR LIABILITY: Could this expose our creator to legal risk?\n\n"
+                f"Reply with EXACTLY one line:\n"
+                f"SAFE: <one sentence why> OR BLOCKED: <one sentence why, citing the specific law or rule violated>"
+            )
+            response = llm.quick(review_prompt, max_tokens=100)
+            if not isinstance(response, str):
+                # Mock or broken LLM — skip review (static checks above still apply)
+                logger.warning("LLM ethics review returned non-string, skipping")
+            else:
+                response = response.strip()
+                if response.upper().startswith("BLOCKED"):
+                    reason = response.split(":", 1)[-1].strip() if ":" in response else response
+                    return False, f"LLM ethics review: {reason}"
+        except Exception as e:
+            # LLM review failed — log but don't block (fail-open for availability,
+            # but static checks above already caught the obvious stuff)
+            logger.warning(f"LLM ethics review failed (non-fatal): {e}")
+
+    return True, "Passed all ethics checks"

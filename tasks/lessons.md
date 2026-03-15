@@ -354,3 +354,24 @@
   2. Report skipped fields in the result so the executor LLM knows what wasn't filled.
   3. Pre-seed platform playbooks for known signup pages (Gumroad, LemonSqueezy, Stripe, LinkedIn) to avoid first-visit discovery overhead.
   4. "Success" means all FILLABLE fields succeeded, not all REQUESTED fields — skipped fields aren't failures.
+
+### 2026-03-15 - Agent must USE its code-writing ability, not just call tools
+- **Mistake**: The agent had `write_code` and `create_tool` but NEVER used them during actual task execution. When form fills failed, it just retried the same failing selectors instead of writing code to handle the page. The agent was acting as a dumb tool-caller instead of a coder.
+- **Root cause**: The `_think` prompt only listed standard tools and never encouraged code-writing as a problem-solving strategy. The `_reflect_on_failures` didn't suggest writing code either. The agent had no concept of "when tools fail, write code."
+- **Rules**:
+  1. `run_page_script` tool lets the agent write and execute custom JS on any page — use it when standard click/type/fill_form fail.
+  2. `smart_fill_form` now has a code-gen fallback: when standard filling fails, it asks the LLM to write a Playwright script, executes it, and caches it.
+  3. `_reflect_on_failures` now suggests code-writing when browser interactions keep failing.
+  4. The `_think` prompt now includes a "FORM INTERACTION STRATEGY" section pushing code-first approach.
+  5. Pattern: try standard tool → if fails → write code → if works → cache for reuse.
+
+### 2026-03-15 - ALL generated code must pass ethics review, not just sandbox checks
+- **Mistake**: `run_page_script` initially only checked for `fetch()` and `cookie` access patterns. "Runs in browser sandbox" was treated as sufficient safety. But the agent could write JS to exploit XSS, create phishing forms, scrape private data, keylog, etc. — all legal JS that runs in a sandbox.
+- **Root cause**: Conflating "sandboxed execution" with "ethical execution." A sandbox prevents escaping the browser, but doesn't prevent harmful actions WITHIN the browser.
+- **Rules**:
+  1. `is_script_ethical()` in ethics.py reviews ALL generated code with 3 layers: static pattern matching, structural analysis, LLM review.
+  2. Blocked patterns cover: exploitation, phishing, credential theft, keylogging, privacy violations, spam, deception, scraping private data.
+  3. JS-specific checks catch: hidden iframes, form hijacking, script injection, exfiltration via images/audio/websockets, clipboard hijacking.
+  4. Obfuscation detection: if a script uses 2+ encoding techniques (atob, fromCharCode, hex escapes), it's rejected — legit code doesn't hide its intent.
+  5. Every code path that generates+executes code (form scripts, run_page_script, create_tool) goes through `is_script_ethical()`.
+  6. The ethics review includes LLM deep review checking: legality (EU), exploitation, privacy, security, consent, deception, creator liability.

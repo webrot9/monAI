@@ -39,7 +39,9 @@ class Coder:
                         language: str = "python") -> dict[str, Any]:
         """Generate a code module from a specification.
 
+        0. Ethics + legal review of the spec itself
         1. Generate the code
+        1b. Ethics + legal review of the generated code
         2. Generate tests
         3. Run tests
         4. If failures: fix and re-test (up to 3 attempts)
@@ -55,10 +57,36 @@ class Coder:
 
         self._log("generate_start", f"Generating module: {spec[:100]}")
 
+        # Step 0: Ethics/legal review of the spec — catch bad intent early
+        from monai.agents.ethics import is_script_ethical
+        is_ok, reason = is_script_ethical(
+            spec, context=f"Code generation spec: {spec[:200]}",
+            script_type="python", llm=self.llm,
+        )
+        if not is_ok:
+            self._log("ethics_blocked", f"Spec blocked: {reason}")
+            return {
+                "status": "blocked",
+                "reason": f"Code generation blocked by ethics/legal review: {reason}",
+            }
+
         # Step 1: Generate the code
         code_result = self._generate_code(spec, language)
         filename = code_result["filename"]
         code = code_result["code"]
+
+        # Step 1b: Ethics/legal review of the GENERATED code
+        script_type = "python" if language == "python" else "custom_tool"
+        is_ok, reason = is_script_ethical(
+            code, context=f"Generated module for: {spec[:200]}",
+            script_type=script_type, llm=self.llm,
+        )
+        if not is_ok:
+            self._log("ethics_blocked", f"Generated code blocked: {reason}")
+            return {
+                "status": "blocked",
+                "reason": f"Generated code blocked by ethics/legal review: {reason}",
+            }
 
         code_path = target_dir / filename
         code_path.write_text(code)
@@ -93,6 +121,17 @@ class Coder:
 
             if fix.get("fix_code"):
                 code = fix["fix_code"]
+                # Re-check ethics on fixed code
+                is_ok, reason = is_script_ethical(
+                    code, context=f"Fixed code for: {spec[:200]}",
+                    script_type=script_type, llm=self.llm,
+                )
+                if not is_ok:
+                    self._log("ethics_blocked", f"Fixed code blocked: {reason}")
+                    return {
+                        "status": "blocked",
+                        "reason": f"Code fix blocked by ethics/legal review: {reason}",
+                    }
                 code_path.write_text(code)
             if fix.get("fix_tests"):
                 test_code = fix["fix_tests"]
@@ -114,6 +153,19 @@ class Coder:
         target_dir = Path(project_dir) if project_dir else WORKSPACE
         target_dir.mkdir(parents=True, exist_ok=True)
 
+        # Ethics/legal review of the spec
+        from monai.agents.ethics import is_script_ethical
+        is_ok, reason = is_script_ethical(
+            spec, context=f"Script generation: {spec[:200]}",
+            script_type="python", llm=self.llm,
+        )
+        if not is_ok:
+            self._log("ethics_blocked", f"Script spec blocked: {reason}")
+            return {
+                "status": "blocked",
+                "reason": f"Script blocked by ethics/legal review: {reason}",
+            }
+
         code_result = self.llm.chat(
             [
                 {"role": "system", "content": (
@@ -131,6 +183,19 @@ class Coder:
 
         # Clean markdown fences if present
         code = self._clean_code(code_result)
+
+        # Ethics/legal review of the generated code
+        is_ok, reason = is_script_ethical(
+            code, context=f"Generated script: {spec[:200]}",
+            script_type="python", llm=self.llm,
+        )
+        if not is_ok:
+            self._log("ethics_blocked", f"Generated script blocked: {reason}")
+            return {
+                "status": "blocked",
+                "reason": f"Generated script blocked by ethics/legal review: {reason}",
+            }
+
         script_path = target_dir / filename
         script_path.write_text(code)
 
