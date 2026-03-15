@@ -1,5 +1,10 @@
 # Lessons Learned
 
+### 2026-03-15 - Strategies don't learn from failures — they retry the same approach forever
+- **Mistake**: Strategy `run()` methods call step methods directly without tracking outcomes. If `_research_programs()` fails, next cycle calls it again identically. No failure tracking, no adaptation, no alternative approaches attempted.
+- **Root cause**: (1) Steps didn't record success/failure outcomes. (2) No mechanism to detect 3+ consecutive failures and try a different approach. (3) Silent failures (empty results, None) treated as success. (4) `plan()` is hardcoded state machine that never reads failure history.
+- **Rule**: All strategy steps must go through `run_step()` which: records outcomes, detects silent failures, and after 3+ consecutive failures asks the LLM for an alternative approach (adapt/skip/retry). The `get_adaptive_context()` method injects failure history into LLM calls so it doesn't repeat mistakes.
+
 ### 2026-03-15 - 8 of 13 strategies are dead code behind Tor
 - **Mistake**: All 13 strategies ran every cycle, burning €10-15/cycle trying to register on platforms that block Tor (Stripe, Gumroad, Upwork, Fiverr, Udemy, Redbubble, Sedo, social media). 4 cycles = €0 revenue, -€16 API costs.
 - **Root cause**: No pre-check for whether a strategy's required platforms are reachable. Provisioner retries Tor-blocked registrations with TTL expiry, so they come back. No mapping of which strategies need which platforms.

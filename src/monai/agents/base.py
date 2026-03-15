@@ -348,6 +348,88 @@ class BaseAgent(ABC):
         )
         return self.execute_task(task)
 
+    def run_step(self, step: str, fn: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Execute a strategy step with adaptive learning.
+
+        Wraps step execution: records outcomes, detects failures,
+        and on repeated failures asks the LLM for alternative approaches.
+        Strategies call this instead of calling methods directly.
+        """
+        consecutive_fails = self.get_consecutive_step_failures(step)
+
+        # If step has failed 3+ times, ask LLM for alternative approach
+        if consecutive_fails >= 3:
+            past_failures = self.get_step_failures(step, limit=3)
+            failure_summary = "\n".join(
+                f"- {f.get('error', 'unknown')}" for f in past_failures
+            )
+            alternative = self.think_json(
+                f"The step '{step}' in strategy '{self.name}' has failed "
+                f"{consecutive_fails} consecutive times.\n\n"
+                f"Past failure reasons:\n{failure_summary}\n\n"
+                f"Failure context:\n{self.get_adaptive_context()}\n\n"
+                "Should we:\n"
+                "1. Try a DIFFERENT approach to this step (describe it)\n"
+                "2. Skip this step entirely for now\n"
+                "3. Retry with the same approach (only if failures were transient)\n\n"
+                'Return: {"decision": "retry"|"skip"|"adapt", '
+                '"reason": str, "new_approach": str}',
+            )
+            decision = alternative.get("decision", "retry")
+            if decision == "skip":
+                self.log_action(
+                    f"step_{step}_skipped",
+                    f"Skipped after {consecutive_fails} failures: "
+                    f"{alternative.get('reason', '')}",
+                )
+                self.learn(
+                    "adaptation", f"Step '{step}' skipped after {consecutive_fails} failures",
+                    alternative.get("reason", "repeated failures"),
+                    rule=f"Consider alternative approaches for '{step}'",
+                )
+                return {"status": "skipped", "reason": alternative.get("reason", "")}
+            elif decision == "adapt":
+                # Store the new approach as context for the step
+                new_approach = alternative.get("new_approach", "")
+                if new_approach:
+                    self.log_action(
+                        f"step_{step}_adapting",
+                        f"Trying new approach: {new_approach}",
+                    )
+                    kwargs["_adaptive_hint"] = new_approach
+
+        try:
+            result = fn(*args, **kwargs)
+            # Detect silent failures
+            is_empty = (
+                result is None
+                or (isinstance(result, dict) and (
+                    not result
+                    or result.get("status") in ("error", "failed")
+                    or result.get("error")
+                ))
+                or (isinstance(result, list) and len(result) == 0)
+            )
+            if is_empty:
+                error_msg = ""
+                if isinstance(result, dict):
+                    error_msg = result.get("error", result.get("reason", "empty result"))
+                else:
+                    error_msg = "returned empty/None"
+                self.record_step_outcome(step, False, str(error_msg))
+                self.learn_from_silent_failure(
+                    step, result, expected="non-empty successful result",
+                )
+                return result if isinstance(result, dict) else {"status": "failed", "error": error_msg}
+            else:
+                self.record_step_outcome(step, True)
+                return result if isinstance(result, dict) else {"status": "ok", "data": result}
+        except Exception as e:
+            self.record_step_outcome(step, False, str(e))
+            self.learn_from_error(e, context=f"Running step '{step}' in {self.name}")
+            self.log_action(f"step_{step}_error", str(e), result="failed")
+            return {"status": "error", "error": str(e)}
+
     # ── Core Actions ────────────────────────────────────────────
 
     def log_action(self, action: str, details: str = "", result: str = ""):
@@ -652,6 +734,128 @@ class BaseAgent(ABC):
             json.dumps({"task": task, "context": context or {}}, default=str),
             priority=2,
         )
+
+    # ── Adaptive Learning ────────────────────────────────────────
+
+    def record_step_outcome(self, step: str, success: bool,
+                            error_summary: str = "", approach: str = ""):
+        """Record the outcome of a strategy step for adaptive planning.
+
+        Tracks consecutive failures per step so strategies can adapt
+        their approach after repeated failures instead of retrying blindly.
+        """
+        self.db.execute_insert(
+            "INSERT INTO agent_log (agent_name, action, details, result) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                self.name,
+                f"step_{step}",
+                json.dumps({
+                    "step": step,
+                    "approach": approach,
+                    "error": error_summary,
+                }, default=str)[:500],
+                "ok" if success else "failed",
+            ),
+        )
+
+    def get_step_failures(self, step: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Get recent failures for a specific step.
+
+        Returns failure details so the strategy can adapt its approach.
+        """
+        try:
+            rows = self.db.execute(
+                "SELECT details, timestamp FROM agent_log "
+                "WHERE agent_name = ? AND action = ? AND result = 'failed' "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (self.name, f"step_{step}", limit),
+            )
+            results = []
+            for r in rows:
+                try:
+                    d = json.loads(r["details"]) if r["details"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    d = {"raw": r["details"]}
+                d["timestamp"] = r["timestamp"]
+                results.append(d)
+            return results
+        except Exception:
+            return []
+
+    def get_consecutive_step_failures(self, step: str) -> int:
+        """Count consecutive failures for a step (resets on success)."""
+        try:
+            rows = self.db.execute(
+                "SELECT result FROM agent_log "
+                "WHERE agent_name = ? AND action = ? "
+                "ORDER BY timestamp DESC LIMIT 20",
+                (self.name, f"step_{step}"),
+            )
+            count = 0
+            for r in rows:
+                if r["result"] == "failed":
+                    count += 1
+                else:
+                    break
+            return count
+        except Exception:
+            return 0
+
+    def get_adaptive_context(self) -> str:
+        """Generate failure-aware context for LLM planning.
+
+        Strategies inject this into their LLM calls so the model knows
+        what failed before and can suggest different approaches.
+        """
+        parts = []
+
+        # Recent failures for this agent
+        try:
+            failures = self.db.execute(
+                "SELECT action, details, timestamp FROM agent_log "
+                "WHERE agent_name = ? AND result = 'failed' "
+                "ORDER BY timestamp DESC LIMIT 10",
+                (self.name,),
+            )
+            if failures:
+                lines = []
+                for f in failures:
+                    detail = (f["details"] or "")[:150]
+                    lines.append(f"- {f['action']}: {detail}")
+                parts.append(
+                    "YOUR RECENT FAILURES (do NOT repeat the same approach):\n"
+                    + "\n".join(lines)
+                )
+        except Exception:
+            pass
+
+        # Lessons learned by this agent
+        lessons = self.memory.get_lessons(self.name, include_shared=False)
+        if lessons:
+            lines = [
+                f"- {l['lesson']}" + (f" RULE: {l['rule']}" if l.get('rule') else "")
+                for l in lessons[:5]
+            ]
+            parts.append("YOUR LESSONS LEARNED:\n" + "\n".join(lines))
+
+        # Blocked domains (from executor learning)
+        try:
+            blocked = self.db.execute(
+                "SELECT config_key, config_value FROM agent_config "
+                "WHERE agent_name = ? AND config_key LIKE 'blocked_domain_%'",
+                (self.name,),
+            )
+            if blocked:
+                domains = [r["config_value"] for r in blocked]
+                parts.append(
+                    "BLOCKED DOMAINS (do NOT use these — they block Tor/proxy):\n"
+                    + ", ".join(domains)
+                )
+        except Exception:
+            pass
+
+        return "\n\n".join(parts) if parts else ""
 
     # ── Learning ────────────────────────────────────────────────
 
