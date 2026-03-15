@@ -977,7 +977,7 @@ class BrowserLearner:
         )
 
         try:
-            response = self.llm.quick(prompt, max_tokens=2000)
+            response = self.llm.quick(prompt)
             script = response.strip()
             # Strip markdown fencing if present
             if script.startswith("```"):

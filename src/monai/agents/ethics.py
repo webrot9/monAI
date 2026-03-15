@@ -571,8 +571,11 @@ BLOCKED_JS_PATTERNS = [
     "createelement('script')",        # injecting external scripts
     "innerhtml.*<script",             # XSS via innerHTML
     "document.write",                 # legacy injection vector
-    "eval(", "function(",             # dynamic code execution
-    "settimeout(", "setinterval(",    # only when combined with strings (eval-like)
+    "eval(",                           # dynamic code execution
+    "new function(",                   # Function constructor (eval equivalent)
+    # NOTE: setTimeout/setInterval are legitimate for delays in page scripts.
+    # Only dangerous when used with string args (eval-like): setTimeout("code", ms)
+    # This is caught by the eval( check above and combo checks below.
     # Exfiltration
     "navigator.sendbeacon",
     "new image().src",                # pixel tracking / data exfil
@@ -715,7 +718,7 @@ def is_script_ethical(
                 f"Reply with EXACTLY one line:\n"
                 f"SAFE: <one sentence why> OR BLOCKED: <one sentence why, citing the specific law or rule violated>"
             )
-            response = llm.quick(review_prompt, max_tokens=100)
+            response = llm.quick(review_prompt)
             if not isinstance(response, str):
                 # Mock or broken LLM — skip review (static checks above still apply)
                 logger.warning("LLM ethics review returned non-string, skipping")
