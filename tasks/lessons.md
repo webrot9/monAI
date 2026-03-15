@@ -1,5 +1,10 @@
 # Lessons Learned
 
+### 2026-03-15 - Self-healing form fill burns LLM calls on missing fields
+- **Mistake**: When `fill_form` discovers a field doesn't exist on a page, it skips it—but doesn't cache that knowledge. Each retry re-discovers via LLM. Executor also conflates "skipped" (field absent) with "failed" (actual error), causing the LLM to retry with the same missing fields.
+- **Root cause**: (1) `_pre_resolve_selectors` didn't cache `__MISSING__` results. (2) Executor error message didn't distinguish skipped vs failed. (3) Pre-seeded selectors had wrong mappings (e.g., `store_name → #name` on LemonSqueezy).
+- **Rule**: When a field is confirmed missing from a page, cache `__MISSING__` in the playbook so it's instantly skipped next time. Executor must tell the LLM which fields are absent so it stops retrying them. Pre-seeded selectors must use `__MISSING__` for known-absent fields.
+
 ### 2026-03-08 - Use OpenAI APIs, not Claude/Anthropic
 - **Mistake**: Assumed Claude SDK for the AI backbone
 - **Root cause**: Defaulted to Anthropic ecosystem without asking

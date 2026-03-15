@@ -83,23 +83,26 @@ class BrowserLearner:
             # Only email + password on initial signup, NO name field
             "input[name='email']": 'input[type="email"]',
             "input[name='password']": 'input[type="password"]',
+            "input[name='name']": "__MISSING__",
         },
         "gumroad.com": {
             "input[name='email']": 'input[type="email"]',
             "input[name='password']": 'input[type="password"]',
+            "input[name='name']": "__MISSING__",
         },
         "auth.lemonsqueezy.com": {
             # LemonSqueezy uses #name, #email, #password
+            # store_name does NOT exist on the registration page
             "input[name='name']": "#name",
             "input[name='email']": "#email",
             "input[name='password']": "#password",
-            "input[name='store_name']": "#name",
+            "input[name='store_name']": "__MISSING__",
         },
         "app.lemonsqueezy.com": {
             "input[name='name']": "#name",
             "input[name='email']": "#email",
             "input[name='password']": "#password",
-            "input[name='store_name']": "#name",
+            "input[name='store_name']": "__MISSING__",
         },
         "dashboard.stripe.com": {
             "input[name='email']": "#email",
@@ -322,6 +325,10 @@ class BrowserLearner:
                         # LLM explicitly said no element matches this field.
                         # Mark it so we skip filling instead of timing out.
                         resolved_fields[orig] = None
+                        # Cache the "missing" result so future fill_form
+                        # calls skip this field instantly without LLM calls
+                        self._update_playbook_selector(
+                            domain, orig, "__MISSING__")
                         logger.warning(
                             f"Field '{orig}' has NO matching element on "
                             f"{domain} — will skip filling")
@@ -712,7 +719,13 @@ class BrowserLearner:
         for selector in fields:
             # 1. Playbook (previously learned for this domain)
             known = self._get_known_selector(domain, selector)
-            if known:
+            if known == "__MISSING__":
+                # Previously confirmed this field doesn't exist on the page
+                resolved[selector] = None
+                logger.info(
+                    f"Field '{selector}' known missing on {domain} "
+                    f"(cached) — will skip filling")
+            elif known:
                 resolved[selector] = known
             else:
                 resolved[selector] = selector

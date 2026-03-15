@@ -553,11 +553,26 @@ class AutonomousExecutor:
                     from urllib.parse import urlparse
                     domain = urlparse(url).netloc if url else ""
                     result = await self._learner.smart_fill_form(fields, domain=domain)
-                    if not result.get("success"):
-                        failed = [k for k, v in result.get("fields", {}).items()
-                                  if not v.get("success")]
-                        return f"ERROR: Fill form failed on: {', '.join(failed)}"
-                    return f"Filled {len(fields)} fields"
+                    skipped = result.get("skipped_fields", [])
+                    failed = [k for k, v in result.get("fields", {}).items()
+                              if not v.get("success") and not v.get("skipped")]
+                    parts = []
+                    filled_count = len(fields) - len(skipped) - len(failed)
+                    if filled_count > 0:
+                        parts.append(f"Filled {filled_count} fields")
+                    if skipped:
+                        parts.append(
+                            f"Skipped fields not present on page: "
+                            f"{', '.join(skipped)}. "
+                            f"Do NOT include these fields in future fill_form calls"
+                        )
+                    if failed:
+                        parts.append(
+                            f"ERROR: Fill failed on: {', '.join(failed)}"
+                        )
+                    if not result.get("success") and not parts:
+                        return "ERROR: Fill form failed"
+                    return ". ".join(parts)
                 else:
                     await self.browser.fill_form(fields)
                     return f"Filled {len(fields)} fields"
