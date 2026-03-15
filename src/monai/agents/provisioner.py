@@ -155,7 +155,7 @@ class Provisioner(BaseAgent):
             return ""
         lines = ["PAST PROVISIONING FAILURES (do NOT retry these — choose alternatives):"]
         for r in rows:
-            if r.get("permanent"):
+            if r["permanent"]:
                 status = "PERMANENTLY BLOCKED — platform blocks all proxies, NEVER retry"
             elif self._is_provision_blocked(r["action"], r["platform"]):
                 status = "STILL BLOCKED"
