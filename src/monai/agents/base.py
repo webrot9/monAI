@@ -423,6 +423,15 @@ class BaseAgent(ABC):
                 return result if isinstance(result, dict) else {"status": "failed", "error": error_msg}
             else:
                 self.record_step_outcome(step, True)
+                # Share successful discoveries with other strategies
+                if isinstance(result, dict):
+                    summary = json.dumps(result, default=str)[:300]
+                    self.share_knowledge(
+                        category="opportunity",
+                        topic=f"{self.name}_{step}_success",
+                        content=summary,
+                        tags=[self.name, step, "success"],
+                    )
                 return result if isinstance(result, dict) else {"status": "ok", "data": result}
         except Exception as e:
             self.record_step_outcome(step, False, str(e))
@@ -647,6 +656,24 @@ class BaseAgent(ABC):
             )
             parts.append(f"UNREAD MESSAGES:\n{msg_text}")
 
+        # Cross-strategy knowledge — discoveries from other agents
+        try:
+            knowledge = self.memory.query_knowledge(
+                category="opportunity", limit=5,
+            )
+            other_knowledge = [k for k in knowledge if k.get("source_agent") != self.name]
+            if other_knowledge:
+                kn_lines = [
+                    f"- [{k['source_agent']}] {k['topic']}: {k['content'][:120]}"
+                    for k in other_knowledge
+                ]
+                parts.append(
+                    "DISCOVERIES FROM OTHER STRATEGIES (leverage these):\n"
+                    + "\n".join(kn_lines)
+                )
+        except Exception:
+            pass
+
         # Inject recent failures from agent_log so ALL agents see what failed
         try:
             recent_failures = self.db.execute(
@@ -737,6 +764,42 @@ class BaseAgent(ABC):
 
     # ── Adaptive Learning ────────────────────────────────────────
 
+    # Failure classification patterns for root cause tagging
+    _FAILURE_PATTERNS: dict[str, list[str]] = {
+        "tor_blocked": [
+            "proxy", "tor", "blocked", "captcha", "cloudflare",
+            "access denied", "403", "forbidden",
+        ],
+        "rate_limited": [
+            "rate limit", "429", "too many requests", "throttl",
+        ],
+        "timeout": [
+            "timeout", "timed out", "deadline exceeded",
+        ],
+        "auth_required": [
+            "login", "authentication", "unauthorized", "401", "sign in",
+        ],
+        "not_found": [
+            "404", "not found", "no results", "empty",
+        ],
+        "budget_exceeded": [
+            "budget", "cost limit", "BudgetExceeded",
+        ],
+    }
+
+    @classmethod
+    def classify_failure(cls, error_msg: str) -> str:
+        """Classify a failure into a root cause category.
+
+        Returns one of: tor_blocked, rate_limited, timeout, auth_required,
+        not_found, budget_exceeded, or 'unknown'.
+        """
+        lower = error_msg.lower()
+        for category, patterns in cls._FAILURE_PATTERNS.items():
+            if any(p in lower for p in patterns):
+                return category
+        return "unknown"
+
     def record_step_outcome(self, step: str, success: bool,
                             error_summary: str = "", approach: str = ""):
         """Record the outcome of a strategy step for adaptive planning.
@@ -744,6 +807,7 @@ class BaseAgent(ABC):
         Tracks consecutive failures per step so strategies can adapt
         their approach after repeated failures instead of retrying blindly.
         """
+        root_cause = self.classify_failure(error_summary) if not success and error_summary else ""
         self.db.execute_insert(
             "INSERT INTO agent_log (agent_name, action, details, result) "
             "VALUES (?, ?, ?, ?)",
@@ -754,6 +818,7 @@ class BaseAgent(ABC):
                     "step": step,
                     "approach": approach,
                     "error": error_summary,
+                    "root_cause": root_cause,
                 }, default=str)[:500],
                 "ok" if success else "failed",
             ),
@@ -810,19 +875,43 @@ class BaseAgent(ABC):
         """
         parts = []
 
-        # Recent failures for this agent
+        # Recent failures for this agent, grouped by root cause
         try:
             failures = self.db.execute(
                 "SELECT action, details, timestamp FROM agent_log "
                 "WHERE agent_name = ? AND result = 'failed' "
-                "ORDER BY timestamp DESC LIMIT 10",
+                "ORDER BY timestamp DESC LIMIT 15",
                 (self.name,),
             )
             if failures:
-                lines = []
+                # Group by root cause for pattern detection
+                by_cause: dict[str, list[str]] = {}
                 for f in failures:
                     detail = (f["details"] or "")[:150]
-                    lines.append(f"- {f['action']}: {detail}")
+                    try:
+                        d = json.loads(f["details"]) if f["details"] else {}
+                        cause = d.get("root_cause", "unknown")
+                    except (json.JSONDecodeError, TypeError):
+                        cause = "unknown"
+                    by_cause.setdefault(cause, []).append(
+                        f"- {f['action']}: {detail}"
+                    )
+
+                lines = []
+                for cause, items in by_cause.items():
+                    if cause != "unknown":
+                        lines.append(f"  [{cause.upper()}] ({len(items)} failures):")
+                    for item in items[:3]:  # Max 3 per cause
+                        lines.append(f"  {item}")
+
+                systemic = [c for c, items in by_cause.items()
+                            if c in ("tor_blocked", "auth_required") and len(items) >= 2]
+                if systemic:
+                    lines.append(
+                        f"\n  SYSTEMIC ISSUES: {', '.join(systemic)} — "
+                        "use COMPLETELY DIFFERENT approach for these"
+                    )
+
                 parts.append(
                     "YOUR RECENT FAILURES (do NOT repeat the same approach):\n"
                     + "\n".join(lines)

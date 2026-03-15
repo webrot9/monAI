@@ -592,6 +592,11 @@ class Orchestrator(BaseAgent):
                                 f"Strategy '{s['name']}' needs review: "
                                 f"net=€{s['net']:.2f}, 7d_net=€{s['trend_7d']['net']:.2f}")
 
+            # Reallocate budget from paused strategies to active performers
+            if paused:
+                freed = self._reallocate_paused_budget(paused, perf)
+                cycle_result["strategy_performance"]["reallocated"] = freed
+
             # Auto-scale: boost budget for growing strategies
             scaled = self._auto_scale_strategies(perf["strategies_to_scale"])
             cycle_result["strategy_performance"]["scaled"] = len(scaled)
@@ -1179,6 +1184,87 @@ class Orchestrator(BaseAgent):
             )
 
         return scaled
+
+    def _reallocate_paused_budget(
+        self, paused_names: list[str], perf: dict[str, Any],
+    ) -> float:
+        """Redistribute budget from paused strategies to top performers.
+
+        When a strategy is paused, its budget is wasted. This method
+        redistributes it proportionally to active strategies with positive ROI,
+        so capital follows performance.
+        """
+        # Collect budget from paused strategies
+        freed_total = 0.0
+        for name in paused_names:
+            rows = self.db.execute(
+                "SELECT allocated_budget FROM strategies WHERE name = ?",
+                (name,),
+            )
+            if rows and rows[0]["allocated_budget"] > 0:
+                freed = rows[0]["allocated_budget"]
+                self.db.execute(
+                    "UPDATE strategies SET allocated_budget = 0, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE name = ?",
+                    (name,),
+                )
+                freed_total += freed
+
+        if freed_total <= 0:
+            return 0.0
+
+        # Find active strategies with positive ROI to receive the budget
+        recipients = []
+        for s in perf.get("strategies_to_scale", []):
+            if s.get("roi_pct", 0) > 0 and s["name"] not in paused_names:
+                recipients.append(s)
+        # Also include strategies_to_review that have positive ROI
+        for s in perf.get("strategies_to_review", []):
+            if s.get("roi_pct", 0) > 0 and s["name"] not in paused_names:
+                recipients.append(s)
+
+        if not recipients:
+            # No positive-ROI strategies — distribute equally to all active
+            active = self.db.execute(
+                "SELECT name FROM strategies WHERE status = 'active'"
+            )
+            if active:
+                per_strategy = freed_total / len(active)
+                for row in active:
+                    self.db.execute(
+                        "UPDATE strategies SET allocated_budget = "
+                        "allocated_budget + ?, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE name = ?",
+                        (per_strategy, row["name"]),
+                    )
+            self.log_action(
+                "budget_reallocation",
+                f"€{freed_total:.2f} from {len(paused_names)} paused strategies "
+                f"distributed equally to {len(active)} active strategies",
+            )
+            return freed_total
+
+        # Distribute proportionally to ROI
+        total_roi = sum(s.get("roi_pct", 1) for s in recipients)
+        for s in recipients:
+            share = (s.get("roi_pct", 1) / total_roi) * freed_total if total_roi > 0 else freed_total / len(recipients)
+            self.db.execute(
+                "UPDATE strategies SET allocated_budget = "
+                "allocated_budget + ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
+                (share, s["id"]),
+            )
+
+        self.log_action(
+            "budget_reallocation",
+            f"€{freed_total:.2f} from paused [{', '.join(paused_names)}] "
+            f"→ distributed to {len(recipients)} performers by ROI",
+        )
+        self.notify_creator(
+            f"*Budget reallocation:* €{freed_total:.2f} freed from paused strategies "
+            f"→ redistributed to {len(recipients)} top performers"
+        )
+        return freed_total
 
     def _send_financial_reports(self) -> None:
         """Send periodic financial reports to creator via Telegram."""
