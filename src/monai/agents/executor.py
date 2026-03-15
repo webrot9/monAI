@@ -49,7 +49,7 @@ Available tools:
 10. shell(command) — Run a shell command and return output
 11. write_file(path, content) — Write content to a file
 12. read_file(path) — Read a file's content
-13. write_code(spec, filename) — Generate a tested code module from a specification
+13. write_code(spec, language) — YOU ARE A CODER. Generate a full, tested code module from a specification. Use this for: API integrations, data processing, web scrapers, automation scripts, utilities, anything that needs real code. The code is written to disk, tested with pytest, and auto-fixed up to 3x. Returns the working file path. Use this AGGRESSIVELY — don't try to hack together solutions with click/type when a proper script would be better
 14. run_tests(path) — Run tests for a code file
 15. wait(seconds) — Wait for a specified time
 16. wait_for(selector, timeout) — Wait for an element to appear on the page (timeout in seconds, default 10)
@@ -379,11 +379,29 @@ class AutonomousExecutor:
         except Exception:
             asset_context = ""
 
+        # Dynamic nudge: detect when browser tools keep failing and push
+        # the agent toward code-writing
+        code_nudge = ""
+        if self.action_history:
+            recent_browser_fails = sum(
+                1 for a in self.action_history[-6:]
+                if a["tool"] in ("click", "type", "fill_form", "submit", "wait_for")
+                and (a["result"].startswith("ERROR:") or "Timeout" in a["result"])
+            )
+            if recent_browser_fails >= 2:
+                code_nudge = (
+                    "\n⚠️ BROWSER TOOLS ARE FAILING REPEATEDLY. "
+                    "STOP using click/type/fill_form — they don't work on this page. "
+                    "USE run_page_script TO WRITE CUSTOM JS, or write_code TO BUILD "
+                    "A PROPER SOLUTION. You are a coder — act like one.\n\n"
+                )
+
         prompt = (
             f"TASK: {task}\n\n"
             f"CONTEXT: {context}\n\n"
             f"STEP: {step + 1}/{self.max_steps}\n\n"
             f"PREVIOUS ACTIONS:\n{history_summary or 'None yet'}\n\n"
+            f"{code_nudge}"
             f"{learned_context}"
             f"{asset_context}"
             f"{custom_rules_text}"
@@ -399,15 +417,21 @@ class AutonomousExecutor:
             "- NEVER post to example.com or made-up/placeholder URLs — they don't exist\n"
             "- NEVER create accounts on platforms NOT mentioned in the task\n"
             "\n"
-            "FORM INTERACTION STRATEGY:\n"
-            "- fill_form has automatic self-healing and code-gen fallback — try it first\n"
-            "- If fill_form STILL fails: use run_page_script to write custom JS that\n"
-            "  interacts with the DOM directly. Read the page first to understand the\n"
-            "  form structure, then write targeted code.\n"
-            "- For React/Angular/Vue apps: use run_page_script with proper input events\n"
-            "  (dispatchEvent, React's internal setter) — simple .value= won't work.\n"
-            "- For multi-step wizards: write a script that clicks through steps AND fills fields.\n"
-            "- You are a CODER. When standard tools fail, WRITE CODE to solve the problem.\n"
+            "CODE-FIRST STRATEGY — YOU ARE A CODER, NOT JUST A TOOL-CALLER:\n"
+            "- When standard tools (click, type, fill_form) fail 2+ times: STOP retrying.\n"
+            "  Instead, use run_page_script (for browser JS) or write_code (for Python)\n"
+            "  to write a proper solution.\n"
+            "- run_page_script: custom JS on the current page. For DOM interaction,\n"
+            "  React/Vue forms, multi-step wizards, dynamic content extraction.\n"
+            "- write_code: full Python modules. For API integrations, data processing,\n"
+            "  web scraping, automation, file generation, ANYTHING that needs real code.\n"
+            "  The module gets written, tested, and auto-fixed. Use it!\n"
+            "- create_tool: when you solve a problem with code, save it as a reusable\n"
+            "  tool so you don't have to write it again next time.\n"
+            "- http_get/http_post: when you can bypass the browser entirely and hit an\n"
+            "  API directly, DO IT. It's faster and more reliable than browser automation.\n"
+            "- THINK LIKE A DEVELOPER: analyze the problem, read the page/API, write code.\n"
+            "  Don't be a dumb click-bot.\n"
             "- NEVER run diagnostic loops (checking IP, proxy status, SSL) unless the task requires it\n"
             "- STAY ON TASK. If the task is 'register on X', only interact with X — not Y or Z\n"
             "- If the core action is impossible (site blocked, missing credentials), call fail() immediately"
