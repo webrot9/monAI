@@ -85,7 +85,7 @@ class Provisioner(BaseAgent):
         if not rows:
             return False
         # Permanent blocks (proxy-blocked platforms) never expire
-        if rows[0].get("permanent"):
+        if rows[0]["permanent"]:
             return True
         failed_at = rows[0]["failed_at"]
         count = rows[0]["fail_count"]
@@ -121,7 +121,7 @@ class Provisioner(BaseAgent):
         )
         count = (rows[0]["fail_count"] + 1) if rows else 1
         # Once permanent, stays permanent
-        if rows and rows[0].get("permanent"):
+        if rows and rows[0]["permanent"]:
             permanent = 1
         self.db.execute(
             "INSERT INTO provision_failures (action, platform, failed_at, "
