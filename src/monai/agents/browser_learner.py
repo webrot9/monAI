@@ -70,6 +70,69 @@ class BrowserLearner:
         with db.connect() as conn:
             conn.executescript(BROWSER_LEARNER_SCHEMA)
 
+        self._seed_platform_playbooks()
+
+    # ── Pre-seeded playbooks for common platforms ──────────────────
+
+    # Maps domain → {original_selector: actual_selector}.
+    # These are derived from real page inspections and prevent
+    # costly LLM calls + 30s timeouts on first-visit registration.
+    _KNOWN_PLATFORM_SELECTORS: dict[str, dict[str, str]] = {
+        "app.gumroad.com": {
+            # Gumroad signup is React — fields use dynamic :r0: ids
+            # Only email + password on initial signup, NO name field
+            "input[name='email']": 'input[type="email"]',
+            "input[name='password']": 'input[type="password"]',
+        },
+        "gumroad.com": {
+            "input[name='email']": 'input[type="email"]',
+            "input[name='password']": 'input[type="password"]',
+        },
+        "auth.lemonsqueezy.com": {
+            # LemonSqueezy uses #name, #email, #password
+            "input[name='name']": "#name",
+            "input[name='email']": "#email",
+            "input[name='password']": "#password",
+            "input[name='store_name']": "#name",
+        },
+        "app.lemonsqueezy.com": {
+            "input[name='name']": "#name",
+            "input[name='email']": "#email",
+            "input[name='password']": "#password",
+            "input[name='store_name']": "#name",
+        },
+        "dashboard.stripe.com": {
+            "input[name='email']": "#email",
+            "input[name='password']": "#password",
+        },
+        "www.linkedin.com": {
+            # LinkedIn signup — multi-step form
+            "first-name": 'input[name="first-name"]',
+            "last-name": 'input[name="last-name"]',
+            "email-address": "#email-address",
+            "password": "#password",
+        },
+    }
+
+    def _seed_platform_playbooks(self) -> None:
+        """Pre-seed known platform selectors into the playbook database.
+
+        Only inserts if no playbook exists yet for that domain,
+        preserving any learned selectors from previous sessions.
+        """
+        for domain, selectors in self._KNOWN_PLATFORM_SELECTORS.items():
+            existing = self.db.execute(
+                "SELECT known_selectors FROM site_playbooks WHERE domain = ?",
+                (domain,),
+            )
+            if not existing:
+                self.db.execute_insert(
+                    "INSERT INTO site_playbooks (domain, known_selectors) "
+                    "VALUES (?, ?)",
+                    (domain, json.dumps(selectors)),
+                )
+                logger.debug(f"Pre-seeded playbook for {domain}")
+
     async def start(self):
         await self.browser.start()
 
@@ -255,12 +318,30 @@ class BrowserLearner:
                         resolved_fields[orig] = healed
                         logger.info(
                             f"Pre-healed selector: '{orig}' → '{healed}'")
+                    elif healed is None:
+                        # LLM explicitly said no element matches this field.
+                        # Mark it so we skip filling instead of timing out.
+                        resolved_fields[orig] = None
+                        logger.warning(
+                            f"Field '{orig}' has NO matching element on "
+                            f"{domain} — will skip filling")
 
         # --- Fill each field with the resolved selector ---
         for selector, value in fields.items():
-            await self._human_delay(short=True)
-
             effective = resolved_fields.get(selector, selector)
+
+            # Skip fields that don't exist on this page (LLM returned null)
+            if effective is None:
+                results[selector] = {
+                    "success": False,
+                    "skipped": True,
+                    "reason": f"No matching element found on {domain}",
+                }
+                logger.info(
+                    f"Skipping field '{selector}' — not present on {domain}")
+                continue
+
+            await self._human_delay(short=True)
 
             # Handle multi-step forms: if the target element is hidden,
             # try to reveal it (scroll into view, click next/continue)
@@ -279,7 +360,11 @@ class BrowserLearner:
 
             results[selector] = result
 
-        all_ok = all(r.get("success") for r in results.values())
+        # Fields that were skipped (not present on page) don't count as failures
+        filled_results = [r for r in results.values() if not r.get("skipped")]
+        all_ok = bool(filled_results) and all(
+            r.get("success") for r in filled_results
+        )
 
         # Self-healing: check for CAPTCHA after filling form
         if all_ok:
@@ -297,7 +382,16 @@ class BrowserLearner:
             except Exception as e:
                 logger.debug(f"Post-fill CAPTCHA check error: {e}")
 
-        return {"success": all_ok, "fields": results}
+        skipped_fields = [k for k, v in results.items() if v.get("skipped")]
+        result = {"success": all_ok, "fields": results}
+        if skipped_fields:
+            result["skipped_fields"] = skipped_fields
+            result["note"] = (
+                f"Fields {skipped_fields} were skipped because they don't "
+                f"exist on this page. The signup form may not require them, "
+                f"or they may appear on a later step."
+            )
+        return result
 
     # ── Failure Detection ─────────────────────────────────────────
 
@@ -607,13 +701,14 @@ class BrowserLearner:
 
     def _pre_resolve_selectors(
         self, fields: dict[str, str], domain: str
-    ) -> dict[str, str]:
+    ) -> dict[str, str | None]:
         """Fast, local resolution of selectors using playbook + heuristics.
 
         Returns a dict mapping original selector → best-guess selector.
         If no better option is found, the original selector is returned as-is.
+        A value of None means the field was explicitly determined to not exist.
         """
-        resolved: dict[str, str] = {}
+        resolved: dict[str, str | None] = {}
         for selector in fields:
             # 1. Playbook (previously learned for this domain)
             known = self._get_known_selector(domain, selector)

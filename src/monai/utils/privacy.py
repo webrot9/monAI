@@ -131,19 +131,52 @@ class ProxyFallbackChain:
     connection — if all proxies are exhausted the action is aborted.
 
     Thread-safe: all state mutations are guarded by a lock.
+
+    Persistent: blocks are stored in SQLite so they survive restarts.
+    Adaptive TTL: repeated blocks for the same domain escalate the TTL
+    (5min → 30min → 2hr → 12hr → 24hr) to avoid wasting cycles.
     """
 
-    # Blocked entries expire after this many seconds so new tasks
-    # (which get a fresh browser / Tor circuit) can retry domains.
-    BLOCK_TTL_SECONDS = 300  # 5 minutes
+    # Adaptive TTL tiers — each consecutive block on the same domain
+    # escalates to the next tier.
+    BLOCK_TTL_TIERS = [
+        300,     # 5 minutes (first block)
+        1800,    # 30 minutes
+        7200,    # 2 hours
+        43200,   # 12 hours
+        86400,   # 24 hours
+    ]
 
-    def __init__(self, privacy_config: PrivacyConfig):
+    _BLOCK_SCHEMA = """\
+    CREATE TABLE IF NOT EXISTS proxy_blocks (
+        domain TEXT NOT NULL,
+        proxy_type TEXT NOT NULL,
+        blocked_at REAL NOT NULL,
+        block_count INTEGER DEFAULT 1,
+        ttl_seconds INTEGER DEFAULT 300,
+        PRIMARY KEY (domain, proxy_type)
+    );
+    """
+
+    def __init__(self, privacy_config: PrivacyConfig, db=None):
         self._privacy = privacy_config
+        self._db = db
         self._lock = threading.Lock()
         # domain → {proxy_type: timestamp_blocked}
         self._blocked: dict[str, dict[str, float]] = {}
         # domain → proxy type that last succeeded
         self._preferred: dict[str, str] = {}
+        # domain,proxy_type → block count (for adaptive TTL)
+        self._block_counts: dict[tuple[str, str], int] = {}
+
+        # Initialize DB schema and load persisted blocks
+        if self._db:
+            try:
+                with self._db.connect() as conn:
+                    conn.executescript(self._BLOCK_SCHEMA)
+                self._load_persisted_blocks()
+            except Exception as e:
+                logger.warning(f"Failed to load persisted proxy blocks: {e}")
 
     # ── Proxy URL resolution ────────────────────────────────────
 
@@ -207,17 +240,26 @@ class ProxyFallbackChain:
         )
 
     def report_blocked(self, domain: str, proxy_type: str) -> None:
-        """Mark a proxy type as blocked for a domain (with TTL)."""
+        """Mark a proxy type as blocked for a domain (with adaptive TTL)."""
+        now = time.time()
         with self._lock:
             if domain not in self._blocked:
                 self._blocked[domain] = {}
-            self._blocked[domain][proxy_type] = time.time()
+            self._blocked[domain][proxy_type] = now
+            # Increment block count for adaptive TTL
+            key = (domain, proxy_type)
+            self._block_counts[key] = self._block_counts.get(key, 0) + 1
+            count = self._block_counts[key]
+            ttl = self._get_ttl(domain, proxy_type)
             # Clear preferred if it was the one that got blocked
             if self._preferred.get(domain) == proxy_type:
                 del self._preferred[domain]
+        # Persist to DB
+        self._persist_block(domain, proxy_type, now, count, ttl)
         logger.warning(
             f"PROXY FALLBACK: {proxy_type} blocked on {domain} — "
-            f"blocked set: {set(self._blocked[domain].keys())}"
+            f"blocked set: {set(self._blocked[domain].keys())} "
+            f"(block #{count}, TTL: {ttl}s)"
         )
 
     def report_success(self, domain: str, proxy_type: str) -> None:
@@ -252,24 +294,92 @@ class ProxyFallbackChain:
                 "preferred": dict(self._preferred),
             }
 
+    def _get_ttl(self, domain: str, proxy_type: str) -> int:
+        """Get the adaptive TTL for a domain+proxy_type based on block count."""
+        count = self._block_counts.get((domain, proxy_type), 1)
+        tier_idx = min(count - 1, len(self.BLOCK_TTL_TIERS) - 1)
+        return self.BLOCK_TTL_TIERS[tier_idx]
+
     def _expire_blocks(self, domain: str) -> None:
         """Remove expired block entries for a domain. Must hold self._lock."""
         blocks = self._blocked.get(domain)
         if not blocks:
             return
         now = time.time()
-        expired = [
-            ptype for ptype, ts in blocks.items()
-            if now - ts >= self.BLOCK_TTL_SECONDS
-        ]
+        expired = []
+        for ptype, ts in blocks.items():
+            ttl = self._get_ttl(domain, ptype)
+            if now - ts >= ttl:
+                expired.append(ptype)
         for ptype in expired:
+            ttl = self._get_ttl(domain, ptype)
             del blocks[ptype]
             logger.info(
                 f"PROXY FALLBACK: {ptype} block expired for {domain} "
-                f"(after {self.BLOCK_TTL_SECONDS}s TTL)"
+                f"(after {ttl}s TTL, block count: "
+                f"{self._block_counts.get((domain, ptype), 0)})"
             )
         if not blocks:
             del self._blocked[domain]
+
+    # ── Persistence helpers ────────────────────────────────────────
+
+    def _persist_block(self, domain: str, proxy_type: str,
+                       blocked_at: float, count: int, ttl: int) -> None:
+        """Save a block to the database for cross-restart persistence."""
+        if not self._db:
+            return
+        try:
+            self._db.execute(
+                "INSERT INTO proxy_blocks (domain, proxy_type, blocked_at, "
+                "block_count, ttl_seconds) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(domain, proxy_type) DO UPDATE SET "
+                "blocked_at = excluded.blocked_at, "
+                "block_count = excluded.block_count, "
+                "ttl_seconds = excluded.ttl_seconds",
+                (domain, proxy_type, blocked_at, count, ttl),
+            )
+        except Exception as e:
+            logger.debug(f"Failed to persist proxy block: {e}")
+
+    def _load_persisted_blocks(self) -> None:
+        """Load previously persisted blocks from DB on startup."""
+        if not self._db:
+            return
+        try:
+            rows = self._db.execute(
+                "SELECT domain, proxy_type, blocked_at, block_count, "
+                "ttl_seconds FROM proxy_blocks"
+            )
+            now = time.time()
+            loaded = 0
+            for row in rows:
+                domain = row["domain"]
+                ptype = row["proxy_type"]
+                blocked_at = row["blocked_at"]
+                count = row["block_count"]
+                ttl = row["ttl_seconds"]
+
+                # Only load if not yet expired
+                if now - blocked_at < ttl:
+                    if domain not in self._blocked:
+                        self._blocked[domain] = {}
+                    self._blocked[domain][ptype] = blocked_at
+                    self._block_counts[(domain, ptype)] = count
+                    loaded += 1
+                else:
+                    # Clean up expired entries
+                    self._db.execute(
+                        "DELETE FROM proxy_blocks WHERE domain = ? "
+                        "AND proxy_type = ?",
+                        (domain, ptype),
+                    )
+            if loaded:
+                logger.info(
+                    f"Loaded {loaded} persisted proxy blocks from database"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load persisted proxy blocks: {e}")
 
     @staticmethod
     def detect_block_page(page_content: str) -> bool:
@@ -325,7 +435,7 @@ class TorController:
 class NetworkAnonymizer:
     """Central anonymization engine — all network traffic goes through here."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, db=None):
         self.config = config
         self.privacy = config.privacy
         self._lock = threading.Lock()
@@ -333,7 +443,7 @@ class NetworkAnonymizer:
         self._real_ip: str | None = None  # Cached real IP (detected once, then hidden)
         self._tor_controller: TorController | None = None
 
-        self._fallback_chain = ProxyFallbackChain(self.privacy)
+        self._fallback_chain = ProxyFallbackChain(self.privacy, db=db)
 
         if self.privacy.proxy_type == "tor":
             self._tor_controller = TorController(
@@ -629,14 +739,14 @@ _anonymizer: NetworkAnonymizer | None = None
 _anonymizer_lock = threading.Lock()
 
 
-def get_anonymizer(config: Config | None = None) -> NetworkAnonymizer:
+def get_anonymizer(config: Config | None = None, db=None) -> NetworkAnonymizer:
     """Get or create the global anonymizer instance."""
     global _anonymizer
     with _anonymizer_lock:
         if _anonymizer is None:
             if config is None:
                 config = Config.load()
-            _anonymizer = NetworkAnonymizer(config)
+            _anonymizer = NetworkAnonymizer(config, db=db)
         return _anonymizer
 
 

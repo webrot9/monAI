@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from monai.agents.asset_aware import AssetManager
@@ -33,12 +34,78 @@ class Provisioner(BaseAgent):
         "that monAI needs to operate."
     )
 
+    # How long a platform provisioning failure stays "blocked" before retry.
+    # Escalates: 1hr → 6hr → 24hr on repeated failures.
+    _PROVISION_FAIL_TTL_TIERS = [3600, 21600, 86400]
+
+    _PROVISION_FAIL_SCHEMA = """\
+    CREATE TABLE IF NOT EXISTS provision_failures (
+        action TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        failed_at REAL NOT NULL,
+        fail_count INTEGER DEFAULT 1,
+        reason TEXT,
+        PRIMARY KEY (action, platform)
+    );
+    """
+
     def __init__(self, config: Config, db: Database, llm: LLM):
         super().__init__(config, db, llm)
         self.identity = IdentityManager(config, db, llm)
         self.executor = AutonomousExecutor(config, db, llm)
         self.constraint_planner = ConstraintPlanner(db, llm)
         self.email_verifier = EmailVerifier(config, db)
+
+        with db.connect() as conn:
+            conn.executescript(self._PROVISION_FAIL_SCHEMA)
+
+    def _is_provision_blocked(self, action: str, platform: str) -> bool:
+        """Check if a provisioning action is still blocked from a past failure."""
+        rows = self.db.execute(
+            "SELECT failed_at, fail_count FROM provision_failures "
+            "WHERE action = ? AND platform = ?",
+            (action, platform),
+        )
+        if not rows:
+            return False
+        failed_at = rows[0]["failed_at"]
+        count = rows[0]["fail_count"]
+        tier = min(count - 1, len(self._PROVISION_FAIL_TTL_TIERS) - 1)
+        ttl = self._PROVISION_FAIL_TTL_TIERS[tier]
+        if time.time() - failed_at < ttl:
+            return True
+        # TTL expired — clean up
+        self.db.execute(
+            "DELETE FROM provision_failures WHERE action = ? AND platform = ?",
+            (action, platform),
+        )
+        return False
+
+    def _record_provision_failure(self, action: str, platform: str,
+                                  reason: str = "") -> None:
+        """Record a provisioning failure with escalating TTL."""
+        now = time.time()
+        rows = self.db.execute(
+            "SELECT fail_count FROM provision_failures "
+            "WHERE action = ? AND platform = ?",
+            (action, platform),
+        )
+        count = (rows[0]["fail_count"] + 1) if rows else 1
+        self.db.execute(
+            "INSERT INTO provision_failures (action, platform, failed_at, "
+            "fail_count, reason) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(action, platform) DO UPDATE SET "
+            "failed_at = excluded.failed_at, "
+            "fail_count = excluded.fail_count, "
+            "reason = excluded.reason",
+            (action, platform, now, count, reason[:500]),
+        )
+        tier = min(count - 1, len(self._PROVISION_FAIL_TTL_TIERS) - 1)
+        ttl = self._PROVISION_FAIL_TTL_TIERS[tier]
+        logger.info(
+            f"Provisioning failure #{count} for {action}:{platform} — "
+            f"blocked for {ttl}s"
+        )
 
     def plan(self) -> list[str]:
         """Determine what needs to be provisioned."""
@@ -88,7 +155,7 @@ class Provisioner(BaseAgent):
 
         # Execute in dependency order
         results = graph_results = {}
-        failed_actions: set[str] = set()  # Track failed action types to avoid retrying identical steps
+        failed_actions: set[str] = set()  # Track failed action types this cycle
         max_rounds = len(graph.steps) * 2  # safety cap
 
         for _ in range(max_rounds):
@@ -97,17 +164,28 @@ class Provisioner(BaseAgent):
                 break
 
             for step in ready:
-                # Dedup: skip steps whose action already failed (prevents doom loops
-                # where multiple register_platform_account steps all fail identically)
+                platform = step.platform or ""
+
+                # Check persistent failure history (cross-cycle persistence)
+                if platform and self._is_provision_blocked(step.action, platform):
+                    logger.info(
+                        f"Skipping '{step.action}' for {platform} — "
+                        f"still blocked from previous failure (persistent)")
+                    graph.mark_failed(step.id,
+                                      f"Blocked: {step.action} on {platform} "
+                                      f"failed recently, waiting for TTL")
+                    continue
+
+                # Dedup: skip steps whose action already failed THIS cycle
                 if step.action in failed_actions:
                     logger.info(
-                        f"Skipping '{step.action}' for {step.platform} — "
+                        f"Skipping '{step.action}' for {platform} — "
                         f"same action type already failed this cycle")
                     graph.mark_failed(step.id, f"Skipped: {step.action} already failed")
                     continue
 
                 step_result = self._execute_provisioning(step)
-                results[f"{step.action}:{step.platform}"] = step_result
+                results[f"{step.action}:{platform}"] = step_result
 
                 if isinstance(step_result, dict) and step_result.get("status") in (
                     "completed", "already_registered", "already_exists", "already_have",
@@ -116,11 +194,14 @@ class Provisioner(BaseAgent):
                 elif isinstance(step_result, dict) and step_result.get("status") in (
                     "failed", "blocked", "skipped",
                 ):
-                    graph.mark_failed(
-                        step.id,
-                        step_result.get("reason", step_result.get("status", "unknown")),
-                    )
+                    reason = step_result.get("reason", step_result.get("status", "unknown"))
+                    graph.mark_failed(step.id, reason)
                     failed_actions.add(step.action)
+                    # Persist failure for cross-cycle learning
+                    if platform:
+                        self._record_provision_failure(
+                            step.action, platform, reason
+                        )
                 else:
                     # Assume success if not explicitly failed
                     graph.mark_completed(step.id)

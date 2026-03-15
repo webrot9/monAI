@@ -150,7 +150,7 @@ class Orchestrator(BaseAgent):
 
         # Startup anonymity verification — refuse to run if proxy is required but broken
         if config.privacy.proxy_type != "none" and getattr(config.privacy, "verify_anonymity", True):
-            anonymizer = get_anonymizer(config)
+            anonymizer = get_anonymizer(config, db=db)
             try:
                 anon_status = anonymizer.startup_check()
                 if not anon_status.get("anonymous"):
