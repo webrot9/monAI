@@ -554,6 +554,30 @@ class BaseAgent(ABC):
             )
             parts.append(f"UNREAD MESSAGES:\n{msg_text}")
 
+        # Inject recent failures from agent_log so ALL agents see what failed
+        try:
+            recent_failures = self.db.execute(
+                "SELECT agent_name, action, details, timestamp FROM agent_log "
+                "WHERE (result = 'failed' OR action LIKE '%fail%' "
+                "OR action LIKE '%error%' OR action LIKE '%FAILED%' "
+                "OR details LIKE '%\"status\": \"failed\"%' "
+                "OR details LIKE '%\"status\": \"error\"%') "
+                "ORDER BY timestamp DESC LIMIT 10"
+            )
+            if recent_failures:
+                fail_lines = []
+                for f in recent_failures:
+                    details = (f["details"] or "")[:120]
+                    fail_lines.append(
+                        f"- [{f['agent_name']}] {f['action']}: {details}"
+                    )
+                parts.append(
+                    "RECENT FAILURES (do NOT repeat these — adapt your approach):\n"
+                    + "\n".join(fail_lines)
+                )
+        except Exception:
+            pass  # agent_log table might not exist yet
+
         return "\n\n".join(parts) if parts else ""
 
     # ── Collaboration ───────────────────────────────────────────

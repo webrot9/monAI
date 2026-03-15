@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -20,6 +21,20 @@ from monai.db.database import Database
 from monai.utils.llm import LLM
 
 logger = logging.getLogger(__name__)
+
+_SUBAGENT_FAIL_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS subagent_failures (
+    task_name TEXT NOT NULL,
+    task_hash TEXT NOT NULL,
+    failed_at REAL NOT NULL,
+    fail_count INTEGER DEFAULT 1,
+    reason TEXT,
+    PRIMARY KEY (task_name, task_hash)
+);
+"""
+
+# Block TTL tiers: 30min → 2hr → 8hr → 24hr
+_SUBAGENT_FAIL_TTL = [1800, 7200, 28800, 86400]
 
 
 class SubAgent:
@@ -73,6 +88,75 @@ class AgentSpawner:
         self.identity = IdentityManager(config, db, llm)
         self.active_agents: dict[str, SubAgent] = {}
         self._executor_pool = ThreadPoolExecutor(max_workers=5)
+        with db.connect() as conn:
+            conn.executescript(_SUBAGENT_FAIL_SCHEMA)
+
+    def _task_hash(self, task: str) -> str:
+        """Short hash of a task to group similar tasks."""
+        import hashlib
+        # Normalize: lowercase, strip whitespace, first 200 chars
+        normalized = task.lower().strip()[:200]
+        return hashlib.md5(normalized.encode()).hexdigest()[:12]
+
+    def _is_task_blocked(self, name: str, task: str) -> tuple[bool, str]:
+        """Check if a sub-agent task is still blocked from past failures."""
+        th = self._task_hash(task)
+        rows = self.db.execute(
+            "SELECT failed_at, fail_count, reason FROM subagent_failures "
+            "WHERE task_name = ? AND task_hash = ?",
+            (name, th),
+        )
+        if not rows:
+            return False, ""
+        failed_at = rows[0]["failed_at"]
+        count = rows[0]["fail_count"]
+        tier = min(count - 1, len(_SUBAGENT_FAIL_TTL) - 1)
+        ttl = _SUBAGENT_FAIL_TTL[tier]
+        if time.time() - failed_at < ttl:
+            return True, rows[0]["reason"] or "unknown"
+        # TTL expired
+        return False, ""
+
+    def _record_task_failure(self, name: str, task: str, reason: str) -> None:
+        """Record a sub-agent task failure with escalating TTL."""
+        th = self._task_hash(task)
+        now = time.time()
+        rows = self.db.execute(
+            "SELECT fail_count FROM subagent_failures "
+            "WHERE task_name = ? AND task_hash = ?",
+            (name, th),
+        )
+        count = (rows[0]["fail_count"] + 1) if rows else 1
+        self.db.execute(
+            "INSERT INTO subagent_failures (task_name, task_hash, failed_at, "
+            "fail_count, reason) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_name, task_hash) DO UPDATE SET "
+            "failed_at = excluded.failed_at, "
+            "fail_count = excluded.fail_count, "
+            "reason = excluded.reason",
+            (name, th, now, count, reason[:500]),
+        )
+        tier = min(count - 1, len(_SUBAGENT_FAIL_TTL) - 1)
+        ttl = _SUBAGENT_FAIL_TTL[tier]
+        logger.info(
+            f"Sub-agent failure #{count} for '{name}' — blocked for {ttl}s"
+        )
+
+    def _get_failure_context(self) -> str:
+        """Build failure context for sub-agent prompts."""
+        rows = self.db.execute(
+            "SELECT task_name, fail_count, reason FROM subagent_failures "
+            "WHERE fail_count > 0 ORDER BY fail_count DESC LIMIT 15"
+        )
+        if not rows:
+            return ""
+        lines = ["PAST SUB-AGENT FAILURES (avoid repeating these):"]
+        for r in rows:
+            lines.append(
+                f"  - '{r['task_name']}': failed {r['fail_count']}x — "
+                f"{r['reason'] or 'unknown'}"
+            )
+        return "\n".join(lines)
 
     def spawn(self, name: str, task: str, max_steps: int = 15) -> SubAgent:
         """Spawn a new sub-agent to handle a task."""
@@ -80,6 +164,10 @@ class AgentSpawner:
             self.config, self.db, self.llm,
             max_steps=max_steps, headless=True,
         )
+        # Inject failure context so sub-agent knows what failed before
+        failure_ctx = self._get_failure_context()
+        if failure_ctx:
+            task = f"{task}\n\n{failure_ctx}"
         agent = SubAgent(name, task, executor, self.identity)
         self.active_agents[name] = agent
         self.db.execute_insert(
@@ -91,9 +179,23 @@ class AgentSpawner:
 
     async def spawn_and_run(self, name: str, task: str, max_steps: int = 15) -> dict[str, Any]:
         """Spawn a sub-agent and run it immediately."""
+        # Check if this task is blocked from past failures
+        blocked, reason = self._is_task_blocked(name, task)
+        if blocked:
+            logger.info(f"Sub-agent '{name}' blocked — still cooling down: {reason}")
+            return {"status": "blocked", "reason": f"Task blocked (past failure): {reason}"}
+
         agent = self.spawn(name, task, max_steps)
         result = await agent.run()
         del self.active_agents[name]
+
+        # Record failure if it didn't succeed
+        status = result.get("status", "")
+        if status in ("error", "failed"):
+            self._record_task_failure(
+                name, task, result.get("error", result.get("reason", "unknown"))
+            )
+
         return result
 
     async def run_parallel(self, tasks: list[dict[str, str]],
@@ -112,10 +214,17 @@ class AgentSpawner:
         output = {}
         for task_info, result in zip(tasks, results):
             name = task_info["name"]
+            task_str = task_info["task"]
             if isinstance(result, Exception):
                 output[name] = {"status": "error", "error": str(result)}
+                self._record_task_failure(name, task_str, str(result))
             else:
                 output[name] = result
+                if result.get("status") in ("error", "failed"):
+                    self._record_task_failure(
+                        name, task_str,
+                        result.get("error", result.get("reason", "unknown"))
+                    )
             if name in self.active_agents:
                 del self.active_agents[name]
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import time
 from typing import Any
 
 from monai.agents.base import BaseAgent
@@ -104,9 +105,67 @@ class APIProvisioner(BaseAgent):
         self.payment_manager = payment_manager
         self._init_schema()
 
+    # Escalating TTL for provider failures: 1hr → 6hr → 24hr
+    _PROVIDER_FAIL_TTL = [3600, 21600, 86400]
+
+    _PROVIDER_FAIL_SCHEMA = """\
+    CREATE TABLE IF NOT EXISTS api_provision_failures (
+        provider TEXT NOT NULL,
+        brand TEXT NOT NULL,
+        failed_at REAL NOT NULL,
+        fail_count INTEGER DEFAULT 1,
+        reason TEXT,
+        PRIMARY KEY (provider, brand)
+    );
+    """
+
     def _init_schema(self):
         with self.db.connect() as conn:
             conn.executescript(API_PROVISIONER_SCHEMA)
+            conn.executescript(self._PROVIDER_FAIL_SCHEMA)
+
+    def _is_provider_blocked(self, provider: str, brand: str) -> bool:
+        """Check if a provider provisioning is blocked from past failures."""
+        rows = self.db.execute(
+            "SELECT failed_at, fail_count FROM api_provision_failures "
+            "WHERE provider = ? AND brand = ?",
+            (provider, brand),
+        )
+        if not rows:
+            return False
+        failed_at = rows[0]["failed_at"]
+        count = rows[0]["fail_count"]
+        tier = min(count - 1, len(self._PROVIDER_FAIL_TTL) - 1)
+        ttl = self._PROVIDER_FAIL_TTL[tier]
+        if time.time() - failed_at < ttl:
+            return True
+        return False
+
+    def _record_provider_failure(self, provider: str, brand: str,
+                                  reason: str = "") -> None:
+        """Record a provider provisioning failure with escalating TTL."""
+        now = time.time()
+        rows = self.db.execute(
+            "SELECT fail_count FROM api_provision_failures "
+            "WHERE provider = ? AND brand = ?",
+            (provider, brand),
+        )
+        count = (rows[0]["fail_count"] + 1) if rows else 1
+        self.db.execute(
+            "INSERT INTO api_provision_failures (provider, brand, failed_at, "
+            "fail_count, reason) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(provider, brand) DO UPDATE SET "
+            "failed_at = excluded.failed_at, "
+            "fail_count = excluded.fail_count, "
+            "reason = excluded.reason",
+            (provider, brand, now, count, reason[:500]),
+        )
+        tier = min(count - 1, len(self._PROVIDER_FAIL_TTL) - 1)
+        ttl = self._PROVIDER_FAIL_TTL[tier]
+        logger.info(
+            f"API provision failure #{count} for {provider}:{brand} — "
+            f"blocked for {ttl}s"
+        )
 
     # ── Core Lifecycle ─────────────────────────────────────────
 
@@ -136,11 +195,29 @@ class APIProvisioner(BaseAgent):
         for step in steps:
             action, brand = step.split(":", 1)
             provider = action.replace("provision_", "")
+
+            # Check persistent failure history before attempting
+            if self._is_provider_blocked(provider, brand):
+                logger.info(
+                    f"Skipping {provider}:{brand} — still blocked from "
+                    f"previous failure"
+                )
+                results[step] = {"status": "blocked", "reason": "past failure TTL"}
+                continue
+
             try:
                 result = self._dispatch_provision(provider, brand)
                 results[step] = result
+                # Record failure if provision didn't succeed
+                status = result.get("status", "")
+                if status in ("error", "failed"):
+                    self._record_provider_failure(
+                        provider, brand,
+                        result.get("error", result.get("reason", "unknown"))
+                    )
             except Exception as e:
                 self.learn_from_error(e, f"Failed to provision {provider} for {brand}")
+                self._record_provider_failure(provider, brand, str(e))
                 results[step] = {"status": "error", "error": str(e)}
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results
