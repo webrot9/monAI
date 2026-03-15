@@ -290,3 +290,12 @@
 - **Rules**:
   1. `VIRTUAL_ENV` must be in `_SAFE_ENV_KEYS` so the sandbox can bind-mount the venv and resolve `sys.executable`.
   2. `coder._run_tests()` should fallback to `"python3"` if `sys.executable` doesn't exist on disk.
+
+### 2026-03-15 - React signup forms have no `input[name='name']` — don't timeout trying to fill non-existent fields
+- **Mistake**: Gumroad signup is a React app that only has email + password on the initial signup page. There is NO `name` field. But the executor LLM kept sending `fill_form({"input[name='name']": "Nexify Digital"})`. The self-healing discovered page elements, LLM returned `null` (no match), but `smart_fill_form` ignored the null and tried the original selector anyway → 30s timeout → retry → timeout → 17 steps wasted.
+- **Root cause**: When `_llm_batch_match_selectors` returned `null` for a field (meaning "this field doesn't exist on this page"), the code only checked `if healed:` (falsy for null) and fell through to using the original selector.
+- **Rules**:
+  1. When batch matching returns `null`, mark the field as `None` in resolved_fields and SKIP filling it entirely.
+  2. Report skipped fields in the result so the executor LLM knows what wasn't filled.
+  3. Pre-seed platform playbooks for known signup pages (Gumroad, LemonSqueezy, Stripe, LinkedIn) to avoid first-visit discovery overhead.
+  4. "Success" means all FILLABLE fields succeeded, not all REQUESTED fields — skipped fields aren't failures.
