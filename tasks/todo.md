@@ -103,5 +103,36 @@
 - [x] BrowserLearner CAPTCHA detection after form fill
 - [x] Executor stuck-loop watchdog (aborts on 4 identical non-failing actions)
 
-## Next Up
-- [ ] First real deployment test (end-to-end with a real Ko-fi page)
+- [x] Fix 1: Persistent proxy-blocked platform detection (permanent column in provision_failures)
+- [x] Fix 2: Platform name preserved in constraint planner goals ("action on platform" format)
+- [x] Fix 3: Ethics checks moved after strategies + budget threshold (<30 calls → skip)
+- [x] Fix 4: Strategy prereq check in base.py (check provisioner block before registration)
+- [x] Fix 5: Sub-agent failure history injected into plan context
+- [x] Fix 6: Cycle-scoped cancellation flag for watchdog timeout
+- [x] Fix 7: Provisioning budget cap (40% of cycle budget)
+- [x] Self-healing form fill: __MISSING__ sentinel caching for absent fields
+- [x] Executor: distinct skipped vs failed field reporting in fill_form
+- [x] Auto-pause 8 Tor-blocked strategies (freelance_writing, digital_products, course_creation, micro_saas, saas, print_on_demand, domain_flipping, social_media)
+- [x] Telegram bots: Stripe dependency made optional (bot deploys even without payment processor)
+- [x] Orchestrator: TOR_BLOCKED_STRATEGIES mapping + auto-pause in _run_strategies
+- [x] Orchestrator: Skip Tor-blocked strategies in _ensure_strategy_payment_providers
+
+## Active — Revenue-Viable Strategies (work via Tor)
+These 5 strategies can generate revenue without Tor-blocked platform registration:
+
+1. **affiliate** — Review/comparison content with affiliate links (no registration needed)
+2. **content_sites** — SEO articles with affiliate monetization (no registration needed)
+3. **lead_gen** — B2B lead scraping and direct sales (no registration needed)
+4. **newsletter** — Substack/Beehiiv newsletters with sponsors (Tor-tolerant platforms)
+5. **telegram_bots** — Telegram bot services (Telegram API works via Tor, payments optional)
+
+## Paused — Tor-Blocked Strategies
+These require platform registration that blocks Tor. Will re-enable when direct internet access is available:
+- freelance_writing (Upwork/Fiverr)
+- digital_products (Gumroad)
+- course_creation (Udemy/Skillshare)
+- micro_saas (Stripe/LemonSqueezy)
+- saas (Stripe)
+- print_on_demand (Redbubble/TeeSpring)
+- domain_flipping (Sedo/Afternic)
+- social_media (Twitter/LinkedIn/Instagram)

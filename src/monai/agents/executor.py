@@ -49,13 +49,14 @@ Available tools:
 10. shell(command) — Run a shell command and return output
 11. write_file(path, content) — Write content to a file
 12. read_file(path) — Read a file's content
-13. write_code(spec, filename) — Generate a tested code module from a specification
+13. write_code(spec, language) — YOU ARE A CODER. Generate a full, tested code module from a specification. Use this for: API integrations, data processing, web scrapers, automation scripts, utilities, anything that needs real code. The code is written to disk, tested with pytest, and auto-fixed up to 3x. Returns the working file path. Use this AGGRESSIVELY — don't try to hack together solutions with click/type when a proper script would be better
 14. run_tests(path) — Run tests for a code file
 15. wait(seconds) — Wait for a specified time
 16. wait_for(selector, timeout) — Wait for an element to appear on the page (timeout in seconds, default 10)
 17. create_tool(name, description, code) — Create a new reusable tool at runtime
-18. done(result) — Signal task completion with a result
-19. fail(reason) — Signal task failure with a reason
+18. run_page_script(script, args) — Execute custom JavaScript on the current page. Use this when standard fill_form/click/type fail. Write Playwright-compatible JS that interacts with the DOM directly. args is an optional JSON object passed to the script. The script runs as an async function body with access to `args`. Use document.querySelector, dispatchEvent, etc. For React/Vue apps, trigger proper input events. No network requests or cookie access allowed. Returns {success, result}.
+19. done(result) — Signal task completion with a result
+20. fail(reason) — Signal task failure with a reason
 """
 
 # Backward-compat alias
@@ -71,6 +72,20 @@ class AutonomousExecutor:
     # (prevents LLM from gaming the breaker with read_page/screenshot between fails)
     MAX_FAILURE_RATIO = 0.7  # 70% of steps failing = abort
     MIN_STEPS_FOR_RATIO = 6  # don't apply ratio check before this many steps
+
+    # Class-level cancellation flag — set by the watchdog to stop all
+    # in-flight executors when a cycle times out.
+    _cycle_cancelled = False
+
+    @classmethod
+    def cancel_cycle(cls) -> None:
+        """Signal all running executors to stop."""
+        cls._cycle_cancelled = True
+
+    @classmethod
+    def reset_cycle(cls) -> None:
+        """Clear the cancellation flag at the start of a new cycle."""
+        cls._cycle_cancelled = False
 
     def __init__(self, config: Config, db: Database, llm: LLM,
                  max_steps: int = 30, headless: bool = True,
@@ -129,6 +144,16 @@ class AutonomousExecutor:
                 await self.browser.start()
 
             for step in range(self.max_steps):
+                # Check cycle-level cancellation (watchdog timeout)
+                if self._cycle_cancelled:
+                    self._log_task(task, "cancelled", "Cycle cancelled by watchdog")
+                    return {
+                        "status": "cancelled",
+                        "reason": "cycle_timeout",
+                        "steps": step,
+                        "history": self.action_history,
+                    }
+
                 # Enforce time limit
                 elapsed = time.time() - start_time
                 if elapsed > self.timeout_seconds:
@@ -354,11 +379,29 @@ class AutonomousExecutor:
         except Exception:
             asset_context = ""
 
+        # Dynamic nudge: detect when browser tools keep failing and push
+        # the agent toward code-writing
+        code_nudge = ""
+        if self.action_history:
+            recent_browser_fails = sum(
+                1 for a in self.action_history[-6:]
+                if a["tool"] in ("click", "type", "fill_form", "submit", "wait_for")
+                and (a["result"].startswith("ERROR:") or "Timeout" in a["result"])
+            )
+            if recent_browser_fails >= 2:
+                code_nudge = (
+                    "\n⚠️ BROWSER TOOLS ARE FAILING REPEATEDLY. "
+                    "STOP using click/type/fill_form — they don't work on this page. "
+                    "USE run_page_script TO WRITE CUSTOM JS, or write_code TO BUILD "
+                    "A PROPER SOLUTION. You are a coder — act like one.\n\n"
+                )
+
         prompt = (
             f"TASK: {task}\n\n"
             f"CONTEXT: {context}\n\n"
             f"STEP: {step + 1}/{self.max_steps}\n\n"
             f"PREVIOUS ACTIONS:\n{history_summary or 'None yet'}\n\n"
+            f"{code_nudge}"
             f"{learned_context}"
             f"{asset_context}"
             f"{custom_rules_text}"
@@ -373,6 +416,22 @@ class AutonomousExecutor:
             "- Be efficient. Change strategy when things aren't working.\n"
             "- NEVER post to example.com or made-up/placeholder URLs — they don't exist\n"
             "- NEVER create accounts on platforms NOT mentioned in the task\n"
+            "\n"
+            "CODE-FIRST STRATEGY — YOU ARE A CODER, NOT JUST A TOOL-CALLER:\n"
+            "- When standard tools (click, type, fill_form) fail 2+ times: STOP retrying.\n"
+            "  Instead, use run_page_script (for browser JS) or write_code (for Python)\n"
+            "  to write a proper solution.\n"
+            "- run_page_script: custom JS on the current page. For DOM interaction,\n"
+            "  React/Vue forms, multi-step wizards, dynamic content extraction.\n"
+            "- write_code: full Python modules. For API integrations, data processing,\n"
+            "  web scraping, automation, file generation, ANYTHING that needs real code.\n"
+            "  The module gets written, tested, and auto-fixed. Use it!\n"
+            "- create_tool: when you solve a problem with code, save it as a reusable\n"
+            "  tool so you don't have to write it again next time.\n"
+            "- http_get/http_post: when you can bypass the browser entirely and hit an\n"
+            "  API directly, DO IT. It's faster and more reliable than browser automation.\n"
+            "- THINK LIKE A DEVELOPER: analyze the problem, read the page/API, write code.\n"
+            "  Don't be a dumb click-bot.\n"
             "- NEVER run diagnostic loops (checking IP, proxy status, SSL) unless the task requires it\n"
             "- STAY ON TASK. If the task is 'register on X', only interact with X — not Y or Z\n"
             "- If the core action is impossible (site blocked, missing credentials), call fail() immediately"
@@ -553,14 +612,64 @@ class AutonomousExecutor:
                     from urllib.parse import urlparse
                     domain = urlparse(url).netloc if url else ""
                     result = await self._learner.smart_fill_form(fields, domain=domain)
-                    if not result.get("success"):
-                        failed = [k for k, v in result.get("fields", {}).items()
-                                  if not v.get("success")]
-                        return f"ERROR: Fill form failed on: {', '.join(failed)}"
-                    return f"Filled {len(fields)} fields"
+                    skipped = result.get("skipped_fields", [])
+                    failed = [k for k, v in result.get("fields", {}).items()
+                              if not v.get("success") and not v.get("skipped")]
+                    parts = []
+                    filled_count = len(fields) - len(skipped) - len(failed)
+                    if filled_count > 0:
+                        parts.append(f"Filled {filled_count} fields")
+                    if skipped:
+                        parts.append(
+                            f"Skipped fields not present on page: "
+                            f"{', '.join(skipped)}. "
+                            f"Do NOT include these fields in future fill_form calls"
+                        )
+                    if failed:
+                        parts.append(
+                            f"ERROR: Fill failed on: {', '.join(failed)}"
+                        )
+                    if not result.get("success") and not parts:
+                        return "ERROR: Fill form failed"
+                    return ". ".join(parts)
                 else:
                     await self.browser.fill_form(fields)
                     return f"Filled {len(fields)} fields"
+
+            elif tool == "run_page_script":
+                script = args.get("script", "")
+                script_args = args.get("args")
+                if not script:
+                    return "ERROR: script is required"
+                if self._learner:
+                    result = await self._learner.run_page_script(
+                        script, args=script_args)
+                    if result.get("success"):
+                        return json.dumps(result.get("result", "Script executed"))
+                    return f"ERROR: Script failed: {result.get('error', 'unknown')}"
+                else:
+                    # Ethics review before execution — even without BrowserLearner
+                    from monai.agents.ethics import is_script_ethical
+                    is_ethical, reason = is_script_ethical(
+                        script,
+                        context=f"run_page_script (no learner)",
+                        script_type="browser_js",
+                        llm=self.llm,
+                    )
+                    if not is_ethical:
+                        return f"BLOCKED: Script failed ethics review: {reason}"
+                    # Fallback: execute directly on page
+                    page = await self.browser._get_page()
+                    try:
+                        if script_args:
+                            wrapped = f"async (args) => {{ {script} }}"
+                            r = await page.evaluate(wrapped, script_args)
+                        else:
+                            wrapped = f"async () => {{ {script} }}"
+                            r = await page.evaluate(wrapped)
+                        return json.dumps(r) if r else "Script executed"
+                    except Exception as e:
+                        return f"ERROR: Script failed: {e}"
 
             elif tool == "submit":
                 selector = args.get("selector", "form")
@@ -639,9 +748,18 @@ class AutonomousExecutor:
                 if is_action_blocked(cmd):
                     return "BLOCKED: dangerous command"
                 # Validate command against whitelist — no arbitrary shell execution
-                from monai.agents.ethics import is_shell_command_allowed
+                from monai.agents.ethics import is_shell_command_allowed, is_script_ethical
                 if not is_shell_command_allowed(cmd):
                     return "BLOCKED: command not in allowed list. Only safe commands permitted."
+                # Ethics/legal review of the command intent
+                # (whitelist checks syntax, this checks purpose)
+                is_ok, reason = is_script_ethical(
+                    cmd,
+                    context=f"Shell command in task: {self.action_history[-1]['tool'] if self.action_history else 'start'}",
+                    script_type="custom_tool",  # general-purpose check
+                )
+                if not is_ok:
+                    return f"BLOCKED: command failed ethics/legal review: {reason}"
                 # Parse and execute in OS-level sandbox (namespace isolation +
                 # sanitized env + forced cwd + no shell=True)
                 import shlex
@@ -655,7 +773,24 @@ class AutonomousExecutor:
                 path = args.get("path", "")
                 if not is_path_allowed(path):
                     return f"SANDBOX VIOLATION: Cannot write outside allowed directories"
-                safe_write(path, args.get("content", ""))
+                content = args.get("content", "")
+                # Ethics/legal review for code files
+                if any(path.endswith(ext) for ext in (
+                    ".py", ".js", ".ts", ".sh", ".bash", ".rb", ".php",
+                    ".pl", ".lua", ".go", ".rs", ".java", ".kt",
+                )):
+                    from monai.agents.ethics import is_script_ethical
+                    script_type = "python" if path.endswith(".py") else (
+                        "browser_js" if path.endswith((".js", ".ts")) else "custom_tool"
+                    )
+                    is_ok, reason = is_script_ethical(
+                        content,
+                        context=f"write_file: {path}",
+                        script_type=script_type,
+                    )
+                    if not is_ok:
+                        return f"BLOCKED: file content failed ethics/legal review: {reason}"
+                safe_write(path, content)
                 return f"Written: {path}"
 
             elif tool == "read_file":
@@ -891,12 +1026,23 @@ class AutonomousExecutor:
             "browse", "click", "type", "screenshot", "fill_form", "submit",
             "read_page", "http_get", "http_post", "shell", "write_file",
             "read_file", "write_code", "run_tests", "wait", "wait_for",
-            "done", "fail", "create_tool",
+            "run_page_script", "done", "fail", "create_tool",
         ):
             return f"ERROR: invalid or reserved tool name: {name}"
 
         if len(code) > self._MAX_TOOL_CODE_SIZE:
             return f"ERROR: tool code exceeds {self._MAX_TOOL_CODE_SIZE} char limit"
+
+        # Layer 0: Full ethics review (static + structural + LLM)
+        from monai.agents.ethics import is_script_ethical
+        is_ethical, reason = is_script_ethical(
+            code,
+            context=f"create_tool: {name} — {description}",
+            script_type="custom_tool",
+            llm=self.llm,
+        )
+        if not is_ethical:
+            return f"BLOCKED: tool code failed ethics review: {reason}"
 
         # Layer 1: Static blocklist (fast, catches obvious stuff)
         code_lower = code.lower()
@@ -1014,7 +1160,7 @@ class AutonomousExecutor:
         """When hitting repeated failures, pause and analyze what's going wrong.
 
         Uses a cheap LLM call to reason about the pattern of failures and
-        suggest a fundamentally different approach.
+        suggest a fundamentally different approach — including writing code.
         """
         if not self.action_history:
             return None
@@ -1030,6 +1176,22 @@ class AutonomousExecutor:
             f"- {a['tool']}({json.dumps(a['args'])[:100]}) → {a['result'][:150]}"
             for a in failures[-5:]
         )
+
+        # Detect if failures are browser/DOM related
+        browser_failures = sum(
+            1 for a in failures
+            if a["tool"] in ("click", "type", "fill_form", "submit", "wait_for")
+        )
+        code_hint = ""
+        if browser_failures >= 2:
+            code_hint = (
+                "\n\nCODE-FIRST HINT: Multiple browser interactions have failed. "
+                "Standard tools (click, type, fill_form) use CSS selectors that "
+                "may not match this page's DOM. Consider using run_page_script "
+                "to write custom JavaScript that reads the actual DOM structure "
+                "and interacts with elements directly. You are a CODER — when "
+                "standard tools fail, WRITE CODE to solve the problem."
+            )
 
         try:
             reflection = self.llm.quick(
@@ -1047,10 +1209,25 @@ class AutonomousExecutor:
                 "- wait(seconds): pause execution\n"
                 "- screenshot(name): capture current page state\n"
                 "- read_page(): get page text\n"
-                "- http_get/http_post: direct API calls\n"
+                "- run_page_script(script, args): WRITE AND EXECUTE custom JavaScript "
+                "on the current page. Use this when standard tools fail — read the DOM, "
+                "find elements, fill forms, click buttons, handle React/Vue apps, "
+                "navigate multi-step wizards, extract data. You write the code, "
+                "it runs in the page context.\n"
+                "- http_get/http_post: direct API calls (bypass the browser entirely)\n"
+                "- write_code(spec): generate a full Python module\n"
+                "- create_tool(name, description, code): create a reusable tool\n"
                 "- shell(command): run shell commands\n\n"
-                "Be specific and actionable — reference actual tools above. Max 3 sentences.",
-                system="You analyze task execution failures and suggest alternative strategies using the available tools.",
+                f"{code_hint}\n\n"
+                "Be specific and actionable. If the page DOM is the problem, suggest "
+                "writing code. Max 3 sentences.",
+                system=(
+                    "You analyze task execution failures and suggest alternative "
+                    "strategies. You strongly prefer writing code (run_page_script) "
+                    "over retrying the same failing tools. When browser interactions "
+                    "fail, the solution is almost always to write custom JS that "
+                    "inspects the DOM and handles the page's specific structure."
+                ),
             )
             logger.info(f"Mid-task reflection: {reflection[:200]}")
             return reflection

@@ -216,10 +216,27 @@ class Orchestrator(BaseAgent):
             for name, agent in self._strategy_agents.items():
                 status = getattr(agent, "status", None)
                 if status in ("paused", "failed"):
+                    reason = self.TOR_BLOCKED_STRATEGIES.get(name, "")
+                    extra = f" ({reason})" if reason else ""
                     lines.append(
-                        f"[strategy_{status}] '{name}' is {status} — "
+                        f"[strategy_{status}] '{name}' is {status}{extra} — "
                         f"do NOT allocate more resources to it"
                     )
+        except Exception:
+            pass
+
+        # 4. Sub-agent failures — prevent LLM from re-generating the same tasks
+        try:
+            rows = self.db.execute(
+                "SELECT task_name, fail_count, reason "
+                "FROM subagent_failures ORDER BY fail_count DESC LIMIT 15"
+            )
+            for r in rows:
+                lines.append(
+                    f"[subagent_failure] '{r['task_name']}': "
+                    f"failed {r['fail_count']}x — {r['reason'] or 'unknown'}. "
+                    f"Do NOT re-spawn this task."
+                )
         except Exception:
             pass
 
@@ -269,6 +286,10 @@ class Orchestrator(BaseAgent):
     def run(self, **kwargs: Any) -> dict[str, Any]:
         """Execute one full autonomous orchestration cycle."""
         self._cycle += 1
+        # Reset executor cancellation flag for this cycle
+        from monai.agents.executor import AutonomousExecutor
+        AutonomousExecutor.reset_cycle()
+
         self.log_action("cycle_start", f"Cycle {self._cycle} at {datetime.now()}")
         self.journal("plan", f"Starting cycle {self._cycle}")
         self.audit.log("orchestrator", "system", "cycle_start",
@@ -431,11 +452,13 @@ class Orchestrator(BaseAgent):
                            details={"action": ar["action"]},
                            result=str(ar.get("result", ""))[:200])
 
-        # Phase 5.5: Ethics check — test agents before letting them operate
-        cycle_result["ethics"] = self._run_ethics_checks()
-
-        # Phase 6: Run registered strategy agents
+        # Phase 6: Run registered strategy agents (revenue work first)
         cycle_result["strategy_results"] = self._run_strategies()
+
+        # Phase 6.1: Ethics check — run AFTER strategies to avoid burning
+        # budget before revenue work.  Strategies already have internal
+        # guardrails; ethics tests are a secondary verification layer.
+        cycle_result["ethics"] = self._run_ethics_checks()
 
         # Phase 6.3: Run workflow pipelines (if any are scheduled)
         cycle_result["workflows"] = self._run_scheduled_workflows()
@@ -568,6 +591,11 @@ class Orchestrator(BaseAgent):
                 self.log_action("strategy_review",
                                 f"Strategy '{s['name']}' needs review: "
                                 f"net=€{s['net']:.2f}, 7d_net=€{s['trend_7d']['net']:.2f}")
+
+            # Reallocate budget from paused strategies to active performers
+            if paused:
+                freed = self._reallocate_paused_budget(paused, perf)
+                cycle_result["strategy_performance"]["reallocated"] = freed
 
             # Auto-scale: boost budget for growing strategies
             scaled = self._auto_scale_strategies(perf["strategies_to_scale"])
@@ -841,7 +869,23 @@ class Orchestrator(BaseAgent):
 
         if needs:
             self.log_action("provisioning", f"Need to set up: {needs}")
-            result = self.provisioner.run()
+            # Guard: cap provisioning to 40% of cycle budget so strategies
+            # get enough calls.  Provisioning is important but not if it
+            # starves all revenue work.
+            tracker = get_cost_tracker()
+            calls_before = tracker.cycle_calls
+            max_provisioning_calls = int(tracker.max_cycle_calls * 0.4)
+            saved_limit = tracker.max_cycle_calls
+            tracker.max_cycle_calls = calls_before + max_provisioning_calls
+            try:
+                result = self.provisioner.run()
+            except BudgetExceededError:
+                logger.warning(
+                    "Provisioning hit budget cap — saving remaining "
+                    "budget for strategy execution")
+                result = {"status": "budget_capped"}
+            finally:
+                tracker.max_cycle_calls = saved_limit
 
         # Bootstrap funding phase check
         bootstrap_phase = self.bootstrap_wallet.get_funding_phase()
@@ -912,6 +956,20 @@ class Orchestrator(BaseAgent):
         "domain_flipping": [],  # Paid via marketplace (Sedo, etc.)
     }
 
+    # Strategies that require platforms known to block Tor/proxy traffic.
+    # These are auto-paused when running behind a proxy to avoid wasting
+    # LLM calls on impossible registration attempts.
+    TOR_BLOCKED_STRATEGIES: dict[str, str] = {
+        "freelance_writing": "Upwork/Fiverr block Tor registration",
+        "digital_products": "Gumroad blocks Tor registration",
+        "course_creation": "Udemy/Skillshare block Tor registration",
+        "micro_saas": "Stripe/LemonSqueezy block Tor registration",
+        "saas": "Stripe blocks Tor registration",
+        "print_on_demand": "Redbubble/TeeSpring block Tor registration",
+        "domain_flipping": "Domain registrars block Tor registration",
+        "social_media": "Social platforms block Tor account creation",
+    }
+
     def _ensure_strategy_payment_providers(self, result: dict[str, Any]) -> None:
         """Proactively provision payment providers for active strategies.
 
@@ -930,6 +988,9 @@ class Orchestrator(BaseAgent):
             failed_providers: set[str] = set()  # Track providers that failed this cycle
             for row in active_strategies:
                 strategy_name = row["strategy"]
+                # Skip Tor-blocked strategies entirely
+                if strategy_name in self.TOR_BLOCKED_STRATEGIES:
+                    continue
                 needed_providers = self.STRATEGY_PAYMENT_PROVIDERS.get(strategy_name, [])
                 for provider in needed_providers:
                     # Skip providers that already failed this cycle
@@ -1123,6 +1184,87 @@ class Orchestrator(BaseAgent):
             )
 
         return scaled
+
+    def _reallocate_paused_budget(
+        self, paused_names: list[str], perf: dict[str, Any],
+    ) -> float:
+        """Redistribute budget from paused strategies to top performers.
+
+        When a strategy is paused, its budget is wasted. This method
+        redistributes it proportionally to active strategies with positive ROI,
+        so capital follows performance.
+        """
+        # Collect budget from paused strategies
+        freed_total = 0.0
+        for name in paused_names:
+            rows = self.db.execute(
+                "SELECT allocated_budget FROM strategies WHERE name = ?",
+                (name,),
+            )
+            if rows and rows[0]["allocated_budget"] > 0:
+                freed = rows[0]["allocated_budget"]
+                self.db.execute(
+                    "UPDATE strategies SET allocated_budget = 0, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE name = ?",
+                    (name,),
+                )
+                freed_total += freed
+
+        if freed_total <= 0:
+            return 0.0
+
+        # Find active strategies with positive ROI to receive the budget
+        recipients = []
+        for s in perf.get("strategies_to_scale", []):
+            if s.get("roi_pct", 0) > 0 and s["name"] not in paused_names:
+                recipients.append(s)
+        # Also include strategies_to_review that have positive ROI
+        for s in perf.get("strategies_to_review", []):
+            if s.get("roi_pct", 0) > 0 and s["name"] not in paused_names:
+                recipients.append(s)
+
+        if not recipients:
+            # No positive-ROI strategies — distribute equally to all active
+            active = self.db.execute(
+                "SELECT name FROM strategies WHERE status = 'active'"
+            )
+            if active:
+                per_strategy = freed_total / len(active)
+                for row in active:
+                    self.db.execute(
+                        "UPDATE strategies SET allocated_budget = "
+                        "allocated_budget + ?, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE name = ?",
+                        (per_strategy, row["name"]),
+                    )
+            self.log_action(
+                "budget_reallocation",
+                f"€{freed_total:.2f} from {len(paused_names)} paused strategies "
+                f"distributed equally to {len(active)} active strategies",
+            )
+            return freed_total
+
+        # Distribute proportionally to ROI
+        total_roi = sum(s.get("roi_pct", 1) for s in recipients)
+        for s in recipients:
+            share = (s.get("roi_pct", 1) / total_roi) * freed_total if total_roi > 0 else freed_total / len(recipients)
+            self.db.execute(
+                "UPDATE strategies SET allocated_budget = "
+                "allocated_budget + ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
+                (share, s["id"]),
+            )
+
+        self.log_action(
+            "budget_reallocation",
+            f"€{freed_total:.2f} from paused [{', '.join(paused_names)}] "
+            f"→ distributed to {len(recipients)} performers by ROI",
+        )
+        self.notify_creator(
+            f"*Budget reallocation:* €{freed_total:.2f} freed from paused strategies "
+            f"→ redistributed to {len(recipients)} top performers"
+        )
+        return freed_total
 
     def _send_financial_reports(self) -> None:
         """Send periodic financial reports to creator via Telegram."""
@@ -1532,9 +1674,21 @@ class Orchestrator(BaseAgent):
         return self.telegram.notify_creator(message)
 
     def _run_ethics_checks(self) -> dict[str, Any]:
-        """Run ethics tests on all registered agents before they operate."""
-        from monai.utils.llm import BudgetExceededError
+        """Run ethics tests on registered agents.
+
+        Runs AFTER strategies to avoid burning budget before revenue work.
+        Skips entirely if insufficient budget remaining (<30 calls).
+        """
         results = {}
+
+        # Skip ethics entirely if budget is low — strategies already ran
+        tracker = get_cost_tracker()
+        remaining = tracker.max_cycle_calls - tracker.cycle_calls
+        if remaining < 30:
+            logger.info(
+                f"Ethics checks skipped — only {remaining} calls remaining "
+                f"(need ≥30)")
+            return {"status": "skipped", "reason": "insufficient_budget"}
 
         # Auto-reset agents quarantined for > 24 hours (false positive recovery)
         reset_agents = self.ethics_tester.auto_reset_stale_quarantines(max_age_hours=24)
@@ -1951,6 +2105,31 @@ class Orchestrator(BaseAgent):
         import concurrent.futures
 
         results = {}
+
+        # Auto-pause strategies that require Tor-blocked platforms
+        uses_proxy = getattr(self.config, "privacy", None) and \
+            getattr(self.config.privacy, "proxy_type", "none") != "none"
+        if uses_proxy:
+            for strat_name, reason in self.TOR_BLOCKED_STRATEGIES.items():
+                rows = self.db.execute(
+                    "SELECT status FROM strategies WHERE name = ? AND status = 'active'",
+                    (strat_name,),
+                )
+                if rows:
+                    self.db.execute_insert(
+                        "UPDATE strategies SET status = 'paused', "
+                        "updated_at = CURRENT_TIMESTAMP WHERE name = ?",
+                        (strat_name,),
+                    )
+                    logger.info(
+                        "Auto-paused strategy '%s': %s (proxy mode active)",
+                        strat_name, reason,
+                    )
+                    results[strat_name] = {
+                        "status": "auto_paused",
+                        "reason": f"Tor-blocked: {reason}",
+                    }
+
         active = self.db.execute("SELECT name FROM strategies WHERE status = 'active'")
         active_names = {r["name"] for r in active}
         strategy_timeout = 300  # 5 minutes max per strategy

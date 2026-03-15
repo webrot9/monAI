@@ -104,23 +104,20 @@ class SaaSAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "discover_opportunities": self._discover_opportunities,
+            "validate_idea": self._validate_idea,
+            "competitor_analysis": self._competitor_analysis,
+            "design_architecture": self._design_architecture,
+            "build_mvp": self._build_mvp,
+            "review_product": self._review_product,
+            "create_landing_page": self._create_landing_page,
+            "plan_launch": self._plan_launch,
+        }
         for step in steps:
-            if step == "discover_opportunities":
-                results["opportunities"] = self._discover_opportunities()
-            elif step == "validate_idea":
-                results["validation"] = self._validate_idea()
-            elif step == "competitor_analysis":
-                results["competitors"] = self._competitor_analysis()
-            elif step == "design_architecture":
-                results["architecture"] = self._design_architecture()
-            elif step == "build_mvp":
-                results["build"] = self._build_mvp()
-            elif step == "review_product":
-                results["review"] = self._review_product()
-            elif step == "create_landing_page":
-                results["landing"] = self._create_landing_page()
-            elif step == "plan_launch":
-                results["launch"] = self._plan_launch()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results

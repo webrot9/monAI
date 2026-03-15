@@ -198,13 +198,13 @@ The ProductIterator runs every 5 cycles to identify underperformers and trigger 
 |--------|---------|
 | `orchestrator.py` | Master brain — strategy selection, agent coordination |
 | `provisioner.py` | Infrastructure provisioning (domains, APIs, accounts) |
-| `executor.py` | Task execution with browser control |
+| `executor.py` | Task execution with browser control + run_page_script (code-gen for DOM interaction) |
 | `identity.py` | Identity & credential management |
 | `coder.py` | Code generation with mandatory testing |
 | `humanizer.py` | Content humanization (anti-AI-detection) |
 | `fact_checker.py` | Content verification before publication |
 | `legal.py` | Per-activity legal compliance advisor |
-| `ethics.py` | Hardcoded ethical rules |
+| `ethics.py` | Hardcoded ethical rules + `is_script_ethical()` for reviewing all generated code |
 | `ethics_test.py` | Ethical testing framework |
 | `self_improve.py` | Agent self-improvement with A/B experiments |
 | `product_iterator.py` | Continuous product improvement (sales analysis, competitor monitoring, auto-iteration) |
@@ -214,7 +214,7 @@ The ProductIterator runs every 5 cycles to identify underperformers and trigger 
 | `finance_expert.py` | Financial advisory and ROI analysis |
 | `social_presence.py` | Brand social accounts |
 | `web_presence.py` | Domain & website management |
-| `browser_learner.py` | Adaptive browser automation |
+| `browser_learner.py` | Adaptive browser automation with code-gen fallback (writes + caches Playwright scripts when standard selectors fail) |
 | `memory.py` | Shared knowledge base |
 | `collaboration.py` | Agent-to-agent help system |
 | `spawner.py` | Sub-agent creation |

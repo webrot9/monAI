@@ -70,17 +70,18 @@ class TelegramBotAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "research_bot_niches": self._research_niches,
+            "design_bot": self._design_bot,
+            "build_bot": self._build_bot,
+            "review_product": self._review_product,
+            "deploy_bot": self._deploy_bot,
+        }
+
         for step in steps:
-            if step == "research_bot_niches":
-                results["research"] = self._research_niches()
-            elif step == "design_bot":
-                results["design"] = self._design_bot()
-            elif step == "build_bot":
-                results["build"] = self._build_bot()
-            elif step == "review_product":
-                results["review"] = self._review_product()
-            elif step == "deploy_bot":
-                results["deploy"] = self._deploy_bot()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results
@@ -315,8 +316,11 @@ class TelegramBotAgent(BaseAgent):
 
     def _deploy_bot(self) -> dict[str, Any]:
         """Deploy a built Telegram bot by registering with BotFather and hosting it."""
-        # Ensure Stripe is set up for in-bot payments (e.g. /subscribe, /buy)
-        self.ensure_platform_account("stripe")
+        # Try to set up Stripe for in-bot payments, but don't block deployment
+        # if Stripe is unavailable (e.g. behind Tor). Bot can still be deployed
+        # and monetized later via Telegram Stars or direct crypto payments.
+        stripe_result = self.ensure_platform_account("stripe")
+        has_payments = stripe_result.get("status") not in ("blocked", "error")
 
         deployed = 0
 

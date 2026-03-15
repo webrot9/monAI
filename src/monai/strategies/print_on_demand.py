@@ -79,17 +79,17 @@ class PrintOnDemandAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "research_niches": self._research_niches,
+            "generate_design_concepts": self._generate_concepts,
+            "review_design": self._review_design,
+            "create_listings": self._create_listings,
+            "find_trending": self._find_trending,
+        }
         for step in steps:
-            if step == "research_niches":
-                results["niches"] = self._research_niches()
-            elif step == "generate_design_concepts":
-                results["concepts"] = self._generate_concepts()
-            elif step == "review_design":
-                results["review"] = self._review_design()
-            elif step == "create_listings":
-                results["listings"] = self._create_listings()
-            elif step == "find_trending":
-                results["trending"] = self._find_trending()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results

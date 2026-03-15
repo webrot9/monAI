@@ -92,17 +92,17 @@ class SocialMediaAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "find_clients": self._find_clients,
+            "create_content_batch": self._create_content_batch,
+            "review_posts": self._review_posts,
+            "analyze_engagement": self._analyze_engagement,
+            "report_to_clients": self._report_to_clients,
+        }
         for step in steps:
-            if step == "find_clients":
-                results["prospecting"] = self._find_clients()
-            elif step == "create_content_batch":
-                results["content"] = self._create_content_batch()
-            elif step == "review_posts":
-                results["review"] = self._review_posts()
-            elif step == "analyze_engagement":
-                results["engagement"] = self._analyze_engagement()
-            elif step == "report_to_clients":
-                results["reports"] = self._report_to_clients()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results

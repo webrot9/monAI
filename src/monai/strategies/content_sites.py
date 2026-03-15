@@ -61,17 +61,18 @@ class ContentSiteAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "research_keywords": self._research_keywords,
+            "create_article": self._create_article,
+            "review_content": self._review_content,
+            "find_affiliate_programs": self._find_affiliate_programs,
+            "plan_new_site": self._plan_new_site,
+        }
+
         for step in steps:
-            if step == "research_keywords":
-                results["keywords"] = self._research_keywords()
-            elif step == "create_article":
-                results["article"] = self._create_article()
-            elif step == "review_content":
-                results["content_review"] = self._review_content()
-            elif step == "find_affiliate_programs":
-                results["affiliates"] = self._find_affiliate_programs()
-            elif step == "plan_new_site":
-                results["new_site"] = self._plan_new_site()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results

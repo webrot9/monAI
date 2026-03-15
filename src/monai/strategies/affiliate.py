@@ -61,17 +61,18 @@ class AffiliateAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "research_programs": self._research_programs,
+            "research_products": self._research_products,
+            "write_review": self._write_review,
+            "review_content": self._review_content,
+            "write_comparison": self._write_comparison,
+        }
+
         for step in steps:
-            if step == "research_programs":
-                results["programs"] = self._research_programs()
-            elif step == "research_products":
-                results["products"] = self._research_products()
-            elif step == "write_review":
-                results["review"] = self._write_review()
-            elif step == "review_content":
-                results["content_review"] = self._review_content()
-            elif step == "write_comparison":
-                results["comparison"] = self._write_comparison()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results

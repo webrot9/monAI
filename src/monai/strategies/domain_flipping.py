@@ -73,15 +73,16 @@ class DomainFlippingAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "research_expired": self._research_expired,
+            "evaluate_domains": self._evaluate_domains,
+            "analyze_market": self._analyze_market,
+            "list_for_sale": self._list_for_sale,
+        }
         for step in steps:
-            if step == "research_expired":
-                results["expired"] = self._research_expired()
-            elif step == "evaluate_domains":
-                results["evaluated"] = self._evaluate_domains()
-            elif step == "analyze_market":
-                results["market"] = self._analyze_market()
-            elif step == "list_for_sale":
-                results["listed"] = self._list_for_sale()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results

@@ -103,21 +103,19 @@ class FreelanceWritingAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "prospect_platforms": self._prospect,
+            "send_proposals": self._send_proposals,
+            "write_content": self._write_content,
+            "review_content": self._review_content,
+            "deliver_work": self._deliver_work,
+            "send_invoice": self._send_invoices,
+            "follow_up": self._follow_up,
+        }
         for step in steps:
-            if step == "prospect_platforms":
-                results["prospect"] = self._prospect()
-            elif step == "send_proposals":
-                results["proposals"] = self._send_proposals()
-            elif step == "write_content":
-                results["content"] = self._write_content()
-            elif step == "review_content":
-                results["content_review"] = self._review_content()
-            elif step == "deliver_work":
-                results["delivery"] = self._deliver_work()
-            elif step == "send_invoice":
-                results["invoice"] = self._send_invoices()
-            elif step == "follow_up":
-                results["followup"] = self._follow_up()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results

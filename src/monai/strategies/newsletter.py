@@ -123,19 +123,19 @@ class NewsletterAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "research_niches": self._research_niches,
+            "plan_newsletter": self._plan_newsletter,
+            "write_issue": self._write_issue,
+            "review_issue": self._review_issue,
+            "find_sponsors": self._find_sponsors,
+            "grow_subscribers": self._grow_subscribers,
+        }
+
         for step in steps:
-            if step == "research_niches":
-                results["niches"] = self._research_niches()
-            elif step == "plan_newsletter":
-                results["planned"] = self._plan_newsletter()
-            elif step == "write_issue":
-                results["issue"] = self._write_issue()
-            elif step == "review_issue":
-                results["review"] = self._review_issue()
-            elif step == "find_sponsors":
-                results["sponsors"] = self._find_sponsors()
-            elif step == "grow_subscribers":
-                results["growth"] = self._grow_subscribers()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results

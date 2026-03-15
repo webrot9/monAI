@@ -252,6 +252,10 @@ class BaseAgent(ABC):
         through APIProvisioner which handles API key extraction, webhook setup,
         and payment manager registration — not just account creation.
 
+        Checks provisioner failure history first — if a platform is permanently
+        blocked (e.g., blocks all proxies), skips registration immediately
+        to avoid wasting LLM calls.
+
         Args:
             platform: Platform name (e.g., 'upwork', 'gumroad', 'stripe')
 
@@ -262,6 +266,13 @@ class BaseAgent(ABC):
         if existing:
             self.log_action("account_check", f"Already have {platform} account")
             return {"status": "exists", "account": existing}
+
+        # Check if this platform is blocked from previous failures
+        if self.provisioner._is_provision_blocked("register_on_platform", platform):
+            self.log_action(
+                "account_blocked",
+                f"Skipping {platform} — blocked from previous failure")
+            return {"status": "blocked", "platform": platform}
 
         # Payment providers need full provisioning (keys, webhooks, payment manager)
         if platform.lower() in self.PAYMENT_PROVIDERS:
@@ -336,6 +347,97 @@ class BaseAgent(ABC):
             "or use the platform's login form with stored credentials."
         )
         return self.execute_task(task)
+
+    def run_step(self, step: str, fn: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Execute a strategy step with adaptive learning.
+
+        Wraps step execution: records outcomes, detects failures,
+        and on repeated failures asks the LLM for alternative approaches.
+        Strategies call this instead of calling methods directly.
+        """
+        consecutive_fails = self.get_consecutive_step_failures(step)
+
+        # If step has failed 3+ times, ask LLM for alternative approach
+        if consecutive_fails >= 3:
+            past_failures = self.get_step_failures(step, limit=3)
+            failure_summary = "\n".join(
+                f"- {f.get('error', 'unknown')}" for f in past_failures
+            )
+            alternative = self.think_json(
+                f"The step '{step}' in strategy '{self.name}' has failed "
+                f"{consecutive_fails} consecutive times.\n\n"
+                f"Past failure reasons:\n{failure_summary}\n\n"
+                f"Failure context:\n{self.get_adaptive_context()}\n\n"
+                "Should we:\n"
+                "1. Try a DIFFERENT approach to this step (describe it)\n"
+                "2. Skip this step entirely for now\n"
+                "3. Retry with the same approach (only if failures were transient)\n\n"
+                'Return: {"decision": "retry"|"skip"|"adapt", '
+                '"reason": str, "new_approach": str}',
+            )
+            decision = alternative.get("decision", "retry")
+            if decision == "skip":
+                self.log_action(
+                    f"step_{step}_skipped",
+                    f"Skipped after {consecutive_fails} failures: "
+                    f"{alternative.get('reason', '')}",
+                )
+                self.learn(
+                    "adaptation", f"Step '{step}' skipped after {consecutive_fails} failures",
+                    alternative.get("reason", "repeated failures"),
+                    rule=f"Consider alternative approaches for '{step}'",
+                )
+                return {"status": "skipped", "reason": alternative.get("reason", "")}
+            elif decision == "adapt":
+                # Store the new approach as context for the step
+                new_approach = alternative.get("new_approach", "")
+                if new_approach:
+                    self.log_action(
+                        f"step_{step}_adapting",
+                        f"Trying new approach: {new_approach}",
+                    )
+                    kwargs["_adaptive_hint"] = new_approach
+
+        try:
+            result = fn(*args, **kwargs)
+            # Detect silent failures
+            is_empty = (
+                result is None
+                or (isinstance(result, dict) and (
+                    not result
+                    or result.get("status") in ("error", "failed")
+                    or result.get("error")
+                ))
+                or (isinstance(result, list) and len(result) == 0)
+            )
+            if is_empty:
+                error_msg = ""
+                if isinstance(result, dict):
+                    error_msg = result.get("error", result.get("reason", "empty result"))
+                else:
+                    error_msg = "returned empty/None"
+                self.record_step_outcome(step, False, str(error_msg))
+                self.learn_from_silent_failure(
+                    step, result, expected="non-empty successful result",
+                )
+                return result if isinstance(result, dict) else {"status": "failed", "error": error_msg}
+            else:
+                self.record_step_outcome(step, True)
+                # Share successful discoveries with other strategies
+                if isinstance(result, dict):
+                    summary = json.dumps(result, default=str)[:300]
+                    self.share_knowledge(
+                        category="opportunity",
+                        topic=f"{self.name}_{step}_success",
+                        content=summary,
+                        tags=[self.name, step, "success"],
+                    )
+                return result if isinstance(result, dict) else {"status": "ok", "data": result}
+        except Exception as e:
+            self.record_step_outcome(step, False, str(e))
+            self.learn_from_error(e, context=f"Running step '{step}' in {self.name}")
+            self.log_action(f"step_{step}_error", str(e), result="failed")
+            return {"status": "error", "error": str(e)}
 
     # ── Core Actions ────────────────────────────────────────────
 
@@ -554,6 +656,24 @@ class BaseAgent(ABC):
             )
             parts.append(f"UNREAD MESSAGES:\n{msg_text}")
 
+        # Cross-strategy knowledge — discoveries from other agents
+        try:
+            knowledge = self.memory.query_knowledge(
+                category="opportunity", limit=5,
+            )
+            other_knowledge = [k for k in knowledge if k.get("source_agent") != self.name]
+            if other_knowledge:
+                kn_lines = [
+                    f"- [{k['source_agent']}] {k['topic']}: {k['content'][:120]}"
+                    for k in other_knowledge
+                ]
+                parts.append(
+                    "DISCOVERIES FROM OTHER STRATEGIES (leverage these):\n"
+                    + "\n".join(kn_lines)
+                )
+        except Exception:
+            pass
+
         # Inject recent failures from agent_log so ALL agents see what failed
         try:
             recent_failures = self.db.execute(
@@ -641,6 +761,190 @@ class BaseAgent(ABC):
             json.dumps({"task": task, "context": context or {}}, default=str),
             priority=2,
         )
+
+    # ── Adaptive Learning ────────────────────────────────────────
+
+    # Failure classification patterns for root cause tagging
+    _FAILURE_PATTERNS: dict[str, list[str]] = {
+        "tor_blocked": [
+            "proxy", "tor", "blocked", "captcha", "cloudflare",
+            "access denied", "403", "forbidden",
+        ],
+        "rate_limited": [
+            "rate limit", "429", "too many requests", "throttl",
+        ],
+        "timeout": [
+            "timeout", "timed out", "deadline exceeded",
+        ],
+        "auth_required": [
+            "login", "authentication", "unauthorized", "401", "sign in",
+        ],
+        "not_found": [
+            "404", "not found", "no results", "empty",
+        ],
+        "budget_exceeded": [
+            "budget", "cost limit", "BudgetExceeded",
+        ],
+    }
+
+    @classmethod
+    def classify_failure(cls, error_msg: str) -> str:
+        """Classify a failure into a root cause category.
+
+        Returns one of: tor_blocked, rate_limited, timeout, auth_required,
+        not_found, budget_exceeded, or 'unknown'.
+        """
+        lower = error_msg.lower()
+        for category, patterns in cls._FAILURE_PATTERNS.items():
+            if any(p in lower for p in patterns):
+                return category
+        return "unknown"
+
+    def record_step_outcome(self, step: str, success: bool,
+                            error_summary: str = "", approach: str = ""):
+        """Record the outcome of a strategy step for adaptive planning.
+
+        Tracks consecutive failures per step so strategies can adapt
+        their approach after repeated failures instead of retrying blindly.
+        """
+        root_cause = self.classify_failure(error_summary) if not success and error_summary else ""
+        self.db.execute_insert(
+            "INSERT INTO agent_log (agent_name, action, details, result) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                self.name,
+                f"step_{step}",
+                json.dumps({
+                    "step": step,
+                    "approach": approach,
+                    "error": error_summary,
+                    "root_cause": root_cause,
+                }, default=str)[:500],
+                "ok" if success else "failed",
+            ),
+        )
+
+    def get_step_failures(self, step: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Get recent failures for a specific step.
+
+        Returns failure details so the strategy can adapt its approach.
+        """
+        try:
+            rows = self.db.execute(
+                "SELECT details, timestamp FROM agent_log "
+                "WHERE agent_name = ? AND action = ? AND result = 'failed' "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (self.name, f"step_{step}", limit),
+            )
+            results = []
+            for r in rows:
+                try:
+                    d = json.loads(r["details"]) if r["details"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    d = {"raw": r["details"]}
+                d["timestamp"] = r["timestamp"]
+                results.append(d)
+            return results
+        except Exception:
+            return []
+
+    def get_consecutive_step_failures(self, step: str) -> int:
+        """Count consecutive failures for a step (resets on success)."""
+        try:
+            rows = self.db.execute(
+                "SELECT result FROM agent_log "
+                "WHERE agent_name = ? AND action = ? "
+                "ORDER BY timestamp DESC LIMIT 20",
+                (self.name, f"step_{step}"),
+            )
+            count = 0
+            for r in rows:
+                if r["result"] == "failed":
+                    count += 1
+                else:
+                    break
+            return count
+        except Exception:
+            return 0
+
+    def get_adaptive_context(self) -> str:
+        """Generate failure-aware context for LLM planning.
+
+        Strategies inject this into their LLM calls so the model knows
+        what failed before and can suggest different approaches.
+        """
+        parts = []
+
+        # Recent failures for this agent, grouped by root cause
+        try:
+            failures = self.db.execute(
+                "SELECT action, details, timestamp FROM agent_log "
+                "WHERE agent_name = ? AND result = 'failed' "
+                "ORDER BY timestamp DESC LIMIT 15",
+                (self.name,),
+            )
+            if failures:
+                # Group by root cause for pattern detection
+                by_cause: dict[str, list[str]] = {}
+                for f in failures:
+                    detail = (f["details"] or "")[:150]
+                    try:
+                        d = json.loads(f["details"]) if f["details"] else {}
+                        cause = d.get("root_cause", "unknown")
+                    except (json.JSONDecodeError, TypeError):
+                        cause = "unknown"
+                    by_cause.setdefault(cause, []).append(
+                        f"- {f['action']}: {detail}"
+                    )
+
+                lines = []
+                for cause, items in by_cause.items():
+                    if cause != "unknown":
+                        lines.append(f"  [{cause.upper()}] ({len(items)} failures):")
+                    for item in items[:3]:  # Max 3 per cause
+                        lines.append(f"  {item}")
+
+                systemic = [c for c, items in by_cause.items()
+                            if c in ("tor_blocked", "auth_required") and len(items) >= 2]
+                if systemic:
+                    lines.append(
+                        f"\n  SYSTEMIC ISSUES: {', '.join(systemic)} — "
+                        "use COMPLETELY DIFFERENT approach for these"
+                    )
+
+                parts.append(
+                    "YOUR RECENT FAILURES (do NOT repeat the same approach):\n"
+                    + "\n".join(lines)
+                )
+        except Exception:
+            pass
+
+        # Lessons learned by this agent
+        lessons = self.memory.get_lessons(self.name, include_shared=False)
+        if lessons:
+            lines = [
+                f"- {l['lesson']}" + (f" RULE: {l['rule']}" if l.get('rule') else "")
+                for l in lessons[:5]
+            ]
+            parts.append("YOUR LESSONS LEARNED:\n" + "\n".join(lines))
+
+        # Blocked domains (from executor learning)
+        try:
+            blocked = self.db.execute(
+                "SELECT config_key, config_value FROM agent_config "
+                "WHERE agent_name = ? AND config_key LIKE 'blocked_domain_%'",
+                (self.name,),
+            )
+            if blocked:
+                domains = [r["config_value"] for r in blocked]
+                parts.append(
+                    "BLOCKED DOMAINS (do NOT use these — they block Tor/proxy):\n"
+                    + ", ".join(domains)
+                )
+        except Exception:
+            pass
+
+        return "\n\n".join(parts) if parts else ""
 
     # ── Learning ────────────────────────────────────────────────
 

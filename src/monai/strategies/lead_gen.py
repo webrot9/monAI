@@ -128,17 +128,18 @@ class LeadGenAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "research_niches": self._research_niches,
+            "build_list": self._build_list,
+            "enrich_leads": self._enrich_leads,
+            "qualify_leads": self._qualify_leads,
+            "find_buyers": self._find_buyers,
+        }
+
         for step in steps:
-            if step == "research_niches":
-                results["niches"] = self._research_niches()
-            elif step == "build_list":
-                results["list"] = self._build_list()
-            elif step == "enrich_leads":
-                results["enriched"] = self._enrich_leads()
-            elif step == "qualify_leads":
-                results["qualified"] = self._qualify_leads()
-            elif step == "find_buyers":
-                results["buyers"] = self._find_buyers()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results

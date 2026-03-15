@@ -112,6 +112,11 @@ class CostTracker:
                 sorted_models = sorted(self.cost_by_model.items(), key=lambda x: x[1], reverse=True)
                 self.cost_by_model = dict(sorted_models[:25])
 
+    def calls_remaining(self) -> int:
+        """Return the number of LLM calls remaining in the current cycle."""
+        with self._lock:
+            return max(0, self.max_cycle_calls - self.cycle_calls)
+
     def set_cycle_limits(self, max_cost: float, max_calls: int) -> None:
         """Update per-cycle budget limits."""
         with self._lock:
