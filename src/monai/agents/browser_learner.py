@@ -13,6 +13,7 @@ Wraps the existing Browser class and adds:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -52,6 +53,20 @@ CREATE TABLE IF NOT EXISTS site_playbooks (
     success_rate REAL DEFAULT 0.0,
     total_attempts INTEGER DEFAULT 0,
     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS form_scripts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL,
+    url_pattern TEXT NOT NULL,          -- URL path pattern (e.g. '/signup', '/register')
+    form_signature TEXT NOT NULL,       -- hash of form field names for matching
+    script TEXT NOT NULL,               -- the generated Playwright JS code
+    field_mapping TEXT,                 -- JSON: which fields the script fills
+    success_count INTEGER DEFAULT 0,
+    fail_count INTEGER DEFAULT 0,
+    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(domain, form_signature)
 );
 """
 
@@ -372,6 +387,41 @@ class BrowserLearner:
         all_ok = bool(filled_results) and all(
             r.get("success") for r in filled_results
         )
+
+        # --- Code-gen fallback: when standard fill fails, write & execute a script ---
+        if not all_ok:
+            failed_fields = {
+                sel: val for sel, val in fields.items()
+                if not results.get(sel, {}).get("success")
+                and not results.get(sel, {}).get("skipped")
+            }
+            if failed_fields:
+                logger.info(
+                    f"Standard fill failed on {len(failed_fields)} fields on "
+                    f"{domain}, attempting code-gen fallback"
+                )
+                codegen_result = await self._codegen_fill_form(
+                    failed_fields, domain)
+                if codegen_result.get("success"):
+                    # Update results for the fields that codegen handled
+                    for sel in failed_fields:
+                        results[sel] = {
+                            "success": True,
+                            "codegen": True,
+                            "script_used": True,
+                        }
+                    # Recompute success
+                    filled_results = [
+                        r for r in results.values() if not r.get("skipped")]
+                    all_ok = bool(filled_results) and all(
+                        r.get("success") for r in filled_results)
+                    logger.info(
+                        f"Code-gen fallback succeeded for {len(failed_fields)} "
+                        f"fields on {domain}")
+                else:
+                    logger.warning(
+                        f"Code-gen fallback also failed on {domain}: "
+                        f"{codegen_result.get('error', 'unknown')}")
 
         # Self-healing: check for CAPTCHA after filling form
         if all_ok:
@@ -796,6 +846,296 @@ class BrowserLearner:
                 "INSERT INTO site_playbooks (domain, known_selectors) VALUES (?, ?)",
                 (domain, json.dumps({old_selector: new_selector})),
             )
+
+    # ── Code-Generation Fallback ─────────────────────────────────
+    #
+    # When standard selector-based form filling fails, the agent writes
+    # a Playwright script tailored to the exact page DOM, executes it,
+    # and caches it for reuse.  This is the "write code to solve it"
+    # capability that turns the agent from a dumb tool-caller into an
+    # adaptive coder.
+
+    async def _codegen_fill_form(
+        self, fields: dict[str, str], domain: str
+    ) -> dict[str, Any]:
+        """Generate and execute a Playwright script to fill form fields.
+
+        This is the nuclear option: when pre-healing + LLM selector matching
+        both fail, we ask the LLM to write actual Playwright code that
+        interacts with the page directly.  The script runs in the current
+        page context via page.evaluate() for JS or via Playwright API calls.
+
+        The generated script is cached in form_scripts for reuse on the
+        same form in future sessions.
+        """
+        try:
+            page = await self.browser._get_page()
+            url = page.url
+            url_path = urlparse(url).path
+
+            # 1. Check cache first — maybe we already have a working script
+            form_sig = self._form_signature(fields)
+            cached = self._get_cached_script(domain, form_sig)
+            if cached:
+                logger.info(
+                    f"Found cached form script for {domain}{url_path}")
+                result = await self._execute_form_script(
+                    page, cached, fields)
+                if result.get("success"):
+                    self._update_script_stats(domain, form_sig, success=True)
+                    return result
+                else:
+                    # Cached script failed — it might be stale
+                    self._update_script_stats(domain, form_sig, success=False)
+                    logger.info(
+                        f"Cached script failed for {domain}, regenerating")
+
+            # 2. Extract full page context for the LLM
+            page_html = await page.evaluate("""() => {
+                // Get a minimal but informative DOM snapshot
+                const forms = document.querySelectorAll('form');
+                if (forms.length > 0) {
+                    return Array.from(forms).map(f => f.outerHTML).join('\\n');
+                }
+                // No form tags — get the main content area
+                const main = document.querySelector('main, [role="main"], .main, #app, #root, body');
+                return main ? main.innerHTML.substring(0, 15000) : document.body.innerHTML.substring(0, 15000);
+            }""")
+
+            elements = await self._discover_form_elements(domain)
+
+            # 3. Ask LLM to write a Playwright script
+            script = self._generate_form_script(
+                fields, elements, page_html, url, domain)
+            if not script:
+                return {"success": False, "error": "LLM failed to generate script"}
+
+            # 4. Execute the script
+            result = await self._execute_form_script(page, script, fields)
+
+            # 5. Cache if successful
+            if result.get("success"):
+                self._cache_form_script(
+                    domain, url_path, form_sig, script, fields)
+                logger.info(
+                    f"Generated and cached form script for {domain}{url_path}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Code-gen form fill failed on {domain}: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _generate_form_script(
+        self,
+        fields: dict[str, str],
+        elements: list[dict],
+        page_html: str,
+        url: str,
+        domain: str,
+    ) -> str | None:
+        """Ask LLM to write Playwright JS code to fill the form.
+
+        Returns executable JavaScript code or None on failure.
+        """
+        fields_desc = json.dumps(
+            {k: f"<value:{k}>" for k in fields}, indent=2)
+        elements_summary = json.dumps(elements[:30], indent=2)
+        # Truncate HTML to keep prompt reasonable
+        html_snippet = page_html[:8000]
+
+        prompt = (
+            f"You are writing Playwright JavaScript code to fill a form on {url}.\n\n"
+            f"## Form Fields to Fill\n"
+            f"```json\n{fields_desc}\n```\n"
+            f"The actual values will be injected at runtime via the `FIELD_VALUES` object.\n\n"
+            f"## Interactive Elements on Page\n"
+            f"```json\n{elements_summary}\n```\n\n"
+            f"## Page HTML (truncated)\n"
+            f"```html\n{html_snippet}\n```\n\n"
+            f"## Requirements\n"
+            f"Write a JavaScript async function body that:\n"
+            f"1. Finds and fills each form field using the ACTUAL selectors from the DOM\n"
+            f"2. Handles React/Vue/Angular apps (use input events, not just .value=)\n"
+            f"3. Dispatches proper events (input, change, blur) so frameworks detect the change\n"
+            f"4. Handles multi-step forms (click Next/Continue if needed before filling later fields)\n"
+            f"5. Uses human-like delays between fields (50-200ms)\n"
+            f"6. Returns a JSON object: {{filled: ['field1', 'field2'], failed: ['field3']}}\n\n"
+            f"## Template\n"
+            f"The code will be wrapped in: `async (FIELD_VALUES) => {{ <YOUR CODE> }}`\n"
+            f"FIELD_VALUES is an object mapping original field keys to their values.\n\n"
+            f"## CRITICAL\n"
+            f"- Return ONLY the function body (no wrapping function declaration)\n"
+            f"- Use document.querySelector, NOT Playwright selectors\n"
+            f"- To trigger React state updates, use: \n"
+            f"  `Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, val);\n"
+            f"   el.dispatchEvent(new Event('input', {{bubbles: true}}));\n"
+            f"   el.dispatchEvent(new Event('change', {{bubbles: true}}));`\n"
+            f"- Do NOT use alert(), confirm(), or prompt()\n"
+            f"- No network requests\n"
+            f"- Return ONLY raw JavaScript, no markdown fences"
+        )
+
+        try:
+            response = self.llm.quick(prompt, max_tokens=2000)
+            script = response.strip()
+            # Strip markdown fencing if present
+            if script.startswith("```"):
+                script = script.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            # Basic safety check
+            if any(danger in script.lower() for danger in [
+                "fetch(", "xmlhttprequest", "navigator.sendbeacon",
+                "window.location", "document.cookie",
+                "localstorage", "sessionstorage",
+            ]):
+                logger.warning(
+                    "Generated form script contains dangerous patterns, rejecting")
+                return None
+            return script
+        except Exception as e:
+            logger.error(f"LLM script generation failed: {e}")
+            return None
+
+    async def _execute_form_script(
+        self, page, script: str, fields: dict[str, str]
+    ) -> dict[str, Any]:
+        """Execute a generated form-fill script on the page.
+
+        The script runs inside page.evaluate() with field values injected.
+        Human-like delays are handled inside the script itself.
+        """
+        # Wrap the script body in an async IIFE with field values
+        wrapped = f"""
+        async (fieldValues) => {{
+            const FIELD_VALUES = fieldValues;
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
+            try {{
+                {script}
+            }} catch (err) {{
+                return {{filled: [], failed: Object.keys(fieldValues), error: err.message}};
+            }}
+        }}
+        """
+        try:
+            result = await page.evaluate(wrapped, fields)
+            if not isinstance(result, dict):
+                result = {"filled": list(fields.keys()), "failed": []}
+
+            filled = result.get("filled", [])
+            failed = result.get("failed", [])
+            error = result.get("error")
+
+            if error:
+                logger.warning(f"Form script execution error: {error}")
+
+            success = len(filled) > 0 and len(failed) == 0
+            return {
+                "success": success,
+                "filled": filled,
+                "failed": failed,
+                "error": error,
+                "codegen": True,
+            }
+        except Exception as e:
+            logger.error(f"Form script execution failed: {e}")
+            return {"success": False, "error": str(e), "codegen": True}
+
+    async def run_page_script(self, script: str, args: dict | None = None) -> dict[str, Any]:
+        """Execute arbitrary Playwright JS on the current page.
+
+        This is the public API that the executor's `run_page_script` tool
+        calls.  It gives the agent the ability to write code and run it
+        against any page, not just forms.
+
+        Safety: scripts run in the browser sandbox (no Node.js access,
+        no file system, no network beyond what the page can do).
+        """
+        page = await self.browser._get_page()
+        domain = urlparse(page.url).netloc
+
+        # Safety check
+        dangerous = [
+            "fetch(", "xmlhttprequest", "navigator.sendbeacon",
+            "window.open", "document.cookie",
+        ]
+        if any(d in script.lower() for d in dangerous):
+            return {
+                "success": False,
+                "error": "Script contains blocked patterns (no network/cookie access)",
+            }
+
+        start = time.time()
+        try:
+            if args:
+                wrapped = f"async (args) => {{ {script} }}"
+                result = await page.evaluate(wrapped, args)
+            else:
+                wrapped = f"async () => {{ {script} }}"
+                result = await page.evaluate(wrapped)
+
+            duration = int((time.time() - start) * 1000)
+            self._log_action(domain, "run_script", None, page.url, True,
+                             duration=duration, countermeasure="codegen")
+            return {"success": True, "result": result, "duration_ms": duration}
+
+        except Exception as e:
+            duration = int((time.time() - start) * 1000)
+            self._log_action(domain, "run_script", None, page.url, False,
+                             "script_error", str(e), duration)
+            return {"success": False, "error": str(e), "duration_ms": duration}
+
+    # ── Form Script Cache ─────────────────────────────────────────
+
+    @staticmethod
+    def _form_signature(fields: dict[str, str]) -> str:
+        """Create a stable hash of field names for cache matching."""
+        keys = sorted(fields.keys())
+        return hashlib.sha256("|".join(keys).encode()).hexdigest()[:16]
+
+    def _get_cached_script(self, domain: str, form_sig: str) -> str | None:
+        """Retrieve a cached form script if it exists and has good success rate."""
+        rows = self.db.execute(
+            "SELECT script, success_count, fail_count FROM form_scripts "
+            "WHERE domain = ? AND form_signature = ?",
+            (domain, form_sig),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        # Don't use scripts that fail more than they succeed (after 2+ uses)
+        total = row["success_count"] + row["fail_count"]
+        if total >= 2 and row["fail_count"] > row["success_count"]:
+            logger.info(
+                f"Cached script for {domain} has poor success rate "
+                f"({row['success_count']}/{total}), skipping")
+            return None
+        return row["script"]
+
+    def _cache_form_script(
+        self, domain: str, url_pattern: str, form_sig: str,
+        script: str, fields: dict[str, str]
+    ) -> None:
+        """Cache a successful form script for reuse."""
+        field_mapping = json.dumps(list(fields.keys()))
+        self.db.execute(
+            "INSERT OR REPLACE INTO form_scripts "
+            "(domain, url_pattern, form_signature, script, field_mapping, "
+            "success_count, last_used) "
+            "VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)",
+            (domain, url_pattern, form_sig, script, field_mapping),
+        )
+
+    def _update_script_stats(
+        self, domain: str, form_sig: str, success: bool
+    ) -> None:
+        """Update success/fail counts for a cached script."""
+        col = "success_count" if success else "fail_count"
+        self.db.execute(
+            f"UPDATE form_scripts SET {col} = {col} + 1, "
+            "last_used = CURRENT_TIMESTAMP "
+            "WHERE domain = ? AND form_signature = ?",
+            (domain, form_sig),
+        )
 
     # ── Human-Like Behavior ───────────────────────────────────────
 

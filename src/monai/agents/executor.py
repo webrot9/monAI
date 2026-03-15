@@ -54,8 +54,9 @@ Available tools:
 15. wait(seconds) — Wait for a specified time
 16. wait_for(selector, timeout) — Wait for an element to appear on the page (timeout in seconds, default 10)
 17. create_tool(name, description, code) — Create a new reusable tool at runtime
-18. done(result) — Signal task completion with a result
-19. fail(reason) — Signal task failure with a reason
+18. run_page_script(script, args) — Execute custom JavaScript on the current page. Use this when standard fill_form/click/type fail. Write Playwright-compatible JS that interacts with the DOM directly. args is an optional JSON object passed to the script. The script runs as an async function body with access to `args`. Use document.querySelector, dispatchEvent, etc. For React/Vue apps, trigger proper input events. No network requests or cookie access allowed. Returns {success, result}.
+19. done(result) — Signal task completion with a result
+20. fail(reason) — Signal task failure with a reason
 """
 
 # Backward-compat alias
@@ -397,6 +398,16 @@ class AutonomousExecutor:
             "- Be efficient. Change strategy when things aren't working.\n"
             "- NEVER post to example.com or made-up/placeholder URLs — they don't exist\n"
             "- NEVER create accounts on platforms NOT mentioned in the task\n"
+            "\n"
+            "FORM INTERACTION STRATEGY:\n"
+            "- fill_form has automatic self-healing and code-gen fallback — try it first\n"
+            "- If fill_form STILL fails: use run_page_script to write custom JS that\n"
+            "  interacts with the DOM directly. Read the page first to understand the\n"
+            "  form structure, then write targeted code.\n"
+            "- For React/Angular/Vue apps: use run_page_script with proper input events\n"
+            "  (dispatchEvent, React's internal setter) — simple .value= won't work.\n"
+            "- For multi-step wizards: write a script that clicks through steps AND fills fields.\n"
+            "- You are a CODER. When standard tools fail, WRITE CODE to solve the problem.\n"
             "- NEVER run diagnostic loops (checking IP, proxy status, SSL) unless the task requires it\n"
             "- STAY ON TASK. If the task is 'register on X', only interact with X — not Y or Z\n"
             "- If the core action is impossible (site blocked, missing credentials), call fail() immediately"
@@ -600,6 +611,31 @@ class AutonomousExecutor:
                 else:
                     await self.browser.fill_form(fields)
                     return f"Filled {len(fields)} fields"
+
+            elif tool == "run_page_script":
+                script = args.get("script", "")
+                script_args = args.get("args")
+                if not script:
+                    return "ERROR: script is required"
+                if self._learner:
+                    result = await self._learner.run_page_script(
+                        script, args=script_args)
+                    if result.get("success"):
+                        return json.dumps(result.get("result", "Script executed"))
+                    return f"ERROR: Script failed: {result.get('error', 'unknown')}"
+                else:
+                    # Fallback: execute directly on page
+                    page = await self.browser._get_page()
+                    try:
+                        if script_args:
+                            wrapped = f"async (args) => {{ {script} }}"
+                            r = await page.evaluate(wrapped, script_args)
+                        else:
+                            wrapped = f"async () => {{ {script} }}"
+                            r = await page.evaluate(wrapped)
+                        return json.dumps(r) if r else "Script executed"
+                    except Exception as e:
+                        return f"ERROR: Script failed: {e}"
 
             elif tool == "submit":
                 selector = args.get("selector", "form")
