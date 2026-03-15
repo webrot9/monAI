@@ -252,6 +252,10 @@ class BaseAgent(ABC):
         through APIProvisioner which handles API key extraction, webhook setup,
         and payment manager registration — not just account creation.
 
+        Checks provisioner failure history first — if a platform is permanently
+        blocked (e.g., blocks all proxies), skips registration immediately
+        to avoid wasting LLM calls.
+
         Args:
             platform: Platform name (e.g., 'upwork', 'gumroad', 'stripe')
 
@@ -262,6 +266,13 @@ class BaseAgent(ABC):
         if existing:
             self.log_action("account_check", f"Already have {platform} account")
             return {"status": "exists", "account": existing}
+
+        # Check if this platform is blocked from previous failures
+        if self.provisioner._is_provision_blocked("register_on_platform", platform):
+            self.log_action(
+                "account_blocked",
+                f"Skipping {platform} — blocked from previous failure")
+            return {"status": "blocked", "platform": platform}
 
         # Payment providers need full provisioning (keys, webhooks, payment manager)
         if platform.lower() in self.PAYMENT_PROVIDERS:

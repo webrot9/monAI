@@ -38,6 +38,14 @@ class Provisioner(BaseAgent):
     # Escalates: 1hr → 6hr → 24hr on repeated failures.
     _PROVISION_FAIL_TTL_TIERS = [3600, 21600, 86400]
 
+    # Patterns in failure reasons that indicate permanent proxy blockage.
+    # These platforms block ALL anonymous access — retrying is pointless.
+    _PROXY_BLOCK_PATTERNS = [
+        "all proxies blocked",
+        "all proxy methods are blocked",
+        "refusing to connect without proxy",
+    ]
+
     _PROVISION_FAIL_SCHEMA = """\
     CREATE TABLE IF NOT EXISTS provision_failures (
         action TEXT NOT NULL,
@@ -45,6 +53,7 @@ class Provisioner(BaseAgent):
         failed_at REAL NOT NULL,
         fail_count INTEGER DEFAULT 1,
         reason TEXT,
+        permanent INTEGER DEFAULT 0,
         PRIMARY KEY (action, platform)
     );
     """
@@ -62,12 +71,15 @@ class Provisioner(BaseAgent):
     def _is_provision_blocked(self, action: str, platform: str) -> bool:
         """Check if a provisioning action is still blocked from a past failure."""
         rows = self.db.execute(
-            "SELECT failed_at, fail_count FROM provision_failures "
+            "SELECT failed_at, fail_count, permanent FROM provision_failures "
             "WHERE action = ? AND platform = ?",
             (action, platform),
         )
         if not rows:
             return False
+        # Permanent blocks (proxy-blocked platforms) never expire
+        if rows[0].get("permanent"):
+            return True
         failed_at = rows[0]["failed_at"]
         count = rows[0]["fail_count"]
         tier = min(count - 1, len(self._PROVISION_FAIL_TTL_TIERS) - 1)
@@ -81,44 +93,67 @@ class Provisioner(BaseAgent):
         )
         return False
 
+    def _is_proxy_block_failure(self, reason: str) -> bool:
+        """Check if a failure reason indicates permanent proxy blockage."""
+        reason_lower = reason.lower()
+        return any(p in reason_lower for p in self._PROXY_BLOCK_PATTERNS)
+
     def _record_provision_failure(self, action: str, platform: str,
                                   reason: str = "") -> None:
-        """Record a provisioning failure with escalating TTL."""
+        """Record a provisioning failure with escalating TTL.
+
+        Proxy-blocked failures are marked permanent — the platform blocks
+        all anonymous proxies and retrying is pointless waste.
+        """
         now = time.time()
+        permanent = 1 if self._is_proxy_block_failure(reason) else 0
         rows = self.db.execute(
-            "SELECT fail_count FROM provision_failures "
+            "SELECT fail_count, permanent FROM provision_failures "
             "WHERE action = ? AND platform = ?",
             (action, platform),
         )
         count = (rows[0]["fail_count"] + 1) if rows else 1
+        # Once permanent, stays permanent
+        if rows and rows[0].get("permanent"):
+            permanent = 1
         self.db.execute(
             "INSERT INTO provision_failures (action, platform, failed_at, "
-            "fail_count, reason) VALUES (?, ?, ?, ?, ?) "
+            "fail_count, reason, permanent) VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(action, platform) DO UPDATE SET "
             "failed_at = excluded.failed_at, "
             "fail_count = excluded.fail_count, "
-            "reason = excluded.reason",
-            (action, platform, now, count, reason[:500]),
+            "reason = excluded.reason, "
+            "permanent = MAX(provision_failures.permanent, excluded.permanent)",
+            (action, platform, now, count, reason[:500], permanent),
         )
-        tier = min(count - 1, len(self._PROVISION_FAIL_TTL_TIERS) - 1)
-        ttl = self._PROVISION_FAIL_TTL_TIERS[tier]
-        logger.info(
-            f"Provisioning failure #{count} for {action}:{platform} — "
-            f"blocked for {ttl}s"
-        )
+        if permanent:
+            logger.info(
+                f"Provisioning failure #{count} for {action}:{platform} — "
+                f"PERMANENTLY blocked (proxy-blocked platform)")
+        else:
+            tier = min(count - 1, len(self._PROVISION_FAIL_TTL_TIERS) - 1)
+            ttl = self._PROVISION_FAIL_TTL_TIERS[tier]
+            logger.info(
+                f"Provisioning failure #{count} for {action}:{platform} — "
+                f"blocked for {ttl}s"
+            )
 
     def _get_failure_context(self) -> str:
         """Build human-readable failure history for LLM context injection."""
         rows = self.db.execute(
-            "SELECT action, platform, fail_count, reason "
+            "SELECT action, platform, fail_count, reason, permanent "
             "FROM provision_failures ORDER BY fail_count DESC"
         )
         if not rows:
             return ""
         lines = ["PAST PROVISIONING FAILURES (do NOT retry these — choose alternatives):"]
         for r in rows:
-            blocked = self._is_provision_blocked(r["action"], r["platform"])
-            status = "STILL BLOCKED" if blocked else "TTL expired, may retry"
+            if r.get("permanent"):
+                status = "PERMANENTLY BLOCKED — platform blocks all proxies, NEVER retry"
+            elif self._is_provision_blocked(r["action"], r["platform"]):
+                status = "STILL BLOCKED"
+            else:
+                status = "TTL expired, may retry"
             lines.append(
                 f"  - {r['action']} on {r['platform']}: "
                 f"failed {r['fail_count']}x — {r['reason'] or 'unknown'} [{status}]"
@@ -160,7 +195,17 @@ class Provisioner(BaseAgent):
         )
         steps = plan.get("steps", [])
         self.log_action("plan", f"Identified {len(steps)} provisioning steps")
-        return [s["action"] for s in sorted(steps, key=lambda x: x.get("priority", 99))]
+        # Include platform in goal string so the constraint planner
+        # can extract it (e.g., "register_on_platform on upwork")
+        goals = []
+        for s in sorted(steps, key=lambda x: x.get("priority", 99)):
+            action = s.get("action", "")
+            platform = s.get("platform", "")
+            if platform and platform.lower() not in action.lower():
+                goals.append(f"{action} on {platform}")
+            else:
+                goals.append(action)
+        return goals
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
         """Run provisioning cycle with constraint-aware planning.

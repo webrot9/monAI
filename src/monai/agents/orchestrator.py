@@ -223,6 +223,21 @@ class Orchestrator(BaseAgent):
         except Exception:
             pass
 
+        # 4. Sub-agent failures — prevent LLM from re-generating the same tasks
+        try:
+            rows = self.db.execute(
+                "SELECT task_name, fail_count, reason "
+                "FROM subagent_failures ORDER BY fail_count DESC LIMIT 15"
+            )
+            for r in rows:
+                lines.append(
+                    f"[subagent_failure] '{r['task_name']}': "
+                    f"failed {r['fail_count']}x — {r['reason'] or 'unknown'}. "
+                    f"Do NOT re-spawn this task."
+                )
+        except Exception:
+            pass
+
         return lines
 
     def plan(self) -> list[str]:
@@ -269,6 +284,10 @@ class Orchestrator(BaseAgent):
     def run(self, **kwargs: Any) -> dict[str, Any]:
         """Execute one full autonomous orchestration cycle."""
         self._cycle += 1
+        # Reset executor cancellation flag for this cycle
+        from monai.agents.executor import AutonomousExecutor
+        AutonomousExecutor.reset_cycle()
+
         self.log_action("cycle_start", f"Cycle {self._cycle} at {datetime.now()}")
         self.journal("plan", f"Starting cycle {self._cycle}")
         self.audit.log("orchestrator", "system", "cycle_start",
@@ -431,11 +450,13 @@ class Orchestrator(BaseAgent):
                            details={"action": ar["action"]},
                            result=str(ar.get("result", ""))[:200])
 
-        # Phase 5.5: Ethics check — test agents before letting them operate
-        cycle_result["ethics"] = self._run_ethics_checks()
-
-        # Phase 6: Run registered strategy agents
+        # Phase 6: Run registered strategy agents (revenue work first)
         cycle_result["strategy_results"] = self._run_strategies()
+
+        # Phase 6.1: Ethics check — run AFTER strategies to avoid burning
+        # budget before revenue work.  Strategies already have internal
+        # guardrails; ethics tests are a secondary verification layer.
+        cycle_result["ethics"] = self._run_ethics_checks()
 
         # Phase 6.3: Run workflow pipelines (if any are scheduled)
         cycle_result["workflows"] = self._run_scheduled_workflows()
@@ -841,7 +862,22 @@ class Orchestrator(BaseAgent):
 
         if needs:
             self.log_action("provisioning", f"Need to set up: {needs}")
-            result = self.provisioner.run()
+            # Guard: cap provisioning to 40% of cycle budget so strategies
+            # get enough calls.  Provisioning is important but not if it
+            # starves all revenue work.
+            calls_before = self.cost_tracker.cycle_calls
+            max_provisioning_calls = int(self.cost_tracker.max_cycle_calls * 0.4)
+            saved_limit = self.cost_tracker.max_cycle_calls
+            self.cost_tracker.max_cycle_calls = calls_before + max_provisioning_calls
+            try:
+                result = self.provisioner.run()
+            except BudgetExceededError:
+                logger.warning(
+                    "Provisioning hit budget cap — saving remaining "
+                    "budget for strategy execution")
+                result = {"status": "budget_capped"}
+            finally:
+                self.cost_tracker.max_cycle_calls = saved_limit
 
         # Bootstrap funding phase check
         bootstrap_phase = self.bootstrap_wallet.get_funding_phase()
@@ -1532,9 +1568,20 @@ class Orchestrator(BaseAgent):
         return self.telegram.notify_creator(message)
 
     def _run_ethics_checks(self) -> dict[str, Any]:
-        """Run ethics tests on all registered agents before they operate."""
-        from monai.utils.llm import BudgetExceededError
+        """Run ethics tests on registered agents.
+
+        Runs AFTER strategies to avoid burning budget before revenue work.
+        Skips entirely if insufficient budget remaining (<30 calls).
+        """
         results = {}
+
+        # Skip ethics entirely if budget is low — strategies already ran
+        remaining = self.cost_tracker.max_cycle_calls - self.cost_tracker.cycle_calls
+        if remaining < 30:
+            logger.info(
+                f"Ethics checks skipped — only {remaining} calls remaining "
+                f"(need ≥30)")
+            return {"status": "skipped", "reason": "insufficient_budget"}
 
         # Auto-reset agents quarantined for > 24 hours (false positive recovery)
         reset_agents = self.ethics_tester.auto_reset_stale_quarantines(max_age_hours=24)

@@ -103,5 +103,31 @@
 - [x] BrowserLearner CAPTCHA detection after form fill
 - [x] Executor stuck-loop watchdog (aborts on 4 identical non-failing actions)
 
-## Next Up
-- [ ] First real deployment test (end-to-end with a real Ko-fi page)
+## Next Up — Structural Fixes (Stop the Infinite Failure Loop)
+
+After 4 cycles: €0 revenue, -€16 API costs, zero accounts registered. System burns 200+ calls/cycle on overhead.
+
+### Fix 1: Provisioner retries Tor-blocked platforms forever
+- [ ] Add proxy-blocked platform detection (persistent, not TTL-based)
+- [ ] Skip blocked platforms in provisioner plan + execution
+
+### Fix 2: Empty platform name in constraint planner steps
+- [ ] Inherit platform from goal text into template steps
+
+### Fix 3: Ethics checks burn budget before strategies run
+- [ ] Move ethics to after strategy execution
+- [ ] Skip ethics if <30 calls remaining
+- [ ] Use lite mode (4 critical tests) for routine checks
+
+### Fix 4: Strategies start without required accounts
+- [ ] Add required_accounts prereq check to _run_strategies
+- [ ] Skip strategies whose platforms aren't registered
+
+### Fix 5: Sub-agents respawned with same impossible tasks
+- [ ] Inject sub-agent failure history into plan() LLM context
+
+### Fix 6: Watchdog kills cycle but leaves orphaned sub-agents
+- [ ] Add cycle-scoped cancellation flag checked between executor steps
+
+### Fix 7: No budget reservation — phases compete for 200 calls
+- [ ] Add per-phase budget caps to CostTracker

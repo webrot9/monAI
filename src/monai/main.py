@@ -254,7 +254,9 @@ def run_daemon(config: Config, cycle_interval: int = 300):
                         elapsed_wait += 1
                         continue
                 else:
-                    # Exceeded cycle_timeout
+                    # Exceeded cycle_timeout — signal all executors to stop
+                    from monai.agents.executor import AutonomousExecutor
+                    AutonomousExecutor.cancel_cycle()
                     logger.critical(
                         f"WATCHDOG: Cycle {cycle} exceeded {cycle_timeout}s timeout — "
                         "force-completing and moving to next cycle"

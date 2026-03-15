@@ -72,6 +72,20 @@ class AutonomousExecutor:
     MAX_FAILURE_RATIO = 0.7  # 70% of steps failing = abort
     MIN_STEPS_FOR_RATIO = 6  # don't apply ratio check before this many steps
 
+    # Class-level cancellation flag — set by the watchdog to stop all
+    # in-flight executors when a cycle times out.
+    _cycle_cancelled = False
+
+    @classmethod
+    def cancel_cycle(cls) -> None:
+        """Signal all running executors to stop."""
+        cls._cycle_cancelled = True
+
+    @classmethod
+    def reset_cycle(cls) -> None:
+        """Clear the cancellation flag at the start of a new cycle."""
+        cls._cycle_cancelled = False
+
     def __init__(self, config: Config, db: Database, llm: LLM,
                  max_steps: int = 30, headless: bool = True,
                  timeout_seconds: int = 3600):
@@ -129,6 +143,16 @@ class AutonomousExecutor:
                 await self.browser.start()
 
             for step in range(self.max_steps):
+                # Check cycle-level cancellation (watchdog timeout)
+                if self._cycle_cancelled:
+                    self._log_task(task, "cancelled", "Cycle cancelled by watchdog")
+                    return {
+                        "status": "cancelled",
+                        "reason": "cycle_timeout",
+                        "steps": step,
+                        "history": self.action_history,
+                    }
+
                 # Enforce time limit
                 elapsed = time.time() - start_time
                 if elapsed > self.timeout_seconds:
