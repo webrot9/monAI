@@ -383,6 +383,9 @@ class Orchestrator(BaseAgent):
         # Phase 0.6: Process collaboration hub (help requests between agents)
         cycle_result["help_requests"] = self._process_help_requests()
 
+        # Phase 0.9: Asset verification — check that stored assets actually work
+        cycle_result["asset_verification"] = self._verify_stored_assets()
+
         # Phase 1: Self-check — do I have what I need?
         cycle_result["provisioning"] = self._ensure_infrastructure()
 
@@ -781,6 +784,42 @@ class Orchestrator(BaseAgent):
                     rate_percentage=self.config.llc.contractor_rate_percentage,
                     payment_method=self.config.llc.contractor_payment_method,
                 )
+
+    def _verify_stored_assets(self) -> dict[str, Any]:
+        """Verify stored assets actually exist before using them.
+
+        Checks emails (Mailslurp inboxes), API keys, etc.
+        Marks dead assets as 'suspended' so provisioning knows to
+        create new ones instead of reusing broken resources.
+        """
+        try:
+            from monai.agents.email_verifier import EmailVerifier
+            verifier = EmailVerifier(self.config, self.db)
+            result = self.identity.verify_stored_assets(verifier)
+            if result["suspended"]:
+                self.log_action(
+                    "asset_verification",
+                    f"SUSPENDED {len(result['suspended'])} dead assets: "
+                    f"{result['suspended']}"
+                )
+                # Store lesson so planner knows
+                self.learn(
+                    "asset_cleanup",
+                    "Dead assets found and suspended",
+                    f"Suspended: {result['suspended']}. "
+                    f"These will be re-provisioned.",
+                    rule="Always verify assets before using them",
+                    severity="warning",
+                )
+            else:
+                self.log_action(
+                    "asset_verification",
+                    f"All {len(result['verified'])} assets verified OK"
+                )
+            return result
+        except Exception as e:
+            logger.warning(f"Asset verification failed: {e}")
+            return {"error": str(e)}
 
     def _ensure_infrastructure(self) -> dict[str, Any]:
         """Check and provision any missing infrastructure."""

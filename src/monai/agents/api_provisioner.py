@@ -863,14 +863,22 @@ class APIProvisioner(BaseAgent):
         # Preferred: create a Mailslurp inbox (real, persistent, API-based)
         ms_result = self.email_verifier.create_mailslurp_inbox(name=brand)
         if ms_result.get("status") == "created":
-            self.identity.store_account(
-                platform="email",
-                identifier=ms_result["address"],
-                credentials={"inbox_id": ms_result["inbox_id"]},
-                metadata={"brand": brand, "type": "mailslurp",
-                          "inbox_id": ms_result["inbox_id"]},
-            )
-            return ms_result["address"]
+            # Verify the inbox actually exists before storing
+            inbox_id = ms_result["inbox_id"]
+            if self.email_verifier.verify_mailslurp_inbox(inbox_id):
+                self.identity.store_account(
+                    platform="email",
+                    identifier=ms_result["address"],
+                    credentials={"inbox_id": inbox_id},
+                    metadata={"brand": brand, "type": "mailslurp",
+                              "inbox_id": inbox_id},
+                )
+                return ms_result["address"]
+            else:
+                logger.warning(
+                    f"Mailslurp inbox {inbox_id} created but verification "
+                    f"failed — NOT storing as brand email for '{brand}'"
+                )
 
         # Fallback: reuse ANY existing active temp email to avoid burning
         # through mail.tm rate limits (creating N emails for N brands).

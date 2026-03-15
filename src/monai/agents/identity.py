@@ -271,6 +271,95 @@ class IdentityManager:
         )
         return rows[0]["total"]
 
+    def mark_suspended(self, platform: str, reason: str = "") -> None:
+        """Mark a stored account/asset as suspended (dead, expired, revoked)."""
+        self.db.execute(
+            "UPDATE identities SET status = 'suspended', "
+            "updated_at = CURRENT_TIMESTAMP "
+            "WHERE platform = ? AND status = 'active'",
+            (platform,),
+        )
+        logger.warning(f"Marked '{platform}' as suspended: {reason}")
+
+    def verify_stored_assets(self, email_verifier) -> dict[str, Any]:
+        """Verify that stored assets actually exist and work.
+
+        Checks emails (Mailslurp inboxes) and API keys.  Marks dead
+        assets as 'suspended' so the system stops using them.
+
+        Returns a summary of what was verified and what was killed.
+        """
+        results: dict[str, Any] = {"verified": [], "suspended": [], "errors": []}
+
+        # 1. Verify email accounts (Mailslurp inboxes)
+        email_rows = self.db.execute(
+            "SELECT id, platform, identifier, credentials, metadata "
+            "FROM identities WHERE type = 'platform_account' "
+            "AND platform = 'email' AND status = 'active'"
+        )
+        # Also check the primary email
+        primary_rows = self.db.execute(
+            "SELECT id, platform, identifier, credentials, metadata "
+            "FROM identities WHERE type = 'agent_identity' "
+            "AND status = 'active' AND platform = 'email'"
+        )
+        # And explicit email type
+        email_type_rows = self.db.execute(
+            "SELECT id, platform, identifier, credentials, metadata "
+            "FROM identities WHERE platform = 'email' AND status = 'active'"
+        )
+
+        all_email_rows = {r["id"]: r for r in [*email_rows, *primary_rows, *email_type_rows]}
+        for row in all_email_rows.values():
+            row = dict(row)
+            try:
+                meta = json.loads(row.get("metadata") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+            inbox_id = meta.get("inbox_id")
+            creds = self._decrypt_credentials(row.get("credentials"))
+            if not inbox_id and creds:
+                inbox_id = creds.get("inbox_id")
+            identifier = row.get("identifier", "?")
+
+            if inbox_id and email_verifier:
+                # Verify the inbox still exists
+                if email_verifier.verify_mailslurp_inbox(inbox_id):
+                    results["verified"].append(f"email:{identifier}")
+                    logger.info(f"Email verified: {identifier}")
+                else:
+                    # Dead inbox — mark suspended
+                    self.db.execute(
+                        "UPDATE identities SET status = 'suspended', "
+                        "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (row["id"],),
+                    )
+                    results["suspended"].append(f"email:{identifier}")
+                    logger.warning(f"Email DEAD, suspended: {identifier}")
+            else:
+                # No inbox_id — can't verify, leave as-is but warn
+                results["errors"].append(
+                    f"email:{identifier} — no inbox_id, can't verify")
+
+        # 2. Verify Mailslurp API key itself
+        if email_verifier:
+            ms_key = email_verifier._mailslurp_key() if hasattr(
+                email_verifier, '_mailslurp_key') else ""
+            if ms_key:
+                if email_verifier.verify_mailslurp_key(ms_key):
+                    results["verified"].append("mailslurp_api_key")
+                else:
+                    results["suspended"].append("mailslurp_api_key")
+                    logger.warning("Mailslurp API key is INVALID")
+
+        summary = (
+            f"Asset verification: {len(results['verified'])} OK, "
+            f"{len(results['suspended'])} suspended, "
+            f"{len(results['errors'])} unverifiable"
+        )
+        logger.info(summary)
+        return results
+
     def generate_password(self, length: int = 20) -> str:
         chars = string.ascii_letters + string.digits + "!@#$%&*"
         return "".join(secrets.choice(chars) for _ in range(length))
