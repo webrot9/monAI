@@ -174,6 +174,57 @@ class Orchestrator(BaseAgent):
         self.social_presence.register_brand(agent.name)
         self.log_action("register_strategy", f"Registered: {agent.name}")
 
+    def _get_strategy_failure_context(self) -> list[str]:
+        """Collect strategy failures and lessons for LLM context injection.
+
+        Returns a list of human-readable failure summaries so the planner
+        doesn't repeat mistakes from past cycles.
+        """
+        lines: list[str] = []
+
+        # 1. High-severity lessons from memory
+        try:
+            lessons = self.memory.get_lessons(
+                agent=self.name, include_shared=True
+            )
+            for lesson in lessons:
+                if lesson.get("severity") in ("high", "critical"):
+                    lines.append(
+                        f"[{lesson.get('category', '?')}] "
+                        f"{lesson.get('lesson', '')} "
+                        f"(Rule: {lesson.get('rule', 'none')})"
+                    )
+        except Exception:
+            pass
+
+        # 2. Provisioning failures (from DB)
+        try:
+            rows = self.db.execute(
+                "SELECT action, platform, fail_count, reason "
+                "FROM provision_failures ORDER BY fail_count DESC LIMIT 20"
+            )
+            for r in rows:
+                lines.append(
+                    f"[provision_failure] {r['action']} on {r['platform']}: "
+                    f"failed {r['fail_count']}x — {r['reason'] or 'unknown'}"
+                )
+        except Exception:
+            pass
+
+        # 3. Paused/failed strategies from portfolio health
+        try:
+            for name, agent in self._strategy_agents.items():
+                status = getattr(agent, "status", None)
+                if status in ("paused", "failed"):
+                    lines.append(
+                        f"[strategy_{status}] '{name}' is {status} — "
+                        f"do NOT allocate more resources to it"
+                    )
+        except Exception:
+            pass
+
+        return lines
+
     def plan(self) -> list[str]:
         """Generate the orchestrator's full action plan for this cycle."""
         health = self.risk.get_portfolio_health()
@@ -181,6 +232,9 @@ class Orchestrator(BaseAgent):
         accounts = self.identity.get_all_accounts()
         resource_costs = self.identity.get_monthly_resource_costs()
         pipeline = self.crm.get_pipeline_summary()
+
+        # Gather recent failure lessons so the LLM doesn't repeat mistakes
+        failure_lessons = self._get_strategy_failure_context()
 
         context = json.dumps({
             "portfolio_health": health,
@@ -192,6 +246,7 @@ class Orchestrator(BaseAgent):
             "total_revenue": self.finance.get_total_revenue(),
             "total_expenses": self.finance.get_total_expenses(),
             "net_profit": self.finance.get_net_profit(),
+            "past_failures_and_lessons": failure_lessons,
         }, indent=2, default=str)
 
         plan_response = self.think_json(
@@ -327,6 +382,9 @@ class Orchestrator(BaseAgent):
 
         # Phase 0.6: Process collaboration hub (help requests between agents)
         cycle_result["help_requests"] = self._process_help_requests()
+
+        # Phase 0.9: Asset verification — check that stored assets actually work
+        cycle_result["asset_verification"] = self._verify_stored_assets()
 
         # Phase 1: Self-check — do I have what I need?
         cycle_result["provisioning"] = self._ensure_infrastructure()
@@ -726,6 +784,42 @@ class Orchestrator(BaseAgent):
                     rate_percentage=self.config.llc.contractor_rate_percentage,
                     payment_method=self.config.llc.contractor_payment_method,
                 )
+
+    def _verify_stored_assets(self) -> dict[str, Any]:
+        """Verify stored assets actually exist before using them.
+
+        Checks emails (Mailslurp inboxes), API keys, etc.
+        Marks dead assets as 'suspended' so provisioning knows to
+        create new ones instead of reusing broken resources.
+        """
+        try:
+            from monai.agents.email_verifier import EmailVerifier
+            verifier = EmailVerifier(self.config, self.db)
+            result = self.identity.verify_stored_assets(verifier)
+            if result["suspended"]:
+                self.log_action(
+                    "asset_verification",
+                    f"SUSPENDED {len(result['suspended'])} dead assets: "
+                    f"{result['suspended']}"
+                )
+                # Store lesson so planner knows
+                self.learn(
+                    "asset_cleanup",
+                    "Dead assets found and suspended",
+                    f"Suspended: {result['suspended']}. "
+                    f"These will be re-provisioned.",
+                    rule="Always verify assets before using them",
+                    severity="warning",
+                )
+            else:
+                self.log_action(
+                    "asset_verification",
+                    f"All {len(result['verified'])} assets verified OK"
+                )
+            return result
+        except Exception as e:
+            logger.warning(f"Asset verification failed: {e}")
+            return {"error": str(e)}
 
     def _ensure_infrastructure(self) -> dict[str, Any]:
         """Check and provision any missing infrastructure."""

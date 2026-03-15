@@ -291,6 +291,46 @@
   1. `VIRTUAL_ENV` must be in `_SAFE_ENV_KEYS` so the sandbox can bind-mount the venv and resolve `sys.executable`.
   2. `coder._run_tests()` should fallback to `"python3"` if `sys.executable` doesn't exist on disk.
 
+### 2026-03-15 - Self-healing must actually change behavior, not just log lessons
+- **Mistake**: Failures were logged to SharedMemory, but:
+  1. Provisioner used the same base identity for EVERY platform (same name, username everywhere)
+  2. Provisioner.plan() didn't include failure history — LLM kept suggesting the same platforms that already failed
+  3. Orchestrator.plan() didn't surface strategy failures or high-severity lessons — made the same plans every cycle
+  4. Only the executor applied "deployed improvements" — provisioner and orchestrator just logged and moved on
+- **Root cause**: Self-healing was cosmetic — lessons were stored but never fed back into the LLM's decision-making context. The planning functions built context from identity + accounts + costs, but NEVER from failure history.
+- **Rules**:
+  1. Provisioner must generate a UNIQUE identity per platform via `_generate_identity(platform=...)` — never reuse the base identity for registration.
+  2. Provisioner.plan() must inject past failure history into LLM context: "PAST PROVISIONING FAILURES — do NOT retry these".
+  3. Orchestrator.plan() must inject strategy failures, high-severity lessons, and paused strategies into planning context.
+  4. If something fails, the NEXT planning cycle must explicitly see WHY it failed, not just that it failed.
+  5. Self-healing means: fail → analyze → store lesson → inject lesson into future decisions → change behavior. If any link in this chain is broken, the system is NOT self-healing.
+
+### 2026-03-15 - Every agent must learn from failures, not just some
+- **Mistake**: Full audit revealed only 3/11 components actually learned from failures (Provisioner A-, BrowserLearner A, Humanizer A). The rest scored D or F:
+  - Spawner (F): sub-agent failures not tracked, same tasks re-spawned identically
+  - API Provisioner (F): no failure memory, retried Stripe infinitely
+  - Executor (D+): learned within a task but forgot between tasks
+  - Orchestrator (D): stored lessons but didn't inject them into planning
+  - Social Presence (D-): stored failed posts but never investigated why
+  - Strategies (D): deterministic state machines that looped on failure
+- **Root cause**: Each agent implemented its own failure handling (or didn't). No system-wide mechanism.
+- **Rules**:
+  1. BaseAgent._get_context_enrichment() must inject RECENT FAILURES from agent_log into EVERY think()/think_json() call — this is the system-wide fix that covers ALL agents automatically.
+  2. Every component that retries operations must have persistent failure tracking with escalating TTL (DB table, not in-memory).
+  3. Spawner must track sub-agent failures in `subagent_failures` table and block re-spawning failed tasks.
+  4. API Provisioner must track provider failures in `api_provision_failures` table.
+  5. When adding a new agent or component, ALWAYS implement the full chain: detect → store → inject → change behavior.
+
+### 2026-03-15 - Never trust the DB blindly — verify assets before using them
+- **Mistake**: System stored emails, API keys, and accounts as `status='active'` and used them forever without checking if they still worked. A dead Mailslurp inbox stayed "active" in DB, causing the system to fixate on a broken email every cycle.
+- **Root cause**: No verification step between "DB says it exists" and "use it". Assets created via API were assumed to be permanent.
+- **Rules**:
+  1. Orchestrator must run asset verification (Phase 0.9) BEFORE provisioning — check that stored emails/keys actually work.
+  2. Dead assets must be marked `status='suspended'` in DB so provisioner sees the gap and creates new ones.
+  3. api_provisioner._get_brand_email() must verify Mailslurp inbox via read-back before storing (like setup_email() does).
+  4. Never store an asset as 'active' without at least one verification call.
+  5. Pattern: store → verify → mark active. Not: store as active → hope it works.
+
 ### 2026-03-15 - React signup forms have no `input[name='name']` — don't timeout trying to fill non-existent fields
 - **Mistake**: Gumroad signup is a React app that only has email + password on the initial signup page. There is NO `name` field. But the executor LLM kept sending `fill_form({"input[name='name']": "Nexify Digital"})`. The self-healing discovered page elements, LLM returned `null` (no match), but `smart_fill_form` ignored the null and tried the original selector anyway → 30s timeout → retry → timeout → 17 steps wasted.
 - **Root cause**: When `_llm_batch_match_selectors` returned `null` for a field (meaning "this field doesn't exist on this page"), the code only checked `if healed:` (falsy for null) and fell through to using the original selector.

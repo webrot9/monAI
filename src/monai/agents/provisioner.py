@@ -107,6 +107,24 @@ class Provisioner(BaseAgent):
             f"blocked for {ttl}s"
         )
 
+    def _get_failure_context(self) -> str:
+        """Build human-readable failure history for LLM context injection."""
+        rows = self.db.execute(
+            "SELECT action, platform, fail_count, reason "
+            "FROM provision_failures ORDER BY fail_count DESC"
+        )
+        if not rows:
+            return ""
+        lines = ["PAST PROVISIONING FAILURES (do NOT retry these — choose alternatives):"]
+        for r in rows:
+            blocked = self._is_provision_blocked(r["action"], r["platform"])
+            status = "STILL BLOCKED" if blocked else "TTL expired, may retry"
+            lines.append(
+                f"  - {r['action']} on {r['platform']}: "
+                f"failed {r['fail_count']}x — {r['reason'] or 'unknown'} [{status}]"
+            )
+        return "\n".join(lines)
+
     def plan(self) -> list[str]:
         """Determine what needs to be provisioned."""
         identity = self.identity.get_identity()
@@ -119,11 +137,15 @@ class Provisioner(BaseAgent):
         except Exception:
             asset_inventory = ""
 
+        # Include failure history so the LLM knows what's been tried and failed
+        failure_history = self._get_failure_context()
+
         context = (
             f"Identity: {json.dumps(identity, default=str)}\n"
             f"Existing accounts: {json.dumps([{'platform': a['platform'], 'type': a['type']} for a in accounts], default=str)}\n"
             f"Monthly resource costs: ${resources_cost:.2f}\n"
             f"\n{asset_inventory}\n"
+            f"\n{failure_history}\n"
         )
 
         plan = self.think_json(
@@ -220,7 +242,12 @@ class Provisioner(BaseAgent):
             return {"status": "blocked", "reason": "No email account available"}
         email = email_account["identifier"]
 
-        identity = self.identity.get_identity()
+        # Generate a UNIQUE identity for this platform — never reuse the base identity
+        try:
+            identity = self.identity._generate_identity(platform=platform)
+        except Exception as e:
+            logger.warning(f"Platform identity generation failed ({e}), using base")
+            identity = self.identity.get_identity()
         password = self.identity.generate_password()
 
         task = (
@@ -244,7 +271,10 @@ class Provisioner(BaseAgent):
                 platform=platform,
                 identifier=identity.get("preferred_username", "monai"),
                 credentials={"password": password},
-                metadata={"registration_result": result},
+                metadata={
+                    "registration_result": result,
+                    "platform_identity": identity,
+                },
             )
             self.log_action("register", f"Registered on {platform}")
 
