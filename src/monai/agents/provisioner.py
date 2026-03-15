@@ -67,6 +67,13 @@ class Provisioner(BaseAgent):
 
         with db.connect() as conn:
             conn.executescript(self._PROVISION_FAIL_SCHEMA)
+            # Migration: add 'permanent' column if missing (table created before it existed)
+            try:
+                conn.execute("SELECT permanent FROM provision_failures LIMIT 1")
+            except Exception:
+                conn.execute(
+                    "ALTER TABLE provision_failures ADD COLUMN permanent INTEGER DEFAULT 0"
+                )
 
     def _is_provision_blocked(self, action: str, platform: str) -> bool:
         """Check if a provisioning action is still blocked from a past failure."""
