@@ -90,17 +90,17 @@ class CourseCreationAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "research_topics": self._research_topics,
+            "design_curriculum": self._design_curriculum,
+            "write_lessons": self._write_lessons,
+            "review_product": self._review_product,
+            "list_course": self._list_course,
+        }
         for step in steps:
-            if step == "research_topics":
-                results["topics"] = self._research_topics()
-            elif step == "design_curriculum":
-                results["curriculum"] = self._design_curriculum()
-            elif step == "write_lessons":
-                results["lessons"] = self._write_lessons()
-            elif step == "review_product":
-                results["review"] = self._review_product()
-            elif step == "list_course":
-                results["listing"] = self._list_course()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results

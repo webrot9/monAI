@@ -116,17 +116,17 @@ class DigitalProductsAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "research_niches": self._research_niches,
+            "create_product": self._create_product,
+            "review_product": self._review_product,
+            "list_product": self._list_product,
+            "check_sales": self._check_sales,
+        }
         for step in steps:
-            if step == "research_niches":
-                results["research"] = self._research_niches()
-            elif step == "create_product":
-                results["create"] = self._create_product()
-            elif step == "review_product":
-                results["review"] = self._review_product()
-            elif step == "list_product":
-                results["list"] = self._list_product()
-            elif step == "check_sales":
-                results["sales"] = self._check_sales()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results

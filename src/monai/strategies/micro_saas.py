@@ -89,21 +89,19 @@ class MicroSaaSAgent(BaseAgent):
         steps = self.plan()
         results = {}
 
+        step_methods = {
+            "research_opportunities": self._research_opportunities,
+            "design_product": self._design_product,
+            "build_mvp": self._build_mvp,
+            "review_product": self._review_product,
+            "deploy": self._deploy,
+            "create_landing_page": self._create_landing_page,
+            "check_usage": self._check_usage,
+        }
         for step in steps:
-            if step == "research_opportunities":
-                results["research"] = self._research_opportunities()
-            elif step == "design_product":
-                results["design"] = self._design_product()
-            elif step == "build_mvp":
-                results["build"] = self._build_mvp()
-            elif step == "review_product":
-                results["review"] = self._review_product()
-            elif step == "deploy":
-                results["deploy"] = self._deploy()
-            elif step == "create_landing_page":
-                results["landing"] = self._create_landing_page()
-            elif step == "check_usage":
-                results["usage"] = self._check_usage()
+            fn = step_methods.get(step)
+            if fn:
+                results[step] = self.run_step(step, fn)
 
         self.log_action("run_complete", json.dumps(results, default=str)[:500])
         return results
