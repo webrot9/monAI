@@ -216,8 +216,10 @@ class Orchestrator(BaseAgent):
             for name, agent in self._strategy_agents.items():
                 status = getattr(agent, "status", None)
                 if status in ("paused", "failed"):
+                    reason = self.TOR_BLOCKED_STRATEGIES.get(name, "")
+                    extra = f" ({reason})" if reason else ""
                     lines.append(
-                        f"[strategy_{status}] '{name}' is {status} — "
+                        f"[strategy_{status}] '{name}' is {status}{extra} — "
                         f"do NOT allocate more resources to it"
                     )
         except Exception:
@@ -948,6 +950,20 @@ class Orchestrator(BaseAgent):
         "domain_flipping": [],  # Paid via marketplace (Sedo, etc.)
     }
 
+    # Strategies that require platforms known to block Tor/proxy traffic.
+    # These are auto-paused when running behind a proxy to avoid wasting
+    # LLM calls on impossible registration attempts.
+    TOR_BLOCKED_STRATEGIES: dict[str, str] = {
+        "freelance_writing": "Upwork/Fiverr block Tor registration",
+        "digital_products": "Gumroad blocks Tor registration",
+        "course_creation": "Udemy/Skillshare block Tor registration",
+        "micro_saas": "Stripe/LemonSqueezy block Tor registration",
+        "saas": "Stripe blocks Tor registration",
+        "print_on_demand": "Redbubble/TeeSpring block Tor registration",
+        "domain_flipping": "Domain registrars block Tor registration",
+        "social_media": "Social platforms block Tor account creation",
+    }
+
     def _ensure_strategy_payment_providers(self, result: dict[str, Any]) -> None:
         """Proactively provision payment providers for active strategies.
 
@@ -966,6 +982,9 @@ class Orchestrator(BaseAgent):
             failed_providers: set[str] = set()  # Track providers that failed this cycle
             for row in active_strategies:
                 strategy_name = row["strategy"]
+                # Skip Tor-blocked strategies entirely
+                if strategy_name in self.TOR_BLOCKED_STRATEGIES:
+                    continue
                 needed_providers = self.STRATEGY_PAYMENT_PROVIDERS.get(strategy_name, [])
                 for provider in needed_providers:
                     # Skip providers that already failed this cycle
@@ -1998,6 +2017,31 @@ class Orchestrator(BaseAgent):
         import concurrent.futures
 
         results = {}
+
+        # Auto-pause strategies that require Tor-blocked platforms
+        uses_proxy = getattr(self.config, "privacy", None) and \
+            getattr(self.config.privacy, "proxy_type", "none") != "none"
+        if uses_proxy:
+            for strat_name, reason in self.TOR_BLOCKED_STRATEGIES.items():
+                rows = self.db.execute(
+                    "SELECT status FROM strategies WHERE name = ? AND status = 'active'",
+                    (strat_name,),
+                )
+                if rows:
+                    self.db.execute_insert(
+                        "UPDATE strategies SET status = 'paused', "
+                        "updated_at = CURRENT_TIMESTAMP WHERE name = ?",
+                        (strat_name,),
+                    )
+                    logger.info(
+                        "Auto-paused strategy '%s': %s (proxy mode active)",
+                        strat_name, reason,
+                    )
+                    results[strat_name] = {
+                        "status": "auto_paused",
+                        "reason": f"Tor-blocked: {reason}",
+                    }
+
         active = self.db.execute("SELECT name FROM strategies WHERE status = 'active'")
         active_names = {r["name"] for r in active}
         strategy_timeout = 300  # 5 minutes max per strategy

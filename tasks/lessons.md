@@ -1,5 +1,10 @@
 # Lessons Learned
 
+### 2026-03-15 - 8 of 13 strategies are dead code behind Tor
+- **Mistake**: All 13 strategies ran every cycle, burning €10-15/cycle trying to register on platforms that block Tor (Stripe, Gumroad, Upwork, Fiverr, Udemy, Redbubble, Sedo, social media). 4 cycles = €0 revenue, -€16 API costs.
+- **Root cause**: No pre-check for whether a strategy's required platforms are reachable. Provisioner retries Tor-blocked registrations with TTL expiry, so they come back. No mapping of which strategies need which platforms.
+- **Rule**: When running behind Tor/proxy, auto-pause strategies that require Tor-blocked platform registration. Only run strategies that work without blocked registrations: affiliate, content_sites, lead_gen, newsletter, telegram_bots. Map strategy→platform dependencies explicitly (TOR_BLOCKED_STRATEGIES). Never waste LLM calls on known-impossible registration attempts.
+
 ### 2026-03-15 - Self-healing form fill burns LLM calls on missing fields
 - **Mistake**: When `fill_form` discovers a field doesn't exist on a page, it skips it—but doesn't cache that knowledge. Each retry re-discovers via LLM. Executor also conflates "skipped" (field absent) with "failed" (actual error), causing the LLM to retry with the same missing fields.
 - **Root cause**: (1) `_pre_resolve_selectors` didn't cache `__MISSING__` results. (2) Executor error message didn't distinguish skipped vs failed. (3) Pre-seeded selectors had wrong mappings (e.g., `store_name → #name` on LemonSqueezy).

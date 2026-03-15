@@ -315,8 +315,11 @@ class TelegramBotAgent(BaseAgent):
 
     def _deploy_bot(self) -> dict[str, Any]:
         """Deploy a built Telegram bot by registering with BotFather and hosting it."""
-        # Ensure Stripe is set up for in-bot payments (e.g. /subscribe, /buy)
-        self.ensure_platform_account("stripe")
+        # Try to set up Stripe for in-bot payments, but don't block deployment
+        # if Stripe is unavailable (e.g. behind Tor). Bot can still be deployed
+        # and monetized later via Telegram Stars or direct crypto payments.
+        stripe_result = self.ensure_platform_account("stripe")
+        has_payments = stripe_result.get("status") not in ("blocked", "error")
 
         deployed = 0
 
