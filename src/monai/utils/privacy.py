@@ -61,17 +61,22 @@ VIEWPORTS = [
     {"width": 2560, "height": 1440},
 ]
 
-# Common timezones — randomized to prevent locale fingerprinting
-TIMEZONES = [
-    "America/New_York", "America/Chicago", "America/Los_Angeles",
-    "Europe/London", "Europe/Berlin", "Europe/Paris",
-    "Asia/Tokyo", "Asia/Singapore", "Australia/Sydney",
-]
-
-# Common locales
-LOCALES = [
-    "en-US", "en-GB", "de-DE", "fr-FR", "es-ES",
-    "pt-BR", "ja-JP", "ko-KR", "zh-CN",
+# Geographically consistent (timezone, locale) pairs — picking these
+# independently produces nonsense like Asia/Tokyo + fr-FR which screams bot.
+TIMEZONE_LOCALE_PAIRS = [
+    ("America/New_York", "en-US"),
+    ("America/Chicago", "en-US"),
+    ("America/Los_Angeles", "en-US"),
+    ("Europe/London", "en-GB"),
+    ("Europe/Berlin", "de-DE"),
+    ("Europe/Paris", "fr-FR"),
+    ("Europe/Madrid", "es-ES"),
+    ("America/Sao_Paulo", "pt-BR"),
+    ("Asia/Tokyo", "ja-JP"),
+    ("Asia/Seoul", "ko-KR"),
+    ("Asia/Shanghai", "zh-CN"),
+    ("Asia/Singapore", "en-US"),
+    ("Australia/Sydney", "en-US"),
 ]
 
 # IP check services (use multiple for reliability)
@@ -539,8 +544,7 @@ class NetworkAnonymizer:
         """Get a randomized browser fingerprint for Playwright context."""
         ua = self.get_user_agent()
         viewport = random.choice(VIEWPORTS)
-        timezone = random.choice(TIMEZONES)
-        locale = random.choice(LOCALES)
+        timezone, locale = random.choice(TIMEZONE_LOCALE_PAIRS)
 
         # Match viewport to user agent (mobile UA gets mobile viewport)
         if "Mobile" in ua or "Android" in ua:

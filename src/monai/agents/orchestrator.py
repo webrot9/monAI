@@ -839,6 +839,12 @@ class Orchestrator(BaseAgent):
                     rule="Always verify assets before using them",
                     severity="warning",
                 )
+            elif result.get("errors"):
+                self.log_action(
+                    "asset_verification",
+                    f"{len(result['verified'])} verified OK, "
+                    f"{len(result['errors'])} unverifiable"
+                )
             else:
                 self.log_action(
                     "asset_verification",
@@ -878,7 +884,7 @@ class Orchestrator(BaseAgent):
             saved_limit = tracker.max_cycle_calls
             tracker.max_cycle_calls = calls_before + max_provisioning_calls
             try:
-                result = self.provisioner.run()
+                result = self.provisioner.run(needs=needs)
             except BudgetExceededError:
                 logger.warning(
                     "Provisioning hit budget cap — saving remaining "

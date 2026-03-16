@@ -214,15 +214,26 @@ class Provisioner(BaseAgent):
                 goals.append(action)
         return goals
 
-    def run(self, **kwargs: Any) -> dict[str, Any]:
+    def run(self, needs: list[str] | None = None, **kwargs: Any) -> dict[str, Any]:
         """Run provisioning cycle with constraint-aware planning.
 
         Uses the ConstraintPlanner to build a dependency graph, then executes
         steps in topological order — prerequisites first, dependents after.
+
+        Args:
+            needs: Specific items to provision (e.g. ['telegram_bot', 'email']).
+                   When provided, skips the LLM plan() call entirely and uses
+                   these as direct goals. This prevents scope creep where the
+                   LLM decides to register on 7 platforms when only telegram_bot
+                   is needed.
         """
         self.log_action("run_start", "Starting provisioning cycle")
 
-        goals = self.plan()
+        if needs:
+            goals = needs
+            self.log_action("plan", f"Using orchestrator needs directly: {goals}")
+        else:
+            goals = self.plan()
         graph = self.constraint_planner.plan(goals)
 
         self.log_action("constraint_plan", graph.summary()[:500])
@@ -297,12 +308,9 @@ class Provisioner(BaseAgent):
             return {"status": "blocked", "reason": "No email account available"}
         email = email_account["identifier"]
 
-        # Generate a UNIQUE identity for this platform — never reuse the base identity
-        try:
-            identity = self.identity._generate_identity(platform=platform)
-        except Exception as e:
-            logger.warning(f"Platform identity generation failed ({e}), using base")
-            identity = self.identity.get_identity()
+        # Use the SAME business identity for all platforms — consistency matters.
+        # Different names per platform looks suspicious and wastes LLM calls.
+        identity = self.identity.get_identity()
         password = self.identity.generate_password()
 
         task = (
@@ -531,8 +539,7 @@ class Provisioner(BaseAgent):
         """Register a domain name — only after validating availability."""
         # Validate domain before attempting registration
         try:
-            from monai.agents.name_validator import NameValidator
-            validator = NameValidator(self.config, self.db, self.llm)
+            validator = self.identity.validator
             check = validator.check_domain_whois(domain)
             validator.close()
 
@@ -632,8 +639,7 @@ class Provisioner(BaseAgent):
 
             # Validate and find an available domain
             try:
-                from monai.agents.name_validator import NameValidator
-                validator = NameValidator(self.config, self.db, self.llm)
+                validator = self.identity.validator
                 check = validator.check_domain(domain_name)
                 if check.available is False:
                     # Domain taken — generate and validate a new one
@@ -653,7 +659,6 @@ class Provisioner(BaseAgent):
                                 domain_name = fallback
                                 break
                     logger.info(f"Original domain taken, using validated: {domain_name}")
-                validator.close()
             except Exception as e:
                 logger.warning(f"Domain validation failed ({e}), using original: {domain_name}")
 
