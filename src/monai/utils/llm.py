@@ -21,6 +21,10 @@ T = TypeVar("T", bound=BaseModel)
 
 logger = logging.getLogger(__name__)
 
+# Thread-safe shutdown flag — set by signal handler in main.py
+# to abort in-flight LLM calls quickly.
+_shutdown_flag = threading.Event()
+
 
 class BudgetExceededError(Exception):
     """Raised when a cycle exceeds its cost or call budget."""
@@ -237,6 +241,10 @@ class LLM:
                 import httpx as _httpx
                 client_kwargs["http_client"] = _httpx.Client(proxy=proxy_url, timeout=120)
 
+        # Limit max retries to 1 (default is 2) and total timeout to 60s
+        # so that shutdown signals aren't blocked by long retry chains.
+        client_kwargs.setdefault("max_retries", 1)
+        client_kwargs.setdefault("timeout", 60)
         self.client = OpenAI(**client_kwargs)
         self.caller = caller  # Which agent/module is making the call
         self.tracker = _global_tracker
@@ -314,6 +322,10 @@ class LLM:
 
     def _call_with_fallback(self, kwargs: dict[str, Any], model: str):
         """Call primary LLM, fall back to Ollama if primary fails."""
+        # Check for shutdown before making a potentially slow API call
+        if _shutdown_flag.is_set():
+            raise BudgetExceededError("Shutdown in progress — aborting LLM call")
+
         try:
             return self.client.chat.completions.create(**kwargs)
         except Exception as primary_err:

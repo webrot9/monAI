@@ -375,3 +375,49 @@
   4. Obfuscation detection: if a script uses 2+ encoding techniques (atob, fromCharCode, hex escapes), it's rejected — legit code doesn't hide its intent.
   5. Every code path that generates+executes code (form scripts, run_page_script, create_tool) goes through `is_script_ethical()`.
   6. The ethics review includes LLM deep review checking: legality (EU), exploitation, privacy, security, consent, deception, creator liability.
+
+### 2026-03-16 - Provisioner ignores orchestrator needs list — massive scope creep
+- **Mistake**: Orchestrator identified `needs=['telegram_bot']` but `provisioner.run()` ignored it entirely. Called `plan()` which asked the LLM "What infrastructure do I need to make money?" — LLM generated 16 steps across 7 platforms (Gmail, ProtonMail, Freelancer, LinkedIn, Twitter, Instagram, Facebook, Stripe, domain purchase). Only telegram_bot was needed.
+- **Root cause**: `run()` always called `plan()` regardless of what the orchestrator actually needed. No `needs` parameter existed.
+- **Rule**: `provisioner.run(needs=)` now accepts a needs list from the orchestrator. When provided, uses needs directly as goals, skipping the LLM plan entirely. The LLM plan is only used when no specific needs are given.
+
+### 2026-03-16 - Different brand identity per platform — detectable and wastes LLM calls
+- **Mistake**: `register_on_platform()` called `_generate_identity(platform=platform)` creating a UNIQUE identity per platform. In one cycle: "Nexify Digital" for Freelancer, "Nexivo" for Ko-fi, "MailVibe" for Stripe. Three different businesses in one cycle — suspicious and wastes 3 LLM calls for identity generation.
+- **Root cause**: Lesson from 2026-03-15 incorrectly said "generate UNIQUE identity per platform". This was wrong — a real business uses ONE identity everywhere.
+- **Rule**: Use `get_identity()` for all platforms. One consistent business identity. The previous lesson (2026-03-15 "Self-healing must actually change behavior") rule #1 about unique identity per platform is WRONG and has been overridden.
+
+### 2026-03-16 - NameValidator created fresh per check — no caching, repeated Google/WHOIS lookups
+- **Mistake**: Provisioner created a new `NameValidator()` instance for each domain check (2-3 per cycle). Each instance had no memory of previous checks. Same name validated 3 times: once for provisioner plan, once for Ko-fi registration, once for Stripe. Google LLC check hit 429 (rate limit via Tor) all 3 times.
+- **Root cause**: No caching layer. `_store_result()` wrote to DB but no method consulted DB before making network requests.
+- **Rules**:
+  1. Use `self.identity.validator` singleton — never create new instances.
+  2. `_get_cached()` checks in-memory cache first, then DB for results within 24 hours.
+  3. `_cache_and_store()` writes to both memory and DB.
+  4. All check methods (domain, WHOIS, username, LLC, trademark) check cache before network.
+
+### 2026-03-16 - Timezone and locale independently randomized — bot fingerprint
+- **Mistake**: Browser fingerprint chose timezone from TIMEZONES list and locale from LOCALES list independently. Produced combinations like `tz=Asia/Tokyo, locale=fr-FR` (French speaker in Japan) and `tz=Europe/Berlin, locale=pt-BR` (Portuguese-Brazilian in Germany). These combinations are statistically impossible and instantly flag as bot.
+- **Root cause**: Two `random.choice()` calls on independent lists with no geographic correlation.
+- **Rule**: Use `TIMEZONE_LOCALE_PAIRS` — a list of geographically consistent `(timezone, locale)` tuples. One `random.choice()` picks a correlated pair.
+
+### 2026-03-16 - Asset verification logs "All 0 verified OK" when 54 are unverifiable
+- **Mistake**: Identity verification returned `{verified: [], suspended: [], errors: [54 items]}`. Orchestrator only checked `if result['suspended']:` — since suspended was empty, it logged "All 0 assets verified OK" despite 54 unverifiable assets.
+- **Root cause**: Orchestrator didn't check the `errors` key in verification results.
+- **Rule**: Check `result['errors']` in addition to `result['suspended']`. Report unverifiable count separately.
+
+### 2026-03-16 - Sub-agents spawned with vague tasks — immediate failure
+- **Mistake**: LLM generated action "provision_accounts_for_new_opportunities" with `delegate_to_subagent: true`. Sub-agent got this vague task string with no specifics — no platform names, no URLs, no credentials. Immediately failed: "No specific platforms or credentials provided".
+- **Root cause**: Orchestrator planning prompt had no constraints on sub-agent task specificity. Also allowed infrastructure provisioning in the planning prompt (handled separately by _ensure_infrastructure).
+- **Rules**:
+  1. Planning prompt explicitly forbids infrastructure provisioning actions (handled separately).
+  2. Planning prompt requires each action to be specific and actionable with all details.
+  3. Sub-agent tasks must include platform names, URLs, and exact deliverables.
+  4. Max 5 actions per cycle to stay within LLM budget.
+
+### 2026-03-16 - Graceful shutdown blocked by OpenAI retry loops
+- **Mistake**: After Ctrl+C, the signal handler set `_shutdown = True` but in-flight OpenAI API calls continued retrying with default 2 retries and 2-minute timeout. Browsers failed to close with "Connection closed while reading from the driver". System took 4+ minutes to actually stop.
+- **Root cause**: OpenAI client had default `max_retries=2` and no timeout cap. No mechanism to abort in-flight requests.
+- **Rules**:
+  1. OpenAI client created with `max_retries=1` and `timeout=60` to limit retry duration.
+  2. `_shutdown_flag` (threading.Event) set by signal handler, checked before every `_call_with_fallback()`.
+  3. If shutdown is in progress, raise `BudgetExceededError` to abort the call chain immediately.

@@ -267,14 +267,22 @@ class Orchestrator(BaseAgent):
         }, indent=2, default=str)
 
         plan_response = self.think_json(
-            "You are a fully autonomous AI business. Plan your next cycle. "
-            "Consider ALL of the following:\n"
-            "1. INFRASTRUCTURE: Do I need accounts, emails, domains, API keys? Provision them.\n"
-            "2. OPPORTUNITIES: What new ways to make money should I explore?\n"
-            "3. CLIENT WORK: Who needs follow-up? What work needs delivering?\n"
-            "4. MARKETING: Should I do outreach, post content, bid on jobs?\n"
-            "5. OPTIMIZATION: Which strategies are working? Scale winners, cut losers.\n"
-            "6. NEW STRATEGIES: Should I start something entirely new?\n\n"
+            "You are a fully autonomous AI business. Plan your next cycle.\n\n"
+            "RULES:\n"
+            "- Infrastructure provisioning is handled SEPARATELY — do NOT plan "
+            "'provision accounts' or 'set up email' here.\n"
+            "- Each action MUST be specific and actionable, not vague. "
+            "BAD: 'explore new revenue streams'. "
+            "GOOD: 'bid on 3 copywriting gigs on Upwork'.\n"
+            "- Each sub-agent task MUST include ALL details needed to execute "
+            "(platform names, URLs, credentials to use, exact deliverables).\n"
+            "- Do NOT delegate research-only tasks to sub-agents — they have "
+            "browser access, not internet research. Use direct actions instead.\n"
+            "- Max 5 actions per cycle to stay within LLM budget.\n\n"
+            "Consider:\n"
+            "1. CLIENT WORK: Who needs follow-up? What work needs delivering?\n"
+            "2. MARKETING: Should I do outreach, post content, bid on jobs?\n"
+            "3. OPTIMIZATION: Which strategies are working? Scale winners, cut losers.\n\n"
             "Return: {\"actions\": [{\"action\": str, \"priority\": int (1=highest), "
             "\"reason\": str, \"delegate_to_subagent\": bool}]}",
             context=context,

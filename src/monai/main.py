@@ -60,6 +60,9 @@ def _handle_signal(signum, frame):
         sys.exit(1)
     logger.info("Shutdown signal received. Finishing current cycle...")
     _shutdown = True
+    # Signal LLM layer to abort in-flight calls immediately
+    from monai.utils.llm import _shutdown_flag
+    _shutdown_flag.set()
 
 
 signal.signal(signal.SIGINT, _handle_signal)
