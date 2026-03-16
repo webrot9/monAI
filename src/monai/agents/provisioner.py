@@ -229,7 +229,7 @@ class Provisioner(BaseAgent):
 
         # Execute in dependency order
         results = graph_results = {}
-        failed_actions: set[str] = set()  # Track failed action types this cycle
+        failed_action_platforms: set[str] = set()  # Track (action:platform) this cycle
         max_rounds = len(graph.steps) * 2  # safety cap
 
         for _ in range(max_rounds):
@@ -250,12 +250,15 @@ class Provisioner(BaseAgent):
                                       f"failed recently, waiting for TTL")
                     continue
 
-                # Dedup: skip steps whose action already failed THIS cycle
-                if step.action in failed_actions:
+                # Dedup: skip steps whose (action, platform) already failed THIS cycle.
+                # We do NOT skip other platforms — Freelancer CAPTCHA should not
+                # block Stripe registration.
+                action_platform_key = f"{step.action}:{platform}"
+                if action_platform_key in failed_action_platforms:
                     logger.info(
                         f"Skipping '{step.action}' for {platform} — "
-                        f"same action type already failed this cycle")
-                    graph.mark_failed(step.id, f"Skipped: {step.action} already failed")
+                        f"same action+platform already failed this cycle")
+                    graph.mark_failed(step.id, f"Skipped: {action_platform_key} already failed")
                     continue
 
                 step_result = self._execute_provisioning(step)
@@ -270,7 +273,7 @@ class Provisioner(BaseAgent):
                 ):
                     reason = step_result.get("reason", step_result.get("status", "unknown"))
                     graph.mark_failed(step.id, reason)
-                    failed_actions.add(step.action)
+                    failed_action_platforms.add(f"{step.action}:{platform}")
                     # Persist failure for cross-cycle learning
                     if platform:
                         self._record_provision_failure(
@@ -608,8 +611,8 @@ class Provisioner(BaseAgent):
         if is_platform_reg:
             # Use platform directly from the step — no LLM extraction needed
             if not platform or platform.lower() in ("platform", "unknown", ""):
-                logger.error(f"Step '{action}' has no valid platform name: '{platform}'")
-                return {"status": "failed", "reason": f"No valid platform name for step '{action}'"}
+                logger.warning(f"Step '{action}' has no valid platform name: '{platform}' — skipping")
+                return {"status": "skipped", "reason": f"No valid platform name for step '{action}'"}
             return self._run_async(self.register_on_platform(platform.lower()))
         elif "email" in action.lower():
             return self._run_async(self.setup_email())
@@ -638,6 +641,17 @@ class Provisioner(BaseAgent):
                         domain_tlds=[".com", ".io", ".co", ".dev"],
                     )
                     domain_name = identity.get("validated_domain") or ""
+                    # Fallback: if generate_and_validate found a viable name
+                    # but no available domain, try .dev / .ai / .agency TLDs
+                    if not domain_name and identity.get("name"):
+                        import re as _re
+                        slug = _re.sub(r'[^a-z0-9]', '', identity["name"].lower())
+                        for tld in [".dev", ".agency", ".tools", ".site"]:
+                            fallback = f"{slug}{tld}"
+                            fb_check = validator.check_domain(fallback)
+                            if fb_check.available is True:
+                                domain_name = fallback
+                                break
                     logger.info(f"Original domain taken, using validated: {domain_name}")
                 validator.close()
             except Exception as e:
