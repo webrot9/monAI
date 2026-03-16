@@ -59,6 +59,56 @@ class TestContentMarketer:
         )
         assert result["pieces_created"] == 1
 
+    def test_publish_executor_failed_not_marked_published(self, config, db, llm):
+        """Executor fail() must NOT mark content as published."""
+        llm.chat_json.return_value = {
+            "pieces": [
+                {"type": "blog_post", "title": "Test Post",
+                 "outline": "Intro", "platform": "linkedin",
+                 "seo_keywords": ["test"]},
+            ]
+        }
+        cm = ContentMarketer(config, db, llm)
+        # Simulate executor returning a failed result
+        cm._publish_content = MagicMock(return_value={
+            "status": "failed",
+            "reason": "Unable to access LinkedIn due to authentication",
+            "steps": 3,
+        })
+        result = cm.run(
+            campaign={"name": "test", "target_audience": "devs",
+                      "channel": "blog", "key_message": "test"},
+            strategy="content_sites",
+        )
+        assert result["pieces_created"] == 1
+        assert result["pieces_published"] == 0
+        # Verify DB status is still draft, not published
+        rows = db.execute(
+            "SELECT status FROM marketing_content WHERE title = 'Test Post'"
+        )
+        assert rows[0]["status"] == "draft"
+
+    def test_publish_success_marks_published(self, config, db, llm):
+        """Successful publish should mark content as published."""
+        llm.chat_json.return_value = {
+            "pieces": [
+                {"type": "blog_post", "title": "Good Post",
+                 "outline": "Intro", "platform": "medium",
+                 "seo_keywords": ["test"]},
+            ]
+        }
+        cm = ContentMarketer(config, db, llm)
+        cm._publish_content = MagicMock(return_value={
+            "status": "completed", "url": "https://medium.com/good-post",
+        })
+        result = cm.run(
+            campaign={"name": "test", "target_audience": "devs",
+                      "channel": "blog", "key_message": "test"},
+            strategy="content_sites",
+        )
+        assert result["pieces_created"] == 1
+        assert result["pieces_published"] == 1
+
     def test_plan(self, config, db, llm):
         cm = ContentMarketer(config, db, llm)
         assert len(cm.plan()) >= 3

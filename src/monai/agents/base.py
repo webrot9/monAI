@@ -355,8 +355,21 @@ class BaseAgent(ABC):
         """
         existing = self.identity.get_account(platform)
         if existing:
-            self.log_action("account_check", f"Already have {platform} account")
-            return {"status": "exists", "account": existing}
+            # Validate the account has actual credentials before trusting it
+            creds = existing.get("credentials")
+            if not creds or (isinstance(creds, dict) and not creds):
+                logger.warning(
+                    "Account for %s exists but has no credentials — marking stale",
+                    platform,
+                )
+                self.identity.db.execute(
+                    "UPDATE identities SET status = 'stale' "
+                    "WHERE platform = ? AND status = 'active'",
+                    (platform,),
+                )
+            else:
+                self.log_action("account_check", f"Already have {platform} account")
+                return {"status": "exists", "account": existing}
 
         # Check if this platform is blocked from previous failures
         if self.provisioner._is_provision_blocked("register_on_platform", platform):
