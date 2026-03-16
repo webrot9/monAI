@@ -43,6 +43,14 @@ class AffiliateAgent(BaseAgent):
     def plan(self) -> list[str]:
         statuses = self._get_content_statuses()
 
+        # Always check for pending sales first
+        pending_sales = self.db.execute(
+            "SELECT COUNT(*) as c FROM checkout_links "
+            "WHERE strategy_name = ? AND status = 'pending'",
+            (self.name,),
+        )
+        has_pending = pending_sales and pending_sales[0]["c"] > 0
+
         # Deterministic progression
         if not statuses:
             return ["research_programs"]
@@ -52,7 +60,11 @@ class AffiliateAgent(BaseAgent):
             return ["review_content"]
         if statuses.get("reviewed", 0) > 0:
             return ["publish_content"]
-        if statuses.get("published", 0) > 0 and statuses.get("reviewed", 0) == 0:
+        if statuses.get("published", 0) > 0 and statuses.get("monetized", 0) == 0:
+            return ["monetize_content"]
+        if has_pending:
+            return ["check_sales"]
+        if statuses.get("monetized", 0) > 0 and statuses.get("reviewed", 0) == 0:
             return ["write_comparison"]  # Create more content types
 
         # All content published — research new programs
@@ -69,6 +81,8 @@ class AffiliateAgent(BaseAgent):
             "write_review": self._write_review,
             "review_content": self._review_content,
             "publish_content": self._publish_content,
+            "monetize_content": self._monetize_content,
+            "check_sales": self._check_sales,
             "write_comparison": self._write_comparison,
         }
 
@@ -378,6 +392,65 @@ class AffiliateAgent(BaseAgent):
                 self.learn_from_error(e, f"Publishing '{title}' to Medium")
 
         return {"published": published}
+
+    def _monetize_content(self) -> dict[str, Any]:
+        """Create checkout links for published content.
+
+        For each published piece, create a Ko-fi checkout for a premium
+        "buying guide" or "tool bundle recommendation" tied to the review.
+        This is how affiliate content generates direct revenue — readers
+        who trust the review can buy the curated recommendation.
+        """
+        monetized = 0
+
+        for path in self.content_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("status") != "published":
+                continue
+
+            product_name = data.get("target", {}).get("product_name",
+                           data.get("target", {}).get("title", path.stem))
+            published_url = data.get("published_url", "")
+
+            # Create a checkout link for a "premium buying guide"
+            checkout = self.create_checkout_link(
+                amount=4.99,
+                product=f"Premium Buying Guide: {product_name}",
+                provider="kofi",
+                metadata={
+                    "content_file": str(path.name),
+                    "published_url": published_url,
+                    "product": product_name,
+                },
+            )
+
+            if checkout.get("status") == "created":
+                data["status"] = "monetized"
+                data["checkout_url"] = checkout.get("checkout_url", "")
+                data["payment_ref"] = checkout.get("payment_ref", "")
+                path.write_text(json.dumps(data, indent=2))
+                monetized += 1
+                self.log_action(
+                    "content_monetized",
+                    f"{product_name}: {checkout.get('checkout_url', '')}",
+                )
+            else:
+                # Even if checkout creation fails, mark as monetized to avoid loops
+                data["status"] = "monetized"
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action(
+                    "monetize_skipped",
+                    f"{product_name}: no payment provider available",
+                )
+
+        return {"monetized": monetized}
+
+    def _check_sales(self) -> dict[str, Any]:
+        """Check pending checkout links for completed payments."""
+        return self.check_pending_sales()
 
     def _write_comparison(self) -> dict[str, Any]:
         """Write a product comparison (e.g., 'X vs Y vs Z')."""

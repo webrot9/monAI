@@ -43,6 +43,14 @@ class ContentSiteAgent(BaseAgent):
     def plan(self) -> list[str]:
         statuses = self._get_content_statuses()
 
+        # Always check for pending sales first
+        pending_sales = self.db.execute(
+            "SELECT COUNT(*) as c FROM checkout_links "
+            "WHERE strategy_name = ? AND status = 'pending'",
+            (self.name,),
+        )
+        has_pending = pending_sales and pending_sales[0]["c"] > 0
+
         # Deterministic progression
         if not statuses:
             return ["research_keywords"]
@@ -52,7 +60,11 @@ class ContentSiteAgent(BaseAgent):
             return ["review_content"]
         if statuses.get("reviewed", 0) > 0:
             return ["publish_article"]
-        if statuses.get("published", 0) > 0 and statuses.get("reviewed", 0) == 0:
+        if statuses.get("published", 0) > 0 and statuses.get("monetized", 0) == 0:
+            return ["monetize_article"]
+        if has_pending:
+            return ["check_sales"]
+        if statuses.get("monetized", 0) > 0 and statuses.get("reviewed", 0) == 0:
             return ["find_affiliate_programs"]
 
         # All content published — research more keywords
@@ -68,6 +80,8 @@ class ContentSiteAgent(BaseAgent):
             "create_article": self._create_article,
             "review_content": self._review_content,
             "publish_article": self._publish_article,
+            "monetize_article": self._monetize_article,
+            "check_sales": self._check_sales,
             "find_affiliate_programs": self._find_affiliate_programs,
             "plan_new_site": self._plan_new_site,
         }
@@ -301,6 +315,61 @@ class ContentSiteAgent(BaseAgent):
                 self.learn_from_error(e, f"Publishing article '{title}' to {platform}")
 
         return {"published": published}
+
+    def _monetize_article(self) -> dict[str, Any]:
+        """Create checkout links for published articles.
+
+        For each published article, create a Ko-fi checkout for a premium
+        resource (detailed guide, template, or toolkit) related to the article topic.
+        """
+        monetized = 0
+
+        for path in self.sites_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("status") != "published":
+                continue
+
+            keyword = data.get("target", {}).get("keyword",
+                      data.get("target", {}).get("title", path.stem))
+            published_url = data.get("published_url", "")
+
+            checkout = self.create_checkout_link(
+                amount=7.99,
+                product=f"Complete Guide: {keyword}",
+                provider="kofi",
+                metadata={
+                    "content_file": str(path.name),
+                    "published_url": published_url,
+                    "keyword": keyword,
+                },
+            )
+
+            if checkout.get("status") == "created":
+                data["status"] = "monetized"
+                data["checkout_url"] = checkout.get("checkout_url", "")
+                data["payment_ref"] = checkout.get("payment_ref", "")
+                path.write_text(json.dumps(data, indent=2))
+                monetized += 1
+                self.log_action(
+                    "article_monetized",
+                    f"{keyword}: {checkout.get('checkout_url', '')}",
+                )
+            else:
+                data["status"] = "monetized"
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action(
+                    "monetize_skipped",
+                    f"{keyword}: no payment provider available",
+                )
+
+        return {"monetized": monetized}
+
+    def _check_sales(self) -> dict[str, Any]:
+        """Check pending checkout links for completed payments."""
+        return self.check_pending_sales()
 
     def _find_affiliate_programs(self) -> dict[str, Any]:
         """Research affiliate programs using REAL data from affiliate networks."""

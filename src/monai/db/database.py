@@ -116,6 +116,22 @@ CREATE TABLE IF NOT EXISTS strategy_health (
     retry_count INTEGER DEFAULT 0  -- How many times we've retried after auto-pause
 );
 
+-- Checkout links: maps payment_ref back to strategy/product for revenue recording
+CREATE TABLE IF NOT EXISTS checkout_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payment_ref TEXT NOT NULL,
+    strategy_name TEXT NOT NULL,
+    product TEXT NOT NULL,
+    amount REAL NOT NULL,
+    currency TEXT DEFAULT 'EUR',
+    provider TEXT NOT NULL,
+    checkout_url TEXT,
+    status TEXT DEFAULT 'pending',  -- pending, paid, expired, refunded
+    metadata TEXT,                  -- JSON: list_id, bot_id, newsletter_id, etc.
+    paid_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Performance indexes
 CREATE INDEX IF NOT EXISTS idx_agent_log_agent_name ON agent_log(agent_name);
 CREATE INDEX IF NOT EXISTS idx_strategies_status ON strategies(status);
@@ -124,6 +140,8 @@ CREATE INDEX IF NOT EXISTS idx_transactions_strategy ON transactions(strategy_id
 CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type, category);
 CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);
 CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_checkout_links_ref ON checkout_links(payment_ref);
+CREATE INDEX IF NOT EXISTS idx_checkout_links_strategy ON checkout_links(strategy_name, status);
 """
 
 
