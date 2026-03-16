@@ -421,3 +421,38 @@
   1. OpenAI client created with `max_retries=1` and `timeout=60` to limit retry duration.
   2. `_shutdown_flag` (threading.Event) set by signal handler, checked before every `_call_with_fallback()`.
   3. If shutdown is in progress, raise `BudgetExceededError` to abort the call chain immediately.
+
+### 2026-03-16 - Constraint planner LLM enrichment causes scope explosion
+- **Mistake**: Goal "telegram_bot" had no hardcoded rule in `_GOAL_TO_ACTIONS`. So the constraint planner called the LLM with a prompt listing ALL capabilities (email, domains, hosting, payments, LLCs, code storage). The LLM inferred 14-16 prerequisite steps across 7 platforms — domain purchase, payment processing, LLC formation, GitHub, hosting provider — when the actual requirement was just "email + Telegram BotFather token".
+- **Root cause**: (1) No hardcoded rule for "telegram_bot". (2) LLM enrichment ran EVEN when hardcoded rules matched, adding unnecessary steps. (3) LLM prompt was too permissive — "determine ALL prerequisite steps".
+- **Rules**:
+  1. Add specific goals to `_GOAL_TO_ACTIONS`: `telegram_bot → ["email_creation"]`, `telegram → ["email_creation"]`, `identity → []`.
+  2. When hardcoded rules match, they are AUTHORITATIVE — skip LLM enrichment entirely. LLM is only for novel goals.
+  3. This eliminates ~5 LLM calls per provisioning cycle and prevents scope creep.
+
+### 2026-03-16 - 5 concurrent sub-agents cause OpenAI 429 rate limits
+- **Mistake**: `AgentSpawner.run_parallel()` used `asyncio.gather()` to run ALL sub-agents simultaneously. With `max_workers=5`, 5 browsers opened in parallel, each making LLM calls in tight loops. OpenAI's rate limiter returned 429 errors, causing retry cascades.
+- **Root cause**: No concurrency limit. Thread pool and async gather both used `max_workers=5` without considering API rate limits.
+- **Rules**:
+  1. `MAX_CONCURRENT = 2` — at most 2 sub-agents run simultaneously.
+  2. `asyncio.Semaphore(MAX_CONCURRENT)` wraps each sub-agent's `run()` call.
+  3. ThreadPoolExecutor also limited to `MAX_CONCURRENT` workers.
+
+### 2026-03-16 - Ko-fi campaign setup runs EVERY cycle behind Tor — always fails
+- **Mistake**: `_ensure_infrastructure()` checked `bootstrap_phase == "pre_bootstrap"` and called `_setup_kofi_campaign()` every cycle. Ko-fi blocks Tor, so the campaign setup always failed. This wasted browser sessions, LLM calls, and 5+ minutes per cycle.
+- **Root cause**: No Tor check before attempting Ko-fi registration. Ko-fi wasn't in `TOR_BLOCKED_STRATEGIES` because it's not a strategy — it's bootstrap funding.
+- **Rule**: Check `config.privacy.proxy_type != "none"` before attempting Ko-fi setup. Skip with log message when behind Tor/proxy.
+
+### 2026-03-16 - CRITICAL: All 4 revenue strategies produce €0 — none publish to real platforms
+- **Mistake**: Complete strategy audit reveals NO strategy can produce revenue:
+  - **affiliate**: Writes review content to local JSON files but NEVER publishes to any website. No affiliate links inserted. No platform account created.
+  - **content_sites**: Writes SEO articles locally but NEVER creates a website, domain, or hosting. Articles exist only as JSON on disk.
+  - **newsletter**: Creates newsletter entries in DB but NEVER creates Substack/Beehiiv account or publishes issues. Growth tactics post to Tor-blocked social media.
+  - **telegram_bots**: Closest to working (~60%) — generates real bot code via Coder, but token extraction via executor is fragile and payment collection is not wired up.
+- **Root cause**: Strategies implement research → design → build/write pipelines but STOP before the monetization step. The "publish" and "collect payment" steps are missing from every strategy's state machine.
+- **Rules**:
+  1. Every strategy MUST have a concrete "publish/deploy" step that puts content/product on a real, public platform.
+  2. Every strategy MUST have a "revenue collection" step that verifies payments can be received.
+  3. Strategies must not be marked "active" until they have published at least one asset to a real platform.
+  4. Priority: Fix telegram_bots first (closest to working), then newsletter (has the most infrastructure), then content_sites and affiliate.
+  5. Content sitting in local JSON files generates exactly €0 — it must be on a platform where humans can find and pay for it.

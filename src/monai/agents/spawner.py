@@ -81,13 +81,18 @@ class SubAgent:
 class AgentSpawner:
     """Creates and manages sub-agents for parallel task execution."""
 
+    # Max concurrent sub-agents (each opens a browser + makes LLM calls).
+    # 5 simultaneous browsers causes OpenAI 429 rate limits.
+    MAX_CONCURRENT = 2
+
     def __init__(self, config: Config, db: Database, llm: LLM):
         self.config = config
         self.db = db
         self.llm = llm
         self.identity = IdentityManager(config, db, llm)
         self.active_agents: dict[str, SubAgent] = {}
-        self._executor_pool = ThreadPoolExecutor(max_workers=5)
+        self._executor_pool = ThreadPoolExecutor(max_workers=self.MAX_CONCURRENT)
+        self._concurrency_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
         with db.connect() as conn:
             conn.executescript(_SUBAGENT_FAIL_SCHEMA)
 
@@ -198,16 +203,24 @@ class AgentSpawner:
 
         return result
 
+    async def _run_with_semaphore(self, agent: SubAgent) -> dict[str, Any]:
+        """Run a sub-agent with concurrency limiting."""
+        async with self._concurrency_semaphore:
+            return await agent.run()
+
     async def run_parallel(self, tasks: list[dict[str, str]],
                            max_steps: int = 15) -> dict[str, dict[str, Any]]:
-        """Run multiple sub-agents in parallel.
+        """Run multiple sub-agents with concurrency limiting.
+
+        At most MAX_CONCURRENT agents run simultaneously to avoid
+        OpenAI 429 rate limits from too many parallel LLM calls.
 
         Args:
             tasks: List of {"name": str, "task": str} dicts
         """
         agents = [self.spawn(t["name"], t["task"], max_steps) for t in tasks]
         results = await asyncio.gather(
-            *[a.run() for a in agents],
+            *[self._run_with_semaphore(a) for a in agents],
             return_exceptions=True,
         )
 

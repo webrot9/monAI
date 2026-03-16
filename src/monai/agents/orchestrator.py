@@ -906,11 +906,15 @@ class Orchestrator(BaseAgent):
         result["bootstrap_phase"] = bootstrap_phase
 
         if bootstrap_phase == "pre_bootstrap":
-            self.log_action("bootstrap",
-                            "No funding source configured. Starting Ko-fi campaign.")
-            # Auto-setup Ko-fi campaign as primary funding source
-            kofi_result = self._setup_kofi_campaign()
-            result["bootstrap"] = kofi_result
+            # Ko-fi blocks Tor — skip campaign setup when behind proxy
+            if self.config.privacy.proxy_type != "none":
+                self.log_action("bootstrap",
+                                "Ko-fi blocks Tor — skipping campaign setup")
+            else:
+                self.log_action("bootstrap",
+                                "No funding source configured. Starting Ko-fi campaign.")
+                kofi_result = self._setup_kofi_campaign()
+                result["bootstrap"] = kofi_result
         else:
             # Campaign exists — sync donations periodically
             if self._cycle % 3 == 0:
