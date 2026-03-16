@@ -96,6 +96,13 @@ class NewsletterAgent(BaseAgent):
             s = nl["status"] if nl["status"] else "unknown"
             statuses[s] = statuses.get(s, 0) + 1
 
+        # Check for reviewed issues that need publishing (highest priority)
+        reviewed_issues = self.db.execute(
+            "SELECT COUNT(*) as c FROM newsletter_issues WHERE status = 'reviewed'"
+        )
+        if reviewed_issues and reviewed_issues[0]["c"] > 0:
+            return ["publish_issue"]
+
         # Check for draft issues that need review before anything else
         draft_issues = self.db.execute(
             "SELECT COUNT(*) as c FROM newsletter_issues WHERE status = 'draft'"
@@ -129,6 +136,7 @@ class NewsletterAgent(BaseAgent):
             "launch_newsletter": self._launch_newsletter,
             "write_issue": self._write_issue,
             "review_issue": self._review_issue,
+            "publish_issue": self._publish_issue,
             "find_sponsors": self._find_sponsors,
             "grow_subscribers": self._grow_subscribers,
         }
@@ -476,6 +484,81 @@ class NewsletterAgent(BaseAgent):
             self.log_action("issue_revised", f"{issue['subject']}: REVISED")
 
         return result.to_dict()
+
+    def _publish_issue(self) -> dict[str, Any]:
+        """Publish reviewed newsletter issues to the actual platform.
+
+        Without this step, issues sit at 'reviewed' status forever and no
+        subscribers ever receive them. This publishes to Substack/Beehiiv
+        via browser automation.
+        """
+        reviewed = self.db.execute(
+            "SELECT ni.*, n.platform, n.name as newsletter_name "
+            "FROM newsletter_issues ni "
+            "JOIN newsletters n ON ni.newsletter_id = n.id "
+            "WHERE ni.status = 'reviewed' LIMIT 1"
+        )
+        if not reviewed:
+            return {"status": "no_reviewed_issues"}
+
+        issue = dict(reviewed[0])
+        subject = issue.get("subject", "Untitled")
+        platform = issue.get("platform", "substack")
+        newsletter_name = issue.get("newsletter_name", "")
+
+        # Load content from file
+        content = ""
+        content_path = self.content_dir / f"issue_{issue['newsletter_id']}_{subject.replace(' ', '_')[:30]}.json"
+        if content_path.exists():
+            try:
+                file_data = json.loads(content_path.read_text())
+                content = file_data.get("content", "")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if not content:
+            # Try from DB if file not found
+            content = issue.get("content", "")
+
+        if not content:
+            self.log_action("publish_skip", f"No content for issue: {subject}")
+            return {"status": "no_content"}
+
+        try:
+            result = self.execute_task(
+                f"Publish a newsletter issue on {platform}.\n"
+                f"Newsletter: {newsletter_name}\n"
+                f"Subject line: {subject}\n"
+                f"Content (first 2000 chars):\n{content[:2000]}\n\n"
+                f"Steps:\n"
+                f"1. Go to {platform}.com dashboard for '{newsletter_name}'\n"
+                f"2. Create a new post/issue\n"
+                f"3. Set the subject line: {subject}\n"
+                f"4. Paste the full content\n"
+                f"5. Send/publish to all subscribers\n"
+                f"6. Return the published URL\n\n"
+                f"Return: {{\"url\": str, \"status\": str}}",
+                f"Publishing newsletter issue: {subject}",
+            )
+
+            if result.get("status") == "completed" or result.get("url"):
+                self.db.execute(
+                    "UPDATE newsletter_issues SET status = 'sent' WHERE id = ?",
+                    (issue["id"],),
+                )
+                self.log_action(
+                    "issue_published",
+                    f"{subject} → {result.get('url', platform)}",
+                )
+                return {"status": "published", "url": result.get("url", "")}
+            else:
+                self.log_action("issue_publish_failed", f"{subject}: {result}")
+                return {"status": "failed", "reason": str(result)}
+
+        except Exception as e:
+            self.log_action("issue_publish_failed", f"{subject}: {e}")
+            self.learn_from_error(e, f"Publishing newsletter issue '{subject}' on {platform}")
+            return {"status": "error", "error": str(e)}
 
     def _find_sponsors(self) -> dict[str, Any]:
         """Find REAL potential sponsors by browsing sponsor platforms and newsletters."""

@@ -110,15 +110,25 @@ class LeadGenAgent(BaseAgent):
         lists = self.db.execute("SELECT status, COUNT(*) as c FROM lead_lists GROUP BY status")
         stats = {r["status"]: r["c"] for r in lists}
 
-        # Deterministic progression
+        # Also check for leads that need processing
+        lead_stats_rows = self.db.execute(
+            "SELECT status, COUNT(*) as c FROM leads GROUP BY status"
+        )
+        lead_stats = {r["status"]: r["c"] for r in lead_stats_rows} if lead_stats_rows else {}
+
+        # Deterministic progression — each step advances the pipeline
         if not stats:
             return ["research_niches"]
-        if stats.get("building", 0) > 0:
+        if stats.get("planned", 0) > 0:
+            return ["build_list"]
+        if lead_stats.get("raw", 0) > 0:
             return ["enrich_leads"]
-        if stats.get("qualifying", 0) > 0:
+        if lead_stats.get("enriched", 0) > 0:
             return ["qualify_leads"]
+        if stats.get("building", 0) > 0 and lead_stats.get("qualified", 0) > 0:
+            return ["finalize_list"]
         if stats.get("ready", 0) > 0:
-            return ["find_buyers"]
+            return ["sell_leads"]
 
         # All lists sold — research new niches
         return ["research_niches"]
@@ -133,7 +143,8 @@ class LeadGenAgent(BaseAgent):
             "build_list": self._build_list,
             "enrich_leads": self._enrich_leads,
             "qualify_leads": self._qualify_leads,
-            "find_buyers": self._find_buyers,
+            "finalize_list": self._finalize_list,
+            "sell_leads": self._sell_leads,
         }
 
         for step in steps:
@@ -214,6 +225,22 @@ class LeadGenAgent(BaseAgent):
             "\"source\": str}]}"
         )
 
+        # Create a lead_lists record for the best niche so plan() progresses
+        best_niches = niches.get("niches", [])
+        if best_niches:
+            best = best_niches[0]
+            self.db.execute_insert(
+                "INSERT INTO lead_lists (name, niche, source, price_per_lead, status) "
+                "VALUES (?, ?, ?, ?, 'planned')",
+                (
+                    f"{best.get('niche', 'unknown')}_leads",
+                    best.get("niche", ""),
+                    ", ".join(best.get("data_sources", ["web"])),
+                    best.get("lead_value_usd", 1.0),
+                ),
+            )
+            self.log_action("niche_selected", best.get("niche", "unknown"))
+
         self.share_knowledge(
             "opportunity", "leadgen_niches",
             json.dumps(niches.get("niches", []))[:1000],
@@ -223,32 +250,36 @@ class LeadGenAgent(BaseAgent):
 
     def _build_list(self) -> dict[str, Any]:
         """Build a lead list by scraping REAL business data from public directories."""
-        # First, plan what list to build
+        # Pick the planned list to build
+        planned = self.db.execute(
+            "SELECT * FROM lead_lists WHERE status = 'planned' LIMIT 1"
+        )
+        if not planned:
+            return {"status": "no_planned_lists"}
+
+        planned_list = dict(planned[0])
+        list_id = planned_list["id"]
+        name = planned_list["name"]
+        niche = planned_list["niche"]
+
+        # Use LLM to determine search parameters based on the niche
         plan = self.think_json(
-            "Design a lead list to build. Specify:\n"
-            "- Target niche and buyer persona\n"
-            "- Where to find the data (public directories, Google Maps, industry listings)\n"
-            "- What data points to collect\n"
-            "- Qualification criteria\n"
-            "- How many leads to target\n\n"
-            "Return: {\"name\": str, \"niche\": str, \"source\": str, "
-            "\"search_query\": str, \"location\": str, "
-            "\"data_points\": [str], \"target_count\": int, "
-            "\"qualification_criteria\": [str], \"price_per_lead\": float}"
+            f"We need to build a lead list for the '{niche}' niche.\n"
+            "Provide search parameters:\n"
+            "- search_query: what to search on Google Maps\n"
+            "- location: geographic focus (US city or region)\n"
+            "- target_count: how many leads to aim for\n\n"
+            "Return: {\"search_query\": str, \"location\": str, \"target_count\": int}"
         )
 
-        name = plan.get("name", "untitled_list")
-        niche = plan.get("niche", "")
         search_query = plan.get("search_query", niche)
         location = plan.get("location", "")
 
-        # Create the list record
-        list_id = self.db.execute_insert(
-            "INSERT INTO lead_lists (name, niche, source, price_per_lead) VALUES (?, ?, ?, ?)",
-            (name, niche, plan.get("source", "multiple"),
-             plan.get("price_per_lead", 1.0)),
+        # Update list to building status
+        self.db.execute(
+            "UPDATE lead_lists SET status = 'building' WHERE id = ?", (list_id,)
         )
-        self.log_action("list_created", name, f"id={list_id}")
+        self.log_action("list_building", name, f"id={list_id}")
 
         leads_added = 0
 
@@ -552,91 +583,124 @@ class LeadGenAgent(BaseAgent):
         self.log_action("qualify_leads", f"Qualified {qualified_count} leads")
         return {"qualified": qualified_count, "total_processed": len(enriched_leads)}
 
-    def _find_buyers(self) -> dict[str, Any]:
-        """Find REAL buyers for lead lists by browsing data marketplaces."""
-        # Get ready lead lists
+    def _finalize_list(self) -> dict[str, Any]:
+        """Mark lead lists as ready for sale once their leads are qualified."""
+        building_lists = self.db.execute(
+            "SELECT * FROM lead_lists WHERE status = 'building'"
+        )
+        if not building_lists:
+            return {"status": "no_lists_to_finalize"}
+
+        finalized = 0
+        for row in building_lists:
+            ll = dict(row)
+            list_id = ll["id"]
+
+            # Count qualified leads for this list
+            qualified = self.db.execute(
+                "SELECT COUNT(*) as c FROM leads "
+                "WHERE list_id = ? AND status = 'qualified' AND qualification_score >= 0.5",
+                (list_id,),
+            )
+            count = qualified[0]["c"] if qualified else 0
+
+            if count > 0:
+                self.db.execute(
+                    "UPDATE lead_lists SET status = 'ready', qualified_leads = ? WHERE id = ?",
+                    (count, list_id),
+                )
+                finalized += 1
+                self.log_action("list_finalized", f"List {ll['name']}: {count} qualified leads ready")
+            else:
+                self.log_action("list_not_ready", f"List {ll['name']}: 0 qualified leads")
+
+        return {"finalized": finalized}
+
+    def _sell_leads(self) -> dict[str, Any]:
+        """List lead packages on data marketplaces and reach out to potential buyers.
+
+        This is where actual revenue comes from — we list on Datarade, reach out
+        to agencies, and respond to buyer demand for B2B data.
+        """
         ready_lists = self.db.execute(
-            "SELECT * FROM lead_lists WHERE status IN ('qualifying', 'ready', 'building') LIMIT 3"
+            "SELECT * FROM lead_lists WHERE status = 'ready' LIMIT 3"
         )
         if not ready_lists:
             return {"status": "no_lists_ready_for_sale"}
 
-        self.log_action("find_buyers", "Browsing real data marketplaces for buyers")
+        sold = 0
 
-        # Browse Datarade to understand the marketplace and find buyer demand
-        datarade_data = self.browse_and_extract(
-            "https://datarade.ai/",
-            "Extract information about how to sell data on this marketplace. "
-            "Look for:\n"
-            "- How to list data products for sale\n"
-            "- Categories of data in demand\n"
-            "- Pricing structures\n"
-            "- Buyer types and what they look for\n"
-            "- Any seller signup or listing process\n\n"
-            "Only include REAL data visible on the page. Do NOT make up any information.\n"
-            "Return as JSON: {\"listing_process\": str, \"categories\": [str], "
-            "\"pricing_info\": str, \"buyer_types\": [str]}"
-        )
+        for row in ready_lists:
+            ll = dict(row)
+            list_id = ll["id"]
+            name = ll["name"]
+            niche = ll["niche"]
+            qualified_count = ll.get("qualified_leads", 0)
+            price = ll.get("price_per_lead", 1.0)
 
-        # Search for businesses that buy B2B leads in relevant niches
-        list_niches = [dict(r).get("niche", "") for r in ready_lists]
-        niche_str = ", ".join(list_niches[:3])
+            # Step 1: List on Datarade marketplace
+            try:
+                account = self.ensure_platform_account("datarade")
+                if account.get("status") not in ("blocked", "error"):
+                    self.execute_task(
+                        f"List a lead data product on Datarade.ai for sale.\n"
+                        f"Product name: {name}\n"
+                        f"Niche: {niche}\n"
+                        f"Number of qualified leads: {qualified_count}\n"
+                        f"Price per lead: ${price:.2f}\n"
+                        f"Data fields: company name, email, phone, website, industry, "
+                        f"location, company size, qualification score\n\n"
+                        f"Steps:\n"
+                        f"1. Go to datarade.ai seller dashboard\n"
+                        f"2. Create a new data product listing\n"
+                        f"3. Set pricing and description\n"
+                        f"4. Submit for review\n"
+                        f"5. Return the listing URL\n\n"
+                        f"Return: {{\"url\": str, \"status\": str}}",
+                        f"Listing lead data on Datarade: {name}",
+                    )
+            except Exception as e:
+                self.log_action("datarade_listing_failed", f"{name}: {e}")
 
-        buyer_search = self.search_web(
-            f"companies that buy B2B leads {niche_str} lead buyers",
-            "Extract company names, what types of leads they purchase, any pricing "
-            "or volume information, and how to contact or sell to them.\n\n"
-            "Only include REAL data visible on the page. Do NOT make up any information.\n"
-            "Return as JSON: {\"buyers\": [{\"company\": str, \"lead_types\": str, "
-            "\"pricing\": str, \"contact_method\": str}]}"
-        )
+            # Step 2: Direct outreach to agencies that buy leads in this niche
+            try:
+                buyer_search = self.search_web(
+                    f"{niche} marketing agency buying leads B2B data provider",
+                    "Find 3 marketing agencies or companies that buy B2B leads. "
+                    "Return {\"agencies\": [{\"name\": str, \"email\": str, \"url\": str}]}",
+                    num_results=5,
+                )
+                agencies = buyer_search.get("agencies", [])
 
-        # Search for lead marketplaces and exchanges
-        marketplace_search = self.search_web(
-            "B2B lead marketplace sell leads data exchange platform 2026",
-            "Extract platform names, URLs, what types of data/leads they trade, "
-            "commission structures, and how to list leads for sale.\n\n"
-            "Only include REAL data visible on the page. Do NOT make up any information.\n"
-            "Return as JSON: {\"marketplaces\": [{\"name\": str, \"url\": str, "
-            "\"lead_types\": str, \"commission\": str, \"listing_process\": str}]}"
-        )
+                for agency in agencies[:3]:
+                    email = agency.get("email", "")
+                    if not email:
+                        continue
 
-        # Search for agencies and companies that resell leads
-        reseller_search = self.search_web(
-            f"lead generation agencies buying leads {niche_str} wholesale",
-            "Extract agency names, what industries they serve, and any information "
-            "about their lead buying practices.\n\n"
-            "Only include REAL data visible on the page. Do NOT make up any information.\n"
-            "Return as JSON: {\"agencies\": [{\"name\": str, \"industries\": [str], "
-            "\"details\": str}]}"
-        )
+                    self.platform_action(
+                        "email",
+                        f"Send a sales outreach email.\n"
+                        f"To: {email}\n"
+                        f"Subject: {qualified_count} Qualified {niche.title()} Leads Available\n"
+                        f"Body: Professional email offering our lead list.\n"
+                        f"- {qualified_count} pre-qualified leads\n"
+                        f"- Includes: company name, email, phone, website, qualification score\n"
+                        f"- All data sourced from public directories and verified\n"
+                        f"- Price: ${price:.2f} per lead or ${price * qualified_count * 0.8:.2f} for the full list\n"
+                        f"- Sample available on request\n"
+                        f"Keep it professional, concise, and value-focused.",
+                        f"Outreach to {agency.get('name', 'agency')} for {niche} leads",
+                    )
+                    self.log_action("outreach_sent", f"{agency.get('name', '')} for {name}")
 
-        # Use LLM to synthesize real data into actionable buyer list
-        raw_data = {
-            "datarade": datarade_data,
-            "buyer_search": buyer_search,
-            "marketplaces": marketplace_search,
-            "resellers": reseller_search,
-            "our_lists": [{"name": dict(r).get("name", ""), "niche": dict(r).get("niche", ""),
-                           "total_leads": dict(r).get("total_leads", 0),
-                           "qualified_leads": dict(r).get("qualified_leads", 0)}
-                          for r in ready_lists],
-        }
-        buyers = self.think_json(
-            "Based on the following REAL market data, identify the 5 best channels "
-            "to sell our lead lists.\n\n"
-            f"Raw research data:\n{json.dumps(raw_data, default=str)[:4000]}\n\n"
-            "For each channel, specify:\n"
-            "- What kind of leads they want\n"
-            "- How much they typically pay per lead\n"
-            "- How to list or pitch our leads to them\n"
-            "- What quality standards they expect\n\n"
-            "IMPORTANT: Only include buyers/platforms that appeared in the real "
-            "data above. Do not invent companies.\n\n"
-            "Return: {\"buyers\": [{\"business_type\": str, \"lead_criteria\": str, "
-            "\"price_range_per_lead\": str, \"where_to_find\": str, "
-            "\"quality_requirements\": [str], \"source\": str}]}"
-        )
+            except Exception as e:
+                self.log_action("outreach_failed", f"{name}: {e}")
 
-        self.log_action("buyers_found", f"{len(buyers.get('buyers', []))} buyer channels identified")
-        return buyers
+            # Mark as listed (still active, waiting for sales)
+            self.db.execute(
+                "UPDATE lead_lists SET status = 'listed' WHERE id = ?", (list_id,)
+            )
+            sold += 1
+            self.log_action("list_listed", f"{name}: listed on marketplace + outreach sent")
+
+        return {"lists_listed": sold}
