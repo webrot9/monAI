@@ -298,9 +298,57 @@ class Provisioner(BaseAgent):
         return results
 
     async def register_on_platform(self, platform: str) -> dict[str, Any]:
-        """Register monAI on a platform (Upwork, Fiverr, etc.)."""
+        """Register monAI on a platform (Upwork, Fiverr, etc.).
+
+        After browser-based registration, validates that stored credentials
+        contain the fields the platform API actually requires. For social
+        platforms (LinkedIn, Twitter, Reddit), browser signup alone does NOT
+        produce API credentials — those require OAuth app setup.
+        """
         if self.identity.has_account(platform):
+            # Double-check: existing account might have stale/incomplete creds
+            from monai.social.api import get_required_credential_fields
+            required = get_required_credential_fields(platform)
+            if required:
+                existing = self.identity.get_account(platform)
+                creds = (existing or {}).get("credentials", {}) or {}
+                missing = [f for f in required if not creds.get(f)]
+                if missing:
+                    logger.warning(
+                        "Account for %s exists but missing API fields %s "
+                        "— cannot register via browser (needs OAuth setup)",
+                        platform, missing,
+                    )
+                    return {
+                        "status": "blocked",
+                        "reason": f"{platform} requires API credentials "
+                                  f"({', '.join(required)}) that cannot be "
+                                  f"obtained via browser signup alone",
+                        "missing_fields": missing,
+                    }
             return {"status": "already_registered", "platform": platform}
+
+        # Check if this platform requires OAuth/API credentials that
+        # browser signup cannot provide. Don't waste LLM calls on
+        # registrations that will produce unusable accounts.
+        from monai.social.api import get_required_credential_fields
+        required = get_required_credential_fields(platform)
+        if required:
+            # Social platforms with API requirements can't be auto-provisioned
+            # via browser form-fill alone — they need OAuth app setup.
+            logger.info(
+                "Platform %s requires API credentials (%s) — "
+                "skipping browser registration (needs manual OAuth setup)",
+                platform, ", ".join(required),
+            )
+            return {
+                "status": "blocked",
+                "reason": f"{platform} requires API credentials "
+                          f"({', '.join(required)}) that cannot be "
+                          f"obtained via browser signup alone. "
+                          f"Provide credentials manually or via OAuth flow.",
+                "missing_fields": list(required),
+            }
 
         # Ensure we have an email before attempting registration
         email_account = self.identity.get_account("email")

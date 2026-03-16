@@ -12,6 +12,8 @@ from monai.social.api import (
     SocialAPIError,
     TwitterClient,
     create_platform_client,
+    get_required_credential_fields,
+    validate_platform_credentials,
 )
 
 
@@ -281,3 +283,91 @@ class TestIndieHackersClient:
         mock_anon.return_value = MagicMock()
         client = IndieHackersClient(mock_config, {})
         assert client.get_profile_metrics() == {"followers": 0}
+
+
+# ── Credential Validation ──────────────────────────────────────
+
+
+class TestCredentialValidation:
+    """Tests for the self-healing credential validation system.
+
+    Verifies that platforms reject incomplete credentials and that
+    validate_credentials() catches invalid tokens before they're stored.
+    """
+
+    def test_required_fields_twitter(self):
+        assert get_required_credential_fields("twitter") == ("bearer_token",)
+
+    def test_required_fields_linkedin(self):
+        fields = get_required_credential_fields("linkedin")
+        assert "access_token" in fields
+        assert "person_urn" in fields
+
+    def test_required_fields_reddit(self):
+        fields = get_required_credential_fields("reddit")
+        assert "client_id" in fields
+        assert "client_secret" in fields
+        assert "username" in fields
+        assert "password" in fields
+
+    def test_required_fields_indie_hackers(self):
+        """IndieHackers uses browser — no API credential requirements."""
+        assert get_required_credential_fields("indie_hackers") == ()
+
+    def test_required_fields_unknown_platform(self):
+        assert get_required_credential_fields("myspace") == ()
+
+    def test_has_required_credentials_complete(self, mock_config, twitter_creds):
+        client = TwitterClient(mock_config, twitter_creds)
+        assert client.has_required_credentials() is True
+
+    def test_has_required_credentials_missing(self, mock_config):
+        """Password-only credentials are useless for Twitter API."""
+        client = TwitterClient(mock_config, {"password": "hunter2"})
+        assert client.has_required_credentials() is False
+
+    def test_has_required_credentials_empty_value(self, mock_config):
+        """Empty string in a required field is treated as missing."""
+        client = LinkedInClient(mock_config, {"access_token": "", "person_urn": ""})
+        assert client.has_required_credentials() is False
+
+    def test_linkedin_rejects_password_only(self, mock_config):
+        """LinkedIn requires access_token + person_urn, not a password."""
+        client = LinkedInClient(mock_config, {"password": "secret"})
+        assert client.has_required_credentials() is False
+        assert client.validate_credentials() is False
+
+    @patch("monai.social.api.get_anonymizer")
+    def test_twitter_validate_success(self, mock_anon, mock_config, twitter_creds):
+        mock_http = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_http.get.return_value = mock_resp
+        mock_anon.return_value.create_http_client.return_value = mock_http
+
+        client = TwitterClient(mock_config, twitter_creds)
+        assert client.validate_credentials() is True
+
+    @patch("monai.social.api.get_anonymizer")
+    def test_twitter_validate_failure(self, mock_anon, mock_config, twitter_creds):
+        mock_http = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_http.get.return_value = mock_resp
+        mock_anon.return_value.create_http_client.return_value = mock_http
+
+        client = TwitterClient(mock_config, twitter_creds)
+        assert client.validate_credentials() is False
+
+    @patch("monai.social.api.get_anonymizer")
+    def test_validate_platform_credentials_factory(self, mock_anon, mock_config):
+        """validate_platform_credentials() rejects incomplete creds."""
+        mock_anon.return_value = MagicMock()
+        # Password-only: should fail for LinkedIn
+        assert validate_platform_credentials(
+            "linkedin", mock_config, {"password": "secret"}
+        ) is False
+        # Unknown platform: should fail
+        assert validate_platform_credentials(
+            "nonexistent", mock_config, {}
+        ) is False

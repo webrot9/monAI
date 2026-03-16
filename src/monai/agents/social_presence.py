@@ -313,7 +313,35 @@ class SocialPresence(BaseAgent):
     def setup_account(self, brand: str, platform: str, username: str,
                       profile_url: str = "", bio: str = "",
                       credentials: dict[str, str] | None = None) -> dict[str, Any]:
-        """Activate a social account for a brand."""
+        """Activate a social account for a brand.
+
+        Checks that credentials contain the fields the platform API actually
+        requires (e.g. LinkedIn needs access_token + person_urn, not just a
+        password). This prevents phantom "active" accounts that can't post.
+
+        Full API validation happens at publish time — if credentials are
+        rejected by the platform, publish_post() marks the account as
+        auth_failed so we stop retrying.
+        """
+        from monai.social.api import get_required_credential_fields
+
+        # Check required credential fields BEFORE marking active
+        required = get_required_credential_fields(platform)
+        if required:
+            creds = credentials or {}
+            missing = [f for f in required if not creds.get(f)]
+            if missing:
+                logger.warning(
+                    "Cannot activate %s/%s — missing required credential "
+                    "fields: %s (have: %s)",
+                    brand, platform, missing, list(creds.keys()),
+                )
+                return {
+                    "brand": brand, "platform": platform,
+                    "status": "rejected",
+                    "reason": f"Missing required fields: {', '.join(missing)}",
+                }
+
         creds_json = json.dumps(credentials) if credentials else None
         self.db.execute(
             "UPDATE brand_social_accounts SET username = ?, profile_url = ?, "
@@ -699,13 +727,32 @@ class SocialPresence(BaseAgent):
                     "url": result.get("url", "")}
 
         except SocialAPIError as e:
+            error_str = str(e)
             self.db.execute(
                 "UPDATE brand_social_posts SET status = 'failed', "
                 "rejection_reason = ? WHERE id = ?",
-                (str(e)[:500], post_id),
+                (error_str[:500], post_id),
             )
             logger.error(f"Failed to publish post {post_id}: {e}")
-            return {"status": "failed", "post_id": post_id, "error": str(e)}
+
+            # Self-healing: if auth-related failure, deactivate the account
+            # so we don't keep wasting API calls with bad credentials
+            error_lower = error_str.lower()
+            auth_signals = ("401", "403", "unauthorized", "authentication",
+                            "invalid token", "expired", "access denied")
+            if any(s in error_lower for s in auth_signals):
+                logger.warning(
+                    "Auth failure publishing to %s/%s — deactivating account",
+                    post["brand"], post["platform"],
+                )
+                self.db.execute(
+                    "UPDATE brand_social_accounts SET status = 'auth_failed', "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE brand = ? AND platform = ?",
+                    (post["brand"], post["platform"]),
+                )
+
+            return {"status": "failed", "post_id": post_id, "error": error_str}
 
     def publish_all_scheduled(self) -> dict[str, Any]:
         """Publish all scheduled posts."""

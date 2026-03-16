@@ -116,10 +116,13 @@ class TestAccountManagement:
         assert len(accounts) == len(BRAND_PLATFORMS["saas"])
         assert all(a["brand"] == "saas" for a in accounts)
 
-    def test_setup_account(self, agent, db):
+    def test_setup_account_with_valid_creds(self, agent, db):
         agent.register_brand("micro_saas")
-        result = agent.setup_account("micro_saas", "twitter",
-                                     "saas_builder", "https://x.com/saas_builder")
+        result = agent.setup_account(
+            "micro_saas", "twitter",
+            "saas_builder", "https://x.com/saas_builder",
+            credentials={"bearer_token": "tok", "user_id": "123"},
+        )
         assert result["status"] == "active"
         assert result["brand"] == "micro_saas"
         assert result["username"] == "saas_builder"
@@ -131,9 +134,43 @@ class TestAccountManagement:
         assert rows[0]["username"] == "saas_builder"
         assert rows[0]["status"] == "active"
 
+    def test_setup_account_rejects_missing_required_fields(self, agent, db):
+        """Cannot activate LinkedIn without access_token + person_urn."""
+        agent.register_brand("newsletter")
+        result = agent.setup_account(
+            "newsletter", "linkedin", "newsletter_co",
+            credentials={"password": "hunter2"},
+        )
+        assert result["status"] == "rejected"
+        assert "access_token" in result["reason"]
+
+        # Account should still be in 'planned' status, NOT 'active'
+        rows = db.execute(
+            "SELECT status FROM brand_social_accounts "
+            "WHERE brand = 'newsletter' AND platform = 'linkedin'"
+        )
+        assert rows[0]["status"] == "planned"
+
+    def test_setup_account_rejects_no_credentials(self, agent, db):
+        """Cannot activate Twitter without bearer_token."""
+        agent.register_brand("micro_saas")
+        result = agent.setup_account("micro_saas", "twitter", "saas_bot")
+        assert result["status"] == "rejected"
+        assert "bearer_token" in result["reason"]
+
+    def test_setup_account_no_required_fields_platform(self, agent, db):
+        """Platforms without required_credential_fields can be activated freely."""
+        agent.register_brand("micro_saas")
+        result = agent.setup_account("micro_saas", "indie_hackers", "saas_ih")
+        assert result["status"] == "active"
+
     def test_setup_shares_knowledge(self, agent, db):
         agent.register_brand("newsletter")
-        agent.setup_account("newsletter", "linkedin", "newsletter_co")
+        result = agent.setup_account(
+            "newsletter", "linkedin", "newsletter_co",
+            credentials={"access_token": "tok", "person_urn": "urn:li:person:x"},
+        )
+        assert result["status"] == "active"
         rows = db.execute(
             "SELECT * FROM knowledge WHERE topic = 'social_newsletter_linkedin'"
         )
@@ -142,8 +179,10 @@ class TestAccountManagement:
     def test_multiple_brands_isolated(self, agent, db):
         agent.register_brand("micro_saas")
         agent.register_brand("newsletter")
-        agent.setup_account("micro_saas", "twitter", "saas_bot")
-        agent.setup_account("newsletter", "twitter", "news_bot")
+        agent.setup_account("micro_saas", "twitter", "saas_bot",
+                            credentials={"bearer_token": "tok", "user_id": "123"})
+        agent.setup_account("newsletter", "twitter", "news_bot",
+                            credentials={"bearer_token": "tok2", "user_id": "456"})
 
         saas_accs = agent._get_brand_accounts("micro_saas")
         news_accs = agent._get_brand_accounts("newsletter")
@@ -356,8 +395,10 @@ class TestMetrics:
     def test_get_follower_growth_all(self, agent, db):
         agent.register_brand("micro_saas")
         agent.register_brand("newsletter")
-        agent.setup_account("micro_saas", "twitter", "saas_bot")
-        agent.setup_account("newsletter", "twitter", "news_bot")
+        agent.setup_account("micro_saas", "twitter", "saas_bot",
+                            credentials={"bearer_token": "tok", "user_id": "1"})
+        agent.setup_account("newsletter", "twitter", "news_bot",
+                            credentials={"bearer_token": "tok2", "user_id": "2"})
         agent.update_followers("micro_saas", "twitter", 500)
         agent.update_followers("newsletter", "twitter", 300)
         growth = agent.get_follower_growth()
@@ -368,8 +409,10 @@ class TestMetrics:
     def test_get_follower_growth_filtered(self, agent, db):
         agent.register_brand("micro_saas")
         agent.register_brand("newsletter")
-        agent.setup_account("micro_saas", "twitter", "saas_bot")
-        agent.setup_account("newsletter", "twitter", "news_bot")
+        agent.setup_account("micro_saas", "twitter", "saas_bot",
+                            credentials={"bearer_token": "tok", "user_id": "1"})
+        agent.setup_account("newsletter", "twitter", "news_bot",
+                            credentials={"bearer_token": "tok2", "user_id": "2"})
         growth = agent.get_follower_growth(brand="micro_saas")
         assert len(growth) == 1
         assert growth[0]["brand"] == "micro_saas"
@@ -413,7 +456,8 @@ class TestMetrics:
     def test_get_all_brands_summary(self, agent, db):
         agent.register_brand("micro_saas")
         agent.register_brand("newsletter")
-        agent.setup_account("micro_saas", "twitter", "saas_bot")
+        agent.setup_account("micro_saas", "twitter", "saas_bot",
+                            credentials={"bearer_token": "tok", "user_id": "1"})
         summary = agent.get_all_brands_summary()
         assert len(summary) == 2
         brands = {s["brand"] for s in summary}
@@ -434,9 +478,19 @@ class TestRun:
         result = agent.run()
         assert result["per_brand"]["micro_saas"]["status"] == "no_active_accounts"
 
-    def test_run_single_brand_full_pipeline(self, agent, db, llm):
+    @patch("monai.agents.social_presence.create_platform_client")
+    def test_run_single_brand_full_pipeline(self, mock_create, agent, db, llm):
         agent.register_brand("micro_saas")
-        agent.setup_account("micro_saas", "twitter", "saas_bot")
+        agent.setup_account("micro_saas", "twitter", "saas_bot",
+                            credentials={"bearer_token": "tok", "user_id": "1"})
+
+        mock_client = MagicMock()
+        mock_client.post.return_value = {"post_id": "tw_1", "url": "https://x.com/tw_1"}
+        mock_client.get_post_metrics.return_value = {
+            "likes": 5, "comments": 1, "shares": 0, "clicks": 10,
+        }
+        mock_client.get_profile_metrics.return_value = {"followers": 100}
+        mock_create.return_value = mock_client
 
         llm.chat_json.side_effect = [
             # _plan_content
@@ -459,14 +513,25 @@ class TestRun:
         assert result["total_posts"] == 1
         assert result["total_engagement"] == 1
         assert result["review"]["approved"] == 1
-        # No credentials = scheduled but publish fails gracefully
         assert result["scheduled"]["scheduled"] == 1
+        assert result["published"]["posted"] == 1
 
-    def test_run_filtered_to_one_brand(self, agent, db, llm):
+    @patch("monai.agents.social_presence.create_platform_client")
+    def test_run_filtered_to_one_brand(self, mock_create, agent, db, llm):
         agent.register_brand("micro_saas")
         agent.register_brand("newsletter")
-        agent.setup_account("micro_saas", "twitter", "saas_bot")
-        agent.setup_account("newsletter", "twitter", "news_bot")
+        agent.setup_account("micro_saas", "twitter", "saas_bot",
+                            credentials={"bearer_token": "tok", "user_id": "1"})
+        agent.setup_account("newsletter", "twitter", "news_bot",
+                            credentials={"bearer_token": "tok2", "user_id": "2"})
+
+        mock_client = MagicMock()
+        mock_client.post.return_value = {"post_id": "tw_x", "url": "https://x.com/tw_x"}
+        mock_client.get_post_metrics.return_value = {
+            "likes": 5, "comments": 1, "shares": 0, "clicks": 10,
+        }
+        mock_client.get_profile_metrics.return_value = {"followers": 100}
+        mock_create.return_value = mock_client
 
         llm.chat_json.side_effect = [
             {"calendar": [{"platform": "twitter", "post_type": "post",
@@ -641,6 +706,46 @@ class TestPublishing:
         assert result["status"] == "not_scheduled"
 
     @patch("monai.agents.social_presence.create_platform_client")
+    def test_publish_auth_failure_deactivates_account(self, mock_create, agent, db, llm):
+        """Auth failures during publish should deactivate the account (self-healing)."""
+        from monai.social.api import SocialAPIError
+        post_id = self._setup_scheduled_post(agent, db, llm)
+
+        mock_client = MagicMock()
+        mock_client.post.side_effect = SocialAPIError("401 Unauthorized: invalid token")
+        mock_create.return_value = mock_client
+
+        result = agent.publish_post(post_id)
+        assert result["status"] == "failed"
+
+        # Account should be marked as auth_failed, not still active
+        row = db.execute(
+            "SELECT status FROM brand_social_accounts "
+            "WHERE brand = 'micro_saas' AND platform = 'twitter'"
+        )[0]
+        assert row["status"] == "auth_failed"
+
+    @patch("monai.agents.social_presence.create_platform_client")
+    def test_publish_non_auth_failure_keeps_account_active(self, mock_create, agent, db, llm):
+        """Non-auth failures (rate limit, server error) should NOT deactivate."""
+        from monai.social.api import SocialAPIError
+        post_id = self._setup_scheduled_post(agent, db, llm)
+
+        mock_client = MagicMock()
+        mock_client.post.side_effect = SocialAPIError("500 Internal Server Error")
+        mock_create.return_value = mock_client
+
+        result = agent.publish_post(post_id)
+        assert result["status"] == "failed"
+
+        # Account should still be active
+        row = db.execute(
+            "SELECT status FROM brand_social_accounts "
+            "WHERE brand = 'micro_saas' AND platform = 'twitter'"
+        )[0]
+        assert row["status"] == "active"
+
+    @patch("monai.agents.social_presence.create_platform_client")
     def test_publish_all_scheduled(self, mock_create, agent, db, llm):
         agent.register_brand("micro_saas")
         agent.setup_account("micro_saas", "twitter", "saas_bot",
@@ -715,8 +820,9 @@ class TestAnalyticsPull:
     @patch("monai.agents.social_presence.create_platform_client")
     def test_pull_follower_counts(self, mock_create, agent, db):
         agent.register_brand("micro_saas")
-        agent.setup_account("micro_saas", "twitter", "saas_bot",
-                            credentials={"bearer_token": "tok", "user_id": "123"})
+        agent.setup_account(
+            "micro_saas", "twitter", "saas_bot",
+            credentials={"bearer_token": "tok", "user_id": "123"})
 
         mock_client = MagicMock()
         mock_client.get_profile_metrics.return_value = {"followers": 2500}
@@ -734,8 +840,9 @@ class TestAnalyticsPull:
     @patch("monai.agents.social_presence.create_platform_client")
     def test_pull_follower_counts_api_error(self, mock_create, agent, db):
         agent.register_brand("micro_saas")
-        agent.setup_account("micro_saas", "twitter", "saas_bot",
-                            credentials={"bearer_token": "tok", "user_id": "123"})
+        agent.setup_account(
+            "micro_saas", "twitter", "saas_bot",
+            credentials={"bearer_token": "tok", "user_id": "123"})
 
         mock_create.side_effect = Exception("API down")
 
