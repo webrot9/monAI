@@ -179,3 +179,85 @@ class TestBrowserLearner:
         mock_llm.quick.side_effect = Exception("LLM down")
         result = bl._llm_batch_match_selectors(["#email"], [])
         assert result == {}
+
+    def test_pre_resolve_missing_field_returns_none(self, config, db, mock_llm):
+        """Fields cached as __MISSING__ should resolve to None."""
+        bl = BrowserLearner(config, db, mock_llm)
+        bl._update_playbook_selector("stripe.com", ".SearchableSelect", "__MISSING__")
+        resolved = bl._pre_resolve_selectors(
+            {".SearchableSelect": "US"}, domain="stripe.com"
+        )
+        assert resolved[".SearchableSelect"] is None
+
+    def test_pre_resolve_codegen_field_returns_none(self, config, db, mock_llm):
+        """Fields cached as __CODEGEN__ should resolve to None (routed to codegen)."""
+        bl = BrowserLearner(config, db, mock_llm)
+        bl._update_playbook_selector("stripe.com", ".SearchableSelect", "__CODEGEN__")
+        resolved = bl._pre_resolve_selectors(
+            {".SearchableSelect": "US"}, domain="stripe.com"
+        )
+        assert resolved[".SearchableSelect"] is None
+
+    @pytest.mark.asyncio
+    async def test_smart_fill_form_includes_skipped_in_codegen(self, config, db, mock_llm):
+        """Skipped (complex UI) fields should be attempted by codegen fallback."""
+        bl = BrowserLearner(config, db, mock_llm)
+        mock_browser = AsyncMock()
+        bl.browser = mock_browser
+
+        # Pre-cache a field as __MISSING__ so it gets skipped by standard fill
+        bl._update_playbook_selector("stripe.com", ".country-select", "__MISSING__")
+
+        # Mock _codegen_fill_form to track what fields it receives
+        codegen_fields_received = {}
+
+        async def capture_codegen(fields, domain):
+            codegen_fields_received.update(fields)
+            return {"success": True}
+
+        bl._codegen_fill_form = capture_codegen
+
+        # smart_type for the email field — succeeds
+        async def mock_smart_type(selector, value, domain, **kw):
+            return {"success": True}
+
+        bl.smart_type = mock_smart_type
+        bl._reveal_if_hidden = AsyncMock(return_value={})
+        bl._human_delay = AsyncMock()
+        bl._discover_form_elements = AsyncMock(return_value=[])
+
+        result = await bl.smart_fill_form(
+            {"#email": "test@test.com", ".country-select": "US"},
+            domain="stripe.com",
+        )
+
+        # The country-select field should have been passed to codegen
+        assert ".country-select" in codegen_fields_received
+        assert codegen_fields_received[".country-select"] == "US"
+
+    @pytest.mark.asyncio
+    async def test_codegen_success_clears_missing_cache(self, config, db, mock_llm):
+        """When codegen fills a __MISSING__ field, cache should update to __CODEGEN__."""
+        bl = BrowserLearner(config, db, mock_llm)
+        mock_browser = AsyncMock()
+        bl.browser = mock_browser
+
+        bl._update_playbook_selector("stripe.com", ".country-select", "__MISSING__")
+
+        async def mock_codegen(fields, domain):
+            return {"success": True}
+
+        bl._codegen_fill_form = mock_codegen
+        bl.smart_type = AsyncMock(return_value={"success": True})
+        bl._reveal_if_hidden = AsyncMock(return_value={})
+        bl._human_delay = AsyncMock()
+        bl._discover_form_elements = AsyncMock(return_value=[])
+
+        await bl.smart_fill_form(
+            {"#email": "test@test.com", ".country-select": "US"},
+            domain="stripe.com",
+        )
+
+        # The __MISSING__ cache should now be __CODEGEN__
+        known = bl._get_known_selector("stripe.com", ".country-select")
+        assert known == "__CODEGEN__"

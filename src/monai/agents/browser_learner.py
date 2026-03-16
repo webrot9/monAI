@@ -389,39 +389,44 @@ class BrowserLearner:
         )
 
         # --- Code-gen fallback: when standard fill fails, write & execute a script ---
-        if not all_ok:
-            failed_fields = {
-                sel: val for sel, val in fields.items()
-                if not results.get(sel, {}).get("success")
-                and not results.get(sel, {}).get("skipped")
-            }
-            if failed_fields:
+        # Include BOTH failed fields AND skipped fields (complex UI components
+        # like SearchableSelect that weren't matched to standard form elements
+        # but likely exist as custom React/Vue components on the page)
+        unfilled_fields = {
+            sel: val for sel, val in fields.items()
+            if not results.get(sel, {}).get("success")
+        }
+        if unfilled_fields:
+            logger.info(
+                f"Standard fill missed {len(unfilled_fields)} fields on "
+                f"{domain}, attempting code-gen fallback"
+            )
+            codegen_result = await self._codegen_fill_form(
+                unfilled_fields, domain)
+            if codegen_result.get("success"):
+                # Update results for the fields that codegen handled
+                for sel in unfilled_fields:
+                    results[sel] = {
+                        "success": True,
+                        "codegen": True,
+                        "script_used": True,
+                    }
+                    # Clear __MISSING__ cache — codegen proved it exists
+                    if self._get_known_selector(domain, sel) == "__MISSING__":
+                        self._update_playbook_selector(
+                            domain, sel, "__CODEGEN__")
+                # Recompute success
+                filled_results = [
+                    r for r in results.values() if not r.get("skipped")]
+                all_ok = bool(filled_results) and all(
+                    r.get("success") for r in filled_results)
                 logger.info(
-                    f"Standard fill failed on {len(failed_fields)} fields on "
-                    f"{domain}, attempting code-gen fallback"
-                )
-                codegen_result = await self._codegen_fill_form(
-                    failed_fields, domain)
-                if codegen_result.get("success"):
-                    # Update results for the fields that codegen handled
-                    for sel in failed_fields:
-                        results[sel] = {
-                            "success": True,
-                            "codegen": True,
-                            "script_used": True,
-                        }
-                    # Recompute success
-                    filled_results = [
-                        r for r in results.values() if not r.get("skipped")]
-                    all_ok = bool(filled_results) and all(
-                        r.get("success") for r in filled_results)
-                    logger.info(
-                        f"Code-gen fallback succeeded for {len(failed_fields)} "
-                        f"fields on {domain}")
-                else:
-                    logger.warning(
-                        f"Code-gen fallback also failed on {domain}: "
-                        f"{codegen_result.get('error', 'unknown')}")
+                    f"Code-gen fallback succeeded for {len(unfilled_fields)} "
+                    f"fields on {domain}")
+            else:
+                logger.warning(
+                    f"Code-gen fallback also failed on {domain}: "
+                    f"{codegen_result.get('error', 'unknown')}")
 
         # Self-healing: check for CAPTCHA after filling form
         if all_ok:
@@ -692,10 +697,33 @@ class BrowserLearner:
         """
         page = await self.browser._get_page()
         elements = await page.evaluate("""() => {
-            const els = document.querySelectorAll('input, textarea, select, button');
-            return Array.from(els).map(el => {
+            // Standard form elements + custom interactive components
+            // (React/Vue SearchableSelect, combobox, listbox, etc.)
+            const standardEls = document.querySelectorAll(
+                'input, textarea, select, button'
+            );
+            const customEls = document.querySelectorAll(
+                '[role="combobox"], [role="listbox"], [role="searchbox"], '
+                + '[role="spinbutton"], [contenteditable="true"], '
+                + '[data-testid], [aria-haspopup="listbox"], '
+                + '[class*="Select"], [class*="select"], '
+                + '[class*="Dropdown"], [class*="dropdown"], '
+                + '[class*="Combobox"], [class*="combobox"], '
+                + '[class*="Autocomplete"], [class*="autocomplete"]'
+            );
+            // Merge and deduplicate
+            const seen = new Set();
+            const allEls = [];
+            for (const el of [...standardEls, ...customEls]) {
+                if (!seen.has(el)) {
+                    seen.add(el);
+                    allEls.push(el);
+                }
+            }
+            return allEls.map(el => {
                 const rect = el.getBoundingClientRect();
                 const isVis = rect.width > 0 && rect.height > 0;
+                const role = el.getAttribute('role') || '';
                 return {
                     tag: el.tagName.toLowerCase(),
                     type: el.getAttribute('type') || '',
@@ -704,12 +732,16 @@ class BrowserLearner:
                     placeholder: el.getAttribute('placeholder') || '',
                     ariaLabel: el.getAttribute('aria-label') || '',
                     className: el.className || '',
+                    role: role,
                     visibleText: el.innerText || el.value || '',
                     boundingBox: {
                         x: rect.x, y: rect.y,
                         width: rect.width, height: rect.height
                     },
-                    isVisible: isVis
+                    isVisible: isVis,
+                    isCustom: role === 'combobox' || role === 'listbox'
+                        || role === 'searchbox' || el.hasAttribute('aria-haspopup')
+                        || (el.className && /Select|Dropdown|Combobox|Autocomplete/i.test(el.className))
                 };
             }).filter(e => {
                 // Include visible elements AND hidden elements that have a
@@ -770,11 +802,22 @@ class BrowserLearner:
             # 1. Playbook (previously learned for this domain)
             known = self._get_known_selector(domain, selector)
             if known == "__MISSING__":
-                # Previously confirmed this field doesn't exist on the page
+                # Previously confirmed this field doesn't exist as a
+                # standard element — but codegen might still handle it
+                # (complex UI components like SearchableSelect).
+                # Mark as None so standard fill skips it, but codegen
+                # fallback will still attempt it.
                 resolved[selector] = None
                 logger.info(
                     f"Field '{selector}' known missing on {domain} "
-                    f"(cached) — will skip filling")
+                    f"(cached) — standard fill will skip, codegen may try")
+            elif known == "__CODEGEN__":
+                # Previously filled via codegen — skip standard fill,
+                # let codegen handle it again (it caches its scripts)
+                resolved[selector] = None
+                logger.info(
+                    f"Field '{selector}' handled by codegen on {domain} "
+                    f"(cached) — routing to codegen fallback")
             elif known:
                 resolved[selector] = known
             else:
@@ -971,6 +1014,13 @@ class BrowserLearner:
             f"  `Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, val);\n"
             f"   el.dispatchEvent(new Event('input', {{bubbles: true}}));\n"
             f"   el.dispatchEvent(new Event('change', {{bubbles: true}}));`\n"
+            f"- For CUSTOM COMPONENTS (SearchableSelect, React-Select, Combobox, etc.):\n"
+            f"  1. Click the container/trigger element to open the dropdown\n"
+            f"  2. Wait 200ms for options to render\n"
+            f"  3. Find the input inside (if searchable) and type the value\n"
+            f"  4. Wait 200ms then click the matching option from the dropdown\n"
+            f"  5. Look for [role='combobox'], [role='listbox'], [role='option'],\n"
+            f"     [class*='Select'], [aria-haspopup='listbox'] patterns in the DOM\n"
             f"- Do NOT use alert(), confirm(), or prompt()\n"
             f"- No network requests\n"
             f"- Return ONLY raw JavaScript, no markdown fences"
