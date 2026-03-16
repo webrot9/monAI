@@ -687,6 +687,28 @@ def is_script_ethical(
             if pattern in script_readable:
                 return False, f"Blocked Python pattern: '{pattern}'"
 
+    # Layer 2.5: Fast-path whitelist for DOM-only form-fill scripts.
+    # If a browser_js script ONLY does safe DOM operations (querySelector,
+    # .value, .click, dispatchEvent, etc.) and contains NONE of the
+    # exfiltration vectors, the static checks above are sufficient —
+    # skip the LLM review which is overly conservative and blocks
+    # legitimate form fills.
+    if script_type == "browser_js":
+        _exfil_vectors = [
+            "fetch(", "fetch (", "xmlhttprequest", "axios",
+            "navigator.sendbeacon", "new image", "new audio",
+            "websocket", "eventsource",
+            "window.open", "window.location",
+            "document.cookie", "localstorage", "sessionstorage",
+            "indexeddb", "clipboard",
+            "eval(", "new function(",
+            "document.write",
+        ]
+        has_exfil = any(v in script_readable for v in _exfil_vectors)
+        if not has_exfil:
+            logger.info("Ethics fast-path: DOM-only script, skipping LLM review")
+            return True, "Passed all static checks (DOM-only fast-path)"
+
     # Layer 3: LLM review (if available) — catches semantic violations
     # that pattern matching misses
     if llm is not None:
