@@ -1,5 +1,10 @@
 # Lessons Learned
 
+### 2026-03-16 - Tests that bypass __init__ break when new instance attributes are added
+- **Mistake**: Added `_script_target_failures` to `AutonomousExecutor.__init__` but didn't check for tests that bypass `__init__` via `__new__`. `test_think_includes_asset_context` broke because the attribute didn't exist.
+- **Root cause**: Tests using `patch.object(Class, '__init__', lambda...)` + `__new__` don't call the real `__init__`, so any new instance attribute is missing.
+- **Rule**: When adding new instance attributes to a class, grep for `__new__` and `__init__.*lambda` in test files to find tests that manually construct instances. Update them to include the new attribute. Never dismiss a failing test as "pre-existing" without verifying on main first.
+
 ### 2026-03-16 - No LLM health check before expensive operations
 - **Mistake**: When OpenAI quota is exhausted (429), each cycle still launches browser, creates mail.tm email, starts Playwright, and provisions infrastructure — all before discovering the LLM is dead. Cycles 2-4 each wasted 5-10 seconds of browser+email work for zero value.
 - **Root cause**: (1) No LLM availability check before starting expensive infrastructure provisioning. (2) Daemon loop uses fixed 300s interval regardless of failure rate — no backoff on persistent errors.
