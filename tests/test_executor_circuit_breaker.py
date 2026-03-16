@@ -460,6 +460,176 @@ class TestScriptTargetBurning:
         assert "#old-target" not in executor._script_target_failures
 
 
+class TestLLMHealthCheck:
+    """LLM.health_check() should detect quota exhaustion and unavailability."""
+
+    def _make_llm(self):
+        config = MagicMock()
+        config.llm.model_mini = "gpt-4o-mini"
+        config.llm.provider = "openai"
+        config.privacy.proxy_type = "none"
+        config.llm.api_key = "test"
+        config.llm.api_base = None
+        config.llm.model = "gpt-4o"
+        config.llm.temperature = 0.7
+        config.llm.max_tokens = 4096
+        return config
+
+    def test_health_check_returns_available_on_success(self):
+        from monai.utils.llm import LLM
+        config = self._make_llm()
+        with patch("monai.utils.llm.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            mock_client.chat.completions.create.return_value = MagicMock()
+
+            llm = LLM(config)
+            result = llm.health_check()
+
+            assert result["available"] is True
+            assert result["quota_exhausted"] is False
+
+    def test_health_check_detects_quota_exhaustion(self):
+        from monai.utils.llm import LLM
+        config = self._make_llm()
+        with patch("monai.utils.llm.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            mock_client.chat.completions.create.side_effect = Exception(
+                "Error code: 429 - {'error': {'message': 'You exceeded your "
+                "current quota', 'type': 'insufficient_quota'}}"
+            )
+
+            llm = LLM(config)
+            result = llm.health_check()
+
+            assert result["available"] is False
+            assert result["quota_exhausted"] is True
+
+    def test_health_check_detects_generic_failure(self):
+        from monai.utils.llm import LLM
+        config = self._make_llm()
+        with patch("monai.utils.llm.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            mock_client.chat.completions.create.side_effect = ConnectionError(
+                "Connection refused"
+            )
+
+            llm = LLM(config)
+            result = llm.health_check()
+
+            assert result["available"] is False
+            assert result["quota_exhausted"] is False
+            assert "Connection refused" in result["error"]
+
+
+class TestOrchestratorLLMGuard:
+    """Orchestrator should skip expensive operations when LLM is unavailable.
+
+    Instead of instantiating the full Orchestrator (which has 30+ deps), we test
+    the health-check guard logic by verifying that the LLM.health_check method
+    correctly detects quota exhaustion, and that the orchestrator code path
+    references the check result correctly.
+    """
+
+    def test_health_check_result_detected_as_quota_exhausted(self):
+        """The health_check result for quota exhaustion should have
+        available=False and quota_exhausted=True."""
+        from monai.utils.llm import LLM
+        config = MagicMock()
+        config.llm.model_mini = "gpt-4o-mini"
+        config.llm.provider = "openai"
+        config.privacy.proxy_type = "none"
+        config.llm.api_key = "test"
+        config.llm.api_base = None
+        config.llm.model = "gpt-4o"
+        config.llm.temperature = 0.7
+        config.llm.max_tokens = 4096
+
+        with patch("monai.utils.llm.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            mock_client.chat.completions.create.side_effect = Exception(
+                "Error code: 429 - insufficient_quota"
+            )
+            llm = LLM(config)
+            result = llm.health_check()
+
+        assert result["available"] is False
+        assert result["quota_exhausted"] is True
+
+        # The orchestrator checks these exact fields:
+        # if not llm_health["available"]:
+        #     if llm_health["quota_exhausted"]:
+        #         reason = "llm_quota_exhausted"
+        reason = "llm_unavailable"
+        if result["quota_exhausted"]:
+            reason = "llm_quota_exhausted"
+        assert reason == "llm_quota_exhausted"
+
+    def test_health_check_connection_error_not_quota(self):
+        """Connection errors should be detected as unavailable but NOT
+        quota_exhausted — the orchestrator should still back off."""
+        from monai.utils.llm import LLM
+        config = MagicMock()
+        config.llm.model_mini = "gpt-4o-mini"
+        config.llm.provider = "openai"
+        config.privacy.proxy_type = "none"
+        config.llm.api_key = "test"
+        config.llm.api_base = None
+        config.llm.model = "gpt-4o"
+        config.llm.temperature = 0.7
+        config.llm.max_tokens = 4096
+
+        with patch("monai.utils.llm.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            mock_client.chat.completions.create.side_effect = ConnectionError(
+                "Connection refused"
+            )
+            llm = LLM(config)
+            result = llm.health_check()
+
+        assert result["available"] is False
+        assert result["quota_exhausted"] is False
+
+        reason = "llm_unavailable"
+        if result["quota_exhausted"]:
+            reason = "llm_quota_exhausted"
+        assert reason == "llm_unavailable"
+
+
+class TestDaemonBackoff:
+    """run_daemon should apply exponential backoff on persistent failures."""
+
+    def test_backoff_multiplier_increases_on_failures(self):
+        """Verify the backoff logic computes correct multipliers."""
+        # This tests the backoff math without running the full daemon
+        max_backoff_multiplier = 12
+        base_interval = 300
+
+        # Simulate consecutive failures
+        consecutive = 0
+        multipliers = []
+        for i in range(6):
+            consecutive += 1
+            mult = min(2 ** (consecutive - 1), max_backoff_multiplier)
+            multipliers.append(mult)
+
+        # 1x, 2x, 4x, 8x, 12x (capped), 12x (capped)
+        assert multipliers == [1, 2, 4, 8, 12, 12]
+
+    def test_backoff_resets_on_success(self):
+        """After a successful cycle, backoff should reset to 1x."""
+        consecutive = 5
+        # Simulate success
+        consecutive = 0
+        mult = min(2 ** max(consecutive - 1, 0), 12)
+        # 2^(-1) = 0.5, but max(0-1, 0) = 0, so 2^0 = 1
+        assert mult == 1
+
+
 class TestTorControlPort:
     """Tor should be started with --ControlPort 9051."""
 

@@ -230,6 +230,9 @@ def run_daemon(config: Config, cycle_interval: int = 300):
         logger.warning("Continuing without webhook server — payments will NOT be received")
 
     cycle = 0
+    consecutive_failures = 0
+    max_backoff_multiplier = 12  # Cap at 12x base interval (1 hour at 300s base)
+
     while not _shutdown:
         cycle += 1
         logger.info(f"\n{'='*60}")
@@ -239,6 +242,7 @@ def run_daemon(config: Config, cycle_interval: int = 300):
         # Watchdog: run cycle with hard timeout (10 minutes) to detect hangs
         # Check _shutdown every second so Ctrl+C is responsive
         cycle_timeout = 600  # seconds
+        cycle_failed = False
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(orchestrator.run)
@@ -264,18 +268,44 @@ def run_daemon(config: Config, cycle_interval: int = 300):
                         f"WATCHDOG: Cycle {cycle} exceeded {cycle_timeout}s timeout — "
                         "force-completing and moving to next cycle"
                     )
+                    cycle_failed = True
                     continue
 
                 if result is not None:
                     _print_cycle_summary(result, db)
+                    # Detect LLM unavailability from cycle result
+                    status = result.get("status", "")
+                    if status in ("llm_unavailable", "llm_quota_exhausted"):
+                        cycle_failed = True
+                    else:
+                        cycle_failed = False
         except Exception as e:
             logger.error(f"Cycle {cycle} failed: {e}", exc_info=True)
+            cycle_failed = True
 
         if _shutdown:
             break
 
-        logger.info(f"Next cycle in {cycle_interval}s...")
-        for _ in range(cycle_interval):
+        # Exponential backoff: when cycles keep failing (LLM quota exhausted,
+        # persistent errors), increase the wait time to avoid wasting resources
+        # (browser launches, email provisioning, API retries)
+        if cycle_failed:
+            consecutive_failures += 1
+            backoff_multiplier = min(2 ** (consecutive_failures - 1), max_backoff_multiplier)
+        else:
+            consecutive_failures = 0
+            backoff_multiplier = 1
+
+        wait_time = int(cycle_interval * backoff_multiplier)
+        if backoff_multiplier > 1:
+            logger.warning(
+                f"Backoff active: {consecutive_failures} consecutive failures, "
+                f"waiting {wait_time}s (base {cycle_interval}s × {backoff_multiplier}x)"
+            )
+        else:
+            logger.info(f"Next cycle in {wait_time}s...")
+
+        for _ in range(wait_time):
             if _shutdown:
                 break
             time.sleep(1)

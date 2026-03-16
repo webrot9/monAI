@@ -283,6 +283,32 @@ class LLM:
         """Attach database for persistent cost logging."""
         self._db = db
 
+    def health_check(self) -> dict[str, Any]:
+        """Lightweight LLM availability check.
+
+        Makes a minimal API call to verify the LLM is reachable and has quota.
+        Returns {"available": True/False, "error": str|None, "quota_exhausted": bool}.
+        """
+        try:
+            self.client.chat.completions.create(
+                model=self.config.llm.model_mini,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+            )
+            return {"available": True, "error": None, "quota_exhausted": False}
+        except Exception as e:
+            err_str = str(e)
+            quota_exhausted = (
+                "insufficient_quota" in err_str
+                or "exceeded your current quota" in err_str
+                or ("429" in err_str and "quota" in err_str.lower())
+            )
+            return {
+                "available": False,
+                "error": err_str[:200],
+                "quota_exhausted": quota_exhausted,
+            }
+
     def chat(
         self,
         messages: list[dict[str, str]],

@@ -1,5 +1,10 @@
 # Lessons Learned
 
+### 2026-03-16 - No LLM health check before expensive operations
+- **Mistake**: When OpenAI quota is exhausted (429), each cycle still launches browser, creates mail.tm email, starts Playwright, and provisions infrastructure — all before discovering the LLM is dead. Cycles 2-4 each wasted 5-10 seconds of browser+email work for zero value.
+- **Root cause**: (1) No LLM availability check before starting expensive infrastructure provisioning. (2) Daemon loop uses fixed 300s interval regardless of failure rate — no backoff on persistent errors.
+- **Rule**: Add `LLM.health_check()` — lightweight 1-token ping to verify quota/availability BEFORE `_execute_cycle()` starts browser/email work. If unavailable, return immediately with `llm_unavailable` or `llm_quota_exhausted` status. Daemon loop tracks consecutive failures and applies exponential backoff (1x → 2x → 4x → 8x → 12x cap) on the cycle interval. Resets to 1x on success.
+
 ### 2026-03-16 - Custom dropdowns (SearchableSelect) burn 10+ steps per task
 - **Mistake**: Stripe registration's country dropdown (SearchableSelect) caused the executor to waste 10-14 steps per cycle. `fill_form` partially succeeds (email+password) but fails on the custom dropdown. The executor then retries via `run_page_script` with slightly varied JS each time, dodging the stuck-loop detector since the code differs. 3 cycles × 14 steps = 42 wasted LLM calls on one dropdown.
 - **Root cause**: (1) Stripe playbook only had email/password mapped — no entry for the SearchableSelect. (2) Codegen fallback generates generic JS that doesn't reliably interact with custom React dropdown components. (3) Executor's stuck-loop watchdog only catches identical args, not semantically equivalent retries. (4) No specialized handling for custom dropdown components (click→type→select pattern).
