@@ -200,6 +200,80 @@ class TestFillFormSelectorNormalization:
         assert Browser._normalize_selector(sel) == sel
 
 
+class TestEthicsBlockNudge:
+    """When run_page_script is blocked by ethics 2+ times, the nudge should
+    steer the LLM away from run_page_script and toward alternatives."""
+
+    def _make_executor(self):
+        config = MagicMock()
+        config.data_dir = MagicMock()
+        config.data_dir.__truediv__ = lambda s, x: MagicMock()
+        db = MagicMock()
+        db.connect.return_value.__enter__ = MagicMock()
+        db.connect.return_value.__exit__ = MagicMock()
+        llm = MagicMock()
+        with patch("monai.agents.executor.get_anonymizer"), \
+             patch("monai.agents.executor.SharedMemory"), \
+             patch("monai.agents.browser_learner.BrowserLearner", side_effect=Exception("no browser")):
+            executor = AutonomousExecutor(config, db, llm, max_steps=10)
+        executor._learner = None
+        return executor
+
+    def test_ethics_block_nudge_after_2_blocks(self):
+        executor = self._make_executor()
+        # Simulate 2 ethics-blocked run_page_script attempts
+        executor.action_history = [
+            {"step": 1, "tool": "run_page_script",
+             "args": {"script": "document.querySelector(...)"},
+             "result": "BLOCKED: Script failed ethics review: violating CFAA"},
+            {"step": 2, "tool": "run_page_script",
+             "args": {"script": "document.querySelector(...)"},
+             "result": "BLOCKED: Script failed ethics review: circumvents ToS"},
+        ]
+
+        # Mock all the dependencies _think needs
+        executor._get_learned_context = MagicMock(return_value="")
+        executor._get_executor_config = MagicMock(return_value=0.3)
+        executor._get_tool_descriptions = MagicMock(return_value="")
+        executor._proof = MagicMock()
+        executor._proof.get_history.return_value = ""
+
+        # Make LLM return a valid action so _think completes
+        executor.llm.chat_json.return_value = {
+            "reasoning": "test", "tool": "fail",
+            "args": {"reason": "blocked"}
+        }
+
+        # Call _think and check that the prompt includes the ethics nudge
+        executor._think("test task", "test context", 2)
+
+        prompt = executor.llm.chat_json.call_args[0][0][-1]["content"]
+        assert "run_page_script has been BLOCKED by ethics review" in prompt
+        assert "DO NOT use run_page_script" in prompt
+
+    def test_no_ethics_nudge_without_blocks(self):
+        executor = self._make_executor()
+        executor.action_history = [
+            {"step": 1, "tool": "fill_form",
+             "args": {"fields": {}},
+             "result": "ERROR: Fill failed on: country"},
+        ]
+        executor._get_learned_context = MagicMock(return_value="")
+        executor._get_executor_config = MagicMock(return_value=0.3)
+        executor._get_tool_descriptions = MagicMock(return_value="")
+        executor._proof = MagicMock()
+        executor._proof.get_history.return_value = ""
+        executor.llm.chat_json.return_value = {
+            "reasoning": "test", "tool": "fail",
+            "args": {"reason": "test"}
+        }
+
+        executor._think("test task", "test context", 1)
+
+        prompt = executor.llm.chat_json.call_args[0][0][-1]["content"]
+        assert "run_page_script has been BLOCKED" not in prompt
+
+
 class TestTorControlPort:
     """Tor should be started with --ControlPort 9051."""
 
