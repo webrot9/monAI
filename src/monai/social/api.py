@@ -26,6 +26,10 @@ class BasePlatformClient:
     """Base class for platform API clients."""
 
     platform: str = ""
+    # Subclasses define which credential fields are required for API calls.
+    # Used by validate_credentials() and ensure_platform_account() to reject
+    # incomplete credentials (e.g. just a password instead of OAuth tokens).
+    required_credential_fields: tuple[str, ...] = ()
 
     def __init__(self, config: Config, credentials: dict[str, str]):
         self._config = config
@@ -45,18 +49,59 @@ class BasePlatformClient:
     def get_profile_metrics(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    def has_required_credentials(self) -> bool:
+        """Check that all required credential fields are present and non-empty."""
+        if not self.required_credential_fields:
+            return True
+        return all(
+            self._credentials.get(field)
+            for field in self.required_credential_fields
+        )
+
+    def validate_credentials(self) -> bool:
+        """Test credentials against the platform API with a lightweight call.
+
+        Returns True if the credentials are valid, False otherwise.
+        Subclasses should override with a real API call.
+        """
+        if not self.has_required_credentials():
+            logger.warning(
+                "%s: missing required credential fields %s (have: %s)",
+                self.platform,
+                self.required_credential_fields,
+                list(self._credentials.keys()),
+            )
+            return False
+        return True
+
 
 class TwitterClient(BasePlatformClient):
     """Twitter/X API v2 client."""
 
     platform = "twitter"
     API_BASE = "https://api.twitter.com/2"
+    required_credential_fields = ("bearer_token",)
 
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self._credentials.get('bearer_token', '')}",
             "Content-Type": "application/json",
         }
+
+    def validate_credentials(self) -> bool:
+        """Verify Twitter bearer token by fetching /2/users/me."""
+        if not super().validate_credentials():
+            return False
+        try:
+            client = self._get_client()
+            resp = client.get(
+                f"{self.API_BASE}/users/me",
+                headers=self._headers(),
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.warning("Twitter credential validation failed: %s", e)
+            return False
 
     def post(self, content: str, **kwargs) -> dict[str, Any]:
         """Create a tweet."""
@@ -142,6 +187,7 @@ class LinkedInClient(BasePlatformClient):
 
     platform = "linkedin"
     API_BASE = "https://api.linkedin.com/v2"
+    required_credential_fields = ("access_token", "person_urn")
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -149,6 +195,21 @@ class LinkedInClient(BasePlatformClient):
             "Content-Type": "application/json",
             "X-Restli-Protocol-Version": "2.0.0",
         }
+
+    def validate_credentials(self) -> bool:
+        """Verify LinkedIn credentials by fetching /v2/me profile."""
+        if not super().validate_credentials():
+            return False
+        try:
+            client = self._get_client()
+            resp = client.get(
+                f"{self.API_BASE}/me",
+                headers=self._headers(),
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            logger.warning("LinkedIn credential validation failed: %s", e)
+            return False
 
     def post(self, content: str, **kwargs) -> dict[str, Any]:
         """Create a LinkedIn post."""
@@ -226,10 +287,23 @@ class RedditClient(BasePlatformClient):
     platform = "reddit"
     API_BASE = "https://oauth.reddit.com"
     AUTH_URL = "https://www.reddit.com/api/v1/access_token"
+    required_credential_fields = ("client_id", "client_secret", "username", "password")
 
     def __init__(self, config: Config, credentials: dict[str, str]):
         super().__init__(config, credentials)
         self._access_token: str = ""
+
+    def validate_credentials(self) -> bool:
+        """Verify Reddit credentials by attempting OAuth2 token exchange."""
+        if not super().validate_credentials():
+            return False
+        try:
+            self._access_token = ""  # Reset to force re-auth
+            self._ensure_auth()
+            return bool(self._access_token)
+        except Exception as e:
+            logger.warning("Reddit credential validation failed: %s", e)
+            return False
 
     def _ensure_auth(self):
         """Get OAuth2 access token if needed."""
@@ -479,3 +553,30 @@ def create_platform_client(
     if not client_cls:
         raise ValueError(f"Unknown platform: {platform}")
     return client_cls(config, credentials)
+
+
+def get_required_credential_fields(platform: str) -> tuple[str, ...]:
+    """Return the credential fields required for a platform's API.
+
+    Used by ensure_platform_account() to reject incomplete credentials
+    (e.g. just a password when OAuth tokens are needed).
+    """
+    client_cls = PLATFORM_CLIENTS.get(platform)
+    if not client_cls:
+        return ()
+    return client_cls.required_credential_fields
+
+
+def validate_platform_credentials(
+    platform: str, config: Config, credentials: dict[str, str]
+) -> bool:
+    """Create a platform client and validate credentials with a real API call.
+
+    Returns False if the platform is unknown, credentials are missing
+    required fields, or the API call fails.
+    """
+    client_cls = PLATFORM_CLIENTS.get(platform)
+    if not client_cls:
+        return False
+    client = client_cls(config, credentials)
+    return client.validate_credentials()

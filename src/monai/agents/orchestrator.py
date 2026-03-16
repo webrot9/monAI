@@ -218,7 +218,8 @@ class Orchestrator(BaseAgent):
             for name, agent in self._strategy_agents.items():
                 status = getattr(agent, "status", None)
                 if status in ("paused", "failed"):
-                    reason = self.TOR_BLOCKED_STRATEGIES.get(name, "")
+                    # Check if auto-paused due to proxy failures
+                    reason = self._get_strategy_pause_reason(name)
                     extra = f" ({reason})" if reason else ""
                     lines.append(
                         f"[strategy_{status}] '{name}' is {status}{extra} — "
@@ -991,18 +992,17 @@ class Orchestrator(BaseAgent):
         "domain_flipping": [],  # Paid via marketplace (Sedo, etc.)
     }
 
-    # Strategies that require platforms known to block Tor/proxy traffic.
-    # These are auto-paused when running behind a proxy to avoid wasting
-    # LLM calls on impossible registration attempts.
-    TOR_BLOCKED_STRATEGIES: dict[str, str] = {
-        "freelance_writing": "Upwork/Fiverr block Tor registration",
-        "digital_products": "Gumroad blocks Tor registration",
-        "course_creation": "Udemy/Skillshare block Tor registration",
-        "micro_saas": "Stripe/LemonSqueezy block Tor registration",
-        "saas": "Stripe blocks Tor registration",
-        "print_on_demand": "Redbubble/TeeSpring block Tor registration",
-        "domain_flipping": "Domain registrars block Tor registration",
-        "social_media": "Social platforms block Tor account creation",
+    # Self-healing configuration for strategy proxy failures.
+    # Instead of a static blocklist, strategies are allowed to try and
+    # auto-pause only after real failures.  They periodically retry with
+    # exponential backoff to detect when platforms become accessible
+    # (e.g., free proxy found, residential proxy configured, platform
+    # policy changed).
+    SELF_HEALING_CONFIG = {
+        "max_consecutive_failures": 3,  # Auto-pause after 3 consecutive proxy failures
+        "base_retry_interval": 3600,    # First retry after 1 hour
+        "max_retry_interval": 86400,    # Cap at 24 hours between retries
+        "backoff_factor": 2,            # Double retry interval each time
     }
 
     def _ensure_strategy_payment_providers(self, result: dict[str, Any]) -> None:
@@ -1023,8 +1023,8 @@ class Orchestrator(BaseAgent):
             failed_providers: set[str] = set()  # Track providers that failed this cycle
             for row in active_strategies:
                 strategy_name = row["strategy"]
-                # Skip Tor-blocked strategies entirely
-                if strategy_name in self.TOR_BLOCKED_STRATEGIES:
+                # Skip auto-paused strategies (proxy failures)
+                if self._is_strategy_auto_paused(strategy_name):
                     continue
                 needed_providers = self.STRATEGY_PAYMENT_PROVIDERS.get(strategy_name, [])
                 for provider in needed_providers:
@@ -2136,34 +2136,195 @@ class Orchestrator(BaseAgent):
                            risk_level="high")
             return {"status": "error", "error": str(e)}
 
+    # ── Self-Healing Strategy Management ─────────────────────────
+
+    def _init_strategy_health(self) -> None:
+        """Ensure strategy_health table exists (idempotent)."""
+        try:
+            with self.db.connect() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS strategy_health (
+                        strategy_name TEXT PRIMARY KEY,
+                        consecutive_proxy_failures INTEGER DEFAULT 0,
+                        total_proxy_failures INTEGER DEFAULT 0,
+                        total_successes INTEGER DEFAULT 0,
+                        last_failure_reason TEXT,
+                        last_failure_at REAL,
+                        last_success_at REAL,
+                        auto_paused_at REAL,
+                        next_retry_at REAL,
+                        retry_count INTEGER DEFAULT 0
+                    );
+                """)
+        except Exception:
+            pass
+
+    def record_strategy_proxy_failure(
+        self, strategy_name: str, reason: str
+    ) -> None:
+        """Record a proxy-related failure for a strategy.
+
+        After SELF_HEALING_CONFIG['max_consecutive_failures'] consecutive
+        failures, the strategy is auto-paused with a retry timer.
+        """
+        import time as _time
+        now = _time.time()
+        cfg = self.SELF_HEALING_CONFIG
+
+        self._init_strategy_health()
+
+        # Upsert health record
+        self.db.execute(
+            "INSERT INTO strategy_health (strategy_name, consecutive_proxy_failures, "
+            "total_proxy_failures, last_failure_reason, last_failure_at) "
+            "VALUES (?, 1, 1, ?, ?) "
+            "ON CONFLICT(strategy_name) DO UPDATE SET "
+            "consecutive_proxy_failures = consecutive_proxy_failures + 1, "
+            "total_proxy_failures = total_proxy_failures + 1, "
+            "last_failure_reason = excluded.last_failure_reason, "
+            "last_failure_at = excluded.last_failure_at",
+            (strategy_name, reason, now),
+        )
+
+        # Check if we should auto-pause
+        rows = self.db.execute(
+            "SELECT consecutive_proxy_failures, retry_count "
+            "FROM strategy_health WHERE strategy_name = ?",
+            (strategy_name,),
+        )
+        if not rows:
+            return
+
+        failures = rows[0]["consecutive_proxy_failures"]
+        retry_count = rows[0]["retry_count"]
+
+        if failures >= cfg["max_consecutive_failures"]:
+            # Calculate next retry time with exponential backoff
+            interval = min(
+                cfg["base_retry_interval"] * (cfg["backoff_factor"] ** retry_count),
+                cfg["max_retry_interval"],
+            )
+            next_retry = now + interval
+
+            # Auto-pause the strategy
+            self.db.execute_insert(
+                "UPDATE strategies SET status = 'paused', "
+                "updated_at = CURRENT_TIMESTAMP WHERE name = ?",
+                (strategy_name,),
+            )
+            self.db.execute(
+                "UPDATE strategy_health SET auto_paused_at = ?, "
+                "next_retry_at = ?, retry_count = retry_count + 1 "
+                "WHERE strategy_name = ?",
+                (now, next_retry, strategy_name),
+            )
+            logger.warning(
+                "SELF-HEALING: Auto-paused strategy '%s' after %d consecutive "
+                "proxy failures (reason: %s). Will retry in %ds.",
+                strategy_name, failures, reason, int(interval),
+            )
+
+    def record_strategy_success(self, strategy_name: str) -> None:
+        """Record a successful strategy execution — resets failure counter."""
+        import time as _time
+        now = _time.time()
+
+        self._init_strategy_health()
+        self.db.execute(
+            "INSERT INTO strategy_health (strategy_name, total_successes, "
+            "last_success_at, consecutive_proxy_failures, auto_paused_at, "
+            "next_retry_at, retry_count) "
+            "VALUES (?, 1, ?, 0, NULL, NULL, 0) "
+            "ON CONFLICT(strategy_name) DO UPDATE SET "
+            "consecutive_proxy_failures = 0, "
+            "total_successes = total_successes + 1, "
+            "last_success_at = excluded.last_success_at, "
+            "auto_paused_at = NULL, "
+            "next_retry_at = NULL, "
+            "retry_count = 0",
+            (strategy_name, now),
+        )
+
+    def _is_strategy_auto_paused(self, strategy_name: str) -> bool:
+        """Check if a strategy is currently auto-paused due to proxy failures."""
+        try:
+            rows = self.db.execute(
+                "SELECT auto_paused_at FROM strategy_health "
+                "WHERE strategy_name = ? AND auto_paused_at IS NOT NULL",
+                (strategy_name,),
+            )
+            return bool(rows)
+        except Exception:
+            return False
+
+    def _get_strategy_pause_reason(self, strategy_name: str) -> str:
+        """Get the reason a strategy is paused (for LLM context)."""
+        try:
+            rows = self.db.execute(
+                "SELECT last_failure_reason, consecutive_proxy_failures, "
+                "next_retry_at FROM strategy_health "
+                "WHERE strategy_name = ? AND auto_paused_at IS NOT NULL",
+                (strategy_name,),
+            )
+            if rows:
+                r = rows[0]
+                import time as _time
+                remaining = max(0, int((r["next_retry_at"] or 0) - _time.time()))
+                return (
+                    f"proxy failures ({r['consecutive_proxy_failures']}x): "
+                    f"{r['last_failure_reason']} — retry in {remaining}s"
+                )
+        except Exception:
+            pass
+        return ""
+
+    def _check_strategy_retries(self, results: dict[str, Any]) -> None:
+        """Un-pause strategies whose retry timer has expired."""
+        import time as _time
+        now = _time.time()
+
+        try:
+            self._init_strategy_health()
+            rows = self.db.execute(
+                "SELECT strategy_name, next_retry_at, retry_count "
+                "FROM strategy_health "
+                "WHERE auto_paused_at IS NOT NULL AND next_retry_at <= ?",
+                (now,),
+            )
+            for row in rows:
+                name = row["strategy_name"]
+                # Reactivate the strategy for this cycle
+                self.db.execute_insert(
+                    "UPDATE strategies SET status = 'active', "
+                    "updated_at = CURRENT_TIMESTAMP WHERE name = ?",
+                    (name,),
+                )
+                # Reset consecutive failures but keep retry_count for backoff
+                self.db.execute(
+                    "UPDATE strategy_health SET "
+                    "consecutive_proxy_failures = 0, "
+                    "auto_paused_at = NULL "
+                    "WHERE strategy_name = ?",
+                    (name,),
+                )
+                logger.info(
+                    "SELF-HEALING: Reactivated strategy '%s' for retry "
+                    "(attempt #%d)", name, row["retry_count"] + 1,
+                )
+                results[name] = {
+                    "status": "retrying",
+                    "retry_attempt": row["retry_count"] + 1,
+                }
+        except Exception as e:
+            logger.warning(f"Strategy retry check failed: {e}")
+
     def _run_strategies(self) -> dict[str, Any]:
         import concurrent.futures
 
         results = {}
 
-        # Auto-pause strategies that require Tor-blocked platforms
-        uses_proxy = getattr(self.config, "privacy", None) and \
-            getattr(self.config.privacy, "proxy_type", "none") != "none"
-        if uses_proxy:
-            for strat_name, reason in self.TOR_BLOCKED_STRATEGIES.items():
-                rows = self.db.execute(
-                    "SELECT status FROM strategies WHERE name = ? AND status = 'active'",
-                    (strat_name,),
-                )
-                if rows:
-                    self.db.execute_insert(
-                        "UPDATE strategies SET status = 'paused', "
-                        "updated_at = CURRENT_TIMESTAMP WHERE name = ?",
-                        (strat_name,),
-                    )
-                    logger.info(
-                        "Auto-paused strategy '%s': %s (proxy mode active)",
-                        strat_name, reason,
-                    )
-                    results[strat_name] = {
-                        "status": "auto_paused",
-                        "reason": f"Tor-blocked: {reason}",
-                    }
+        # Self-healing: check if any auto-paused strategies are ready to retry
+        self._check_strategy_retries(results)
 
         active = self.db.execute("SELECT name FROM strategies WHERE status = 'active'")
         active_names = {r["name"] for r in active}
@@ -2221,6 +2382,8 @@ class Orchestrator(BaseAgent):
                         self.task_router.update_performance(
                             name, "strategy_execution", True, duration_ms,
                         )
+                        # Self-healing: reset failure counter on success
+                        self.record_strategy_success(name)
                         last_error = None
                         break  # Success — no retry needed
                     except concurrent.futures.TimeoutError:
@@ -2272,6 +2435,18 @@ class Orchestrator(BaseAgent):
                         self.task_router.update_performance(
                             name, "strategy_execution", False, duration_ms,
                         )
+                        # Self-healing: detect proxy-related failures
+                        err_lower = str(e).lower()
+                        is_proxy_failure = any(s in err_lower for s in [
+                            "allproxiesblocked", "proxy", "tor",
+                            "blocked", "403", "captcha",
+                            "anonymity", "registration failed",
+                            "account creation", "access denied",
+                        ])
+                        if is_proxy_failure:
+                            self.record_strategy_proxy_failure(
+                                name, str(e)[:200],
+                            )
                         break
 
         # Store results for next cycle's metrics recording

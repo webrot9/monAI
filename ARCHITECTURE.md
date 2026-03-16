@@ -316,7 +316,8 @@ All strategies use real browser automation and APIs — zero simulation:
 | `llm.py` | OpenAI integration, model tiers (FULL/MINI/NANO), CostTracker with save/load, BudgetExceededError |
 | `crypto.py` | Fernet config encryption (auto-key, sensitive field detection, ENC: prefix) |
 | `browser.py` | Playwright browser automation |
-| `privacy.py` | Tor/proxy anonymization |
+| `privacy.py` | Tor/proxy anonymization, fallback chain (Tor→residential→datacenter→free) |
+| `free_proxies.py` | Auto-scraping free proxy pool (geonode, free-proxy-list, sslproxies) |
 | `resources.py` | CPU/memory/disk monitoring |
 | `sandbox.py` | Sandboxed execution |
 | `telegram.py` | Telegram Bot API client |
@@ -365,6 +366,8 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 **Sprint 5 completed 2026-03-11**: Crowdfunding landing page enhancements — client-side QR code generation for Monero payment modal (pure JS, canvas-based), crowdfunding campaign management with atomic contribution recording and auto-funded status, fixed DB API calls (fetch_all→execute, positional→dict-key row access).
 
 **Sprint 6 completed 2026-03-11**: ProxyFallbackChain already fully implemented — 22 tests added covering Tor→residential→datacenter proxy fallback, per-domain blocking, block page content detection (≥2 pattern matches), thread safety, preferred proxy after success.
+
+**Sprint 8 completed 2026-03-16**: Self-healing strategy management — removed static `TOR_BLOCKED_STRATEGIES` blocklist that prevented 8 strategies from ever running. Replaced with dynamic self-healing: strategies are allowed to try, auto-pause after 3 real proxy failures, and periodically retry with exponential backoff (1h → 2h → ... → 24h cap). Added free proxy auto-scraping (`FreeProxyPool`) as a 4th fallback tier (Tor → residential → datacenter → free). The system now self-procures free SOCKS5/HTTPS proxies from public lists (geonode, free-proxy-list.net, sslproxies.org), validates them, tracks reliability, and uses them automatically when Tor is blocked and no paid proxy is configured. 27 new tests covering self-healing, free proxy fallback, proxy failure detection, and pool management.
 
 **Sprint 7 completed 2026-03-11**: APIProvisioner already fully implemented — 49 tests added covering schema init, plan generation, encrypted key storage/retrieval, key rotation, provider dispatching, webhook URL building, brand email resolution, result key parsing, BTCPay provisioning, provision_all orchestration. Fixed 3 production bugs (sqlite3.Row .get() → bracket access).
 
@@ -415,7 +418,7 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 ### Feature Completions
 - **LemonSqueezy full integration**: Auto-creates products and variants (was: checkout-only)
 - **LemonSqueezy platform integration**: `integrations/lemonsqueezy.py` for strategy agents
-- **Tor detection fallback**: `ProxyFallbackChain` — auto-falls back Tor → residential → datacenter
+- **Tor detection fallback**: `ProxyFallbackChain` — auto-falls back Tor → residential → datacenter → free proxies
 - **Crowdfunding landing page**: `web/landing/` — deployable static site with payment integration
 - **Team agents with real logic**: Engineering, research, marketing teams now use browser automation
 - **API key self-provisioning**: `agents/api_provisioner.py` — autonomous provider registration

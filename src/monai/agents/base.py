@@ -347,6 +347,10 @@ class BaseAgent(ABC):
         blocked (e.g., blocks all proxies), skips registration immediately
         to avoid wasting LLM calls.
 
+        Validates that stored credentials contain the fields the platform API
+        actually requires (e.g. LinkedIn needs access_token + person_urn, not
+        just a password). Marks accounts as stale if credentials are incomplete.
+
         Args:
             platform: Platform name (e.g., 'upwork', 'gumroad', 'stripe')
 
@@ -355,8 +359,46 @@ class BaseAgent(ABC):
         """
         existing = self.identity.get_account(platform)
         if existing:
-            self.log_action("account_check", f"Already have {platform} account")
-            return {"status": "exists", "account": existing}
+            creds = existing.get("credentials")
+            if not creds or (isinstance(creds, dict) and not creds):
+                logger.warning(
+                    "Account for %s exists but has no credentials — marking stale",
+                    platform,
+                )
+                self.identity.db.execute(
+                    "UPDATE identities SET status = 'stale' "
+                    "WHERE platform = ? AND status = 'active'",
+                    (platform,),
+                )
+            else:
+                # Check platform-specific required credential fields.
+                # A password-only credential is useless for platforms that
+                # need OAuth tokens (LinkedIn, Twitter, Reddit, etc.).
+                from monai.social.api import get_required_credential_fields
+                required = get_required_credential_fields(platform)
+                if required:
+                    missing = [f for f in required if not creds.get(f)]
+                    if missing:
+                        logger.warning(
+                            "Account for %s has credentials but is missing "
+                            "required fields %s — marking stale",
+                            platform, missing,
+                        )
+                        self.identity.db.execute(
+                            "UPDATE identities SET status = 'stale' "
+                            "WHERE platform = ? AND status = 'active'",
+                            (platform,),
+                        )
+                    else:
+                        self.log_action(
+                            "account_check",
+                            f"Already have {platform} account")
+                        return {"status": "exists", "account": existing}
+                else:
+                    self.log_action(
+                        "account_check",
+                        f"Already have {platform} account")
+                    return {"status": "exists", "account": existing}
 
         # Check if this platform is blocked from previous failures
         if self.provisioner._is_provision_blocked("register_on_platform", platform):
@@ -414,13 +456,21 @@ class BaseAgent(ABC):
         Credentials are NOT included in LLM prompts — the executor retrieves
         them from the identity manager when needed during browser automation.
 
+        Self-healing: if the action fails with an authentication error, marks
+        the account as stale so the next cycle will re-provision.
+
         Args:
             platform: Platform name
             action_description: What to do on the platform
             context: Additional context (content to post, work to deliver, etc.)
         """
-        # Ensure we have an account
-        self.ensure_platform_account(platform)
+        # Ensure we have an account with valid credentials
+        account_result = self.ensure_platform_account(platform)
+        if account_result.get("status") in ("blocked", "stale"):
+            return {
+                "status": "failed",
+                "reason": f"No valid account for {platform}: {account_result.get('status')}",
+            }
 
         # SECURITY: Do NOT include credentials in LLM prompt.
         # Only include the platform name and username (non-secret info).
@@ -437,7 +487,28 @@ class BaseAgent(ABC):
             "If login is needed, the browser should already have session cookies, "
             "or use the platform's login form with stored credentials."
         )
-        return self.execute_task(task)
+        result = self.execute_task(task)
+
+        # Self-healing: detect auth failures and mark credentials stale
+        AUTH_FAILURE_SIGNALS = (
+            "authentication", "unauthorized", "403", "401",
+            "login required", "session expired", "access denied",
+            "not authenticated", "invalid token",
+        )
+        status = result.get("status", "")
+        error = str(result.get("error", "") or result.get("reason", "")).lower()
+        if status in ("failed", "error") and any(s in error for s in AUTH_FAILURE_SIGNALS):
+            logger.warning(
+                "platform_action on %s failed with auth error — marking stale: %s",
+                platform, error[:200],
+            )
+            self.identity.db.execute(
+                "UPDATE identities SET status = 'stale' "
+                "WHERE platform = ? AND status = 'active'",
+                (platform,),
+            )
+
+        return result
 
     def run_step(self, step: str, fn: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Execute a strategy step with adaptive learning.

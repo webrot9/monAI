@@ -102,6 +102,20 @@ CREATE TABLE IF NOT EXISTS agent_log (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Strategy health tracking for self-healing (proxy failures, auto-pause/unpause)
+CREATE TABLE IF NOT EXISTS strategy_health (
+    strategy_name TEXT PRIMARY KEY,
+    consecutive_proxy_failures INTEGER DEFAULT 0,
+    total_proxy_failures INTEGER DEFAULT 0,
+    total_successes INTEGER DEFAULT 0,
+    last_failure_reason TEXT,
+    last_failure_at REAL,
+    last_success_at REAL,
+    auto_paused_at REAL,           -- NULL if not auto-paused
+    next_retry_at REAL,            -- When to retry an auto-paused strategy
+    retry_count INTEGER DEFAULT 0  -- How many times we've retried after auto-pause
+);
+
 -- Performance indexes
 CREATE INDEX IF NOT EXISTS idx_agent_log_agent_name ON agent_log(agent_name);
 CREATE INDEX IF NOT EXISTS idx_strategies_status ON strategies(status);

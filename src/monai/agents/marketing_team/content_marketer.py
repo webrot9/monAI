@@ -138,11 +138,18 @@ class ContentMarketer(BaseAgent):
                 publish_result = self._publish_content(
                     platform, piece.get("title", ""), body, piece.get("type", ""),
                 )
-                if publish_result.get("status") != "error":
+                pub_status = publish_result.get("status", "")
+                if pub_status not in ("error", "failed", "cancelled", "timeout"):
                     published += 1
                     self.db.execute(
                         "UPDATE marketing_content SET status = 'published' WHERE id = ?",
                         (content_id,),
+                    )
+                else:
+                    reason = publish_result.get("reason") or publish_result.get("error", "unknown")
+                    logger.warning(
+                        "Publishing to %s failed (status=%s): %s",
+                        platform, pub_status, reason,
                     )
 
         self.log_action("create_content",
