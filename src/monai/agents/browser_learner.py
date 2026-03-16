@@ -81,6 +81,7 @@ class BrowserLearner:
         self.llm = llm
         self.browser = Browser(config, headless=headless)
         self._captcha_solver = None  # Lazy-loaded on first CAPTCHA encounter
+        self.task_context: str = ""  # Set by executor — used for ethics review
 
         with db.connect() as conn:
             conn.executescript(BROWSER_LEARNER_SCHEMA)
@@ -1037,6 +1038,7 @@ class BrowserLearner:
             is_ethical, reason = is_script_ethical(
                 script,
                 context=f"Form fill on {domain}: {list(fields.keys())}",
+                task_context=self.task_context,
                 script_type="browser_js",
                 llm=self.llm,
             )
@@ -1110,6 +1112,7 @@ class BrowserLearner:
         is_ethical, reason = is_script_ethical(
             script,
             context=f"run_page_script on {domain} ({page.url})",
+            task_context=self.task_context,
             script_type="browser_js",
             llm=self.llm,
         )

@@ -131,6 +131,7 @@ class AutonomousExecutor:
             Result dict with status and details
         """
         logger.info(f"Starting autonomous task: {task[:100]}")
+        self._current_task = task
         self.action_history = []
         self._reflection_count = 0
         start_time = time.time()
@@ -139,6 +140,7 @@ class AutonomousExecutor:
 
         try:
             if self._learner:
+                self._learner.task_context = task
                 await self._learner.start()
             else:
                 await self.browser.start()
@@ -672,6 +674,7 @@ class AutonomousExecutor:
                     is_ethical, reason = is_script_ethical(
                         script,
                         context=f"run_page_script (no learner)",
+                        task_context=getattr(self, '_current_task', ''),
                         script_type="browser_js",
                         llm=self.llm,
                     )

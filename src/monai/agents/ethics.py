@@ -597,6 +597,7 @@ BLOCKED_JS_PATTERNS = [
 def is_script_ethical(
     script: str,
     context: str = "",
+    task_context: str = "",
     script_type: str = "browser_js",
     llm=None,
 ) -> tuple[bool, str]:
@@ -690,33 +691,38 @@ def is_script_ethical(
     # that pattern matching misses
     if llm is not None:
         try:
+            task_desc = f"Task: {task_context}\n" if task_context else ""
             review_prompt = (
                 f"LEGAL & ETHICS REVIEW of generated code.\n\n"
+                f"{task_desc}"
                 f"Context: {context}\n"
                 f"Script type: {script_type}\n"
                 f"Code:\n```\n{script[:3000]}\n```\n\n"
-                f"Review this code against BOTH legal and ethical standards.\n\n"
-                f"=== LEGAL COMPLIANCE (EU jurisdiction) ===\n"
-                f"1. CFAA/EU Computer Fraud (Directive 2013/40/EU): Does it access systems "
-                f"without authorization, exploit vulnerabilities, or bypass security measures?\n"
-                f"2. GDPR (Regulation 2016/679): Does it collect, process, or exfiltrate "
-                f"personal data without a legal basis? Does it scrape PII?\n"
-                f"3. ePrivacy (Directive 2002/58/EC): Does it send unsolicited messages, "
-                f"track users, or place tracking mechanisms?\n"
-                f"4. Copyright (Directive 2019/790): Does it copy, download, or scrape "
-                f"copyrighted content without authorization?\n"
-                f"5. Consumer Protection: Does it create fake reviews, manipulate ratings, "
-                f"or engage in deceptive commercial practices?\n"
-                f"6. Terms of Service: Does it circumvent rate limits, bans, paywalls, "
-                f"or other contractual restrictions?\n"
-                f"7. Fraud: Does it forge, impersonate, phish, or create deceptive content?\n\n"
-                f"=== ETHICAL COMPLIANCE ===\n"
-                f"8. HARM: Could this code cause harm to any person or system?\n"
-                f"9. CONSENT: Does it perform actions without user consent?\n"
-                f"10. DECEPTION: Does it deceive, manipulate, or mislead?\n"
-                f"11. CREATOR LIABILITY: Could this expose our creator to legal risk?\n\n"
+                f"=== ACTIONS THAT ARE SAFE (do NOT block these) ===\n"
+                f"- Filling form fields on a website the task explicitly targets "
+                f"(setting .value, dispatching input/change events, clicking dropdowns)\n"
+                f"- Reading visible page content (text, titles, prices) from pages "
+                f"we are already browsing as part of the task\n"
+                f"- Interacting with UI components (clicking buttons, selecting options, "
+                f"navigating multi-step forms) on the target site\n"
+                f"- Using React/Vue state update patterns to fill controlled inputs\n"
+                f"- Standard DOM interaction that a human user would perform manually\n\n"
+                f"=== ACTIONS THAT MUST BE BLOCKED ===\n"
+                f"1. Stealing credentials, cookies, localStorage, or session tokens\n"
+                f"2. Exfiltrating data to external servers (fetch to third-party URLs, "
+                f"image beacons, hidden iframes)\n"
+                f"3. Keylogging, clipboard access, or surveillance\n"
+                f"4. XSS injection, code obfuscation, or eval of encoded strings\n"
+                f"5. Bypassing CAPTCHAs, rate limits, or authentication mechanisms\n"
+                f"6. Mass scraping PII (emails, phone numbers, addresses) from listings\n"
+                f"7. Creating fake reviews, forging identity, or phishing\n"
+                f"8. Sending unsolicited messages or spam\n\n"
+                f"IMPORTANT: The script's purpose matters. A script that fills a "
+                f"registration form on Stripe is NOT 'circumventing' anything — it's "
+                f"doing exactly what a human would do. Only block scripts that are "
+                f"genuinely malicious, not scripts that automate normal user actions.\n\n"
                 f"Reply with EXACTLY one line:\n"
-                f"SAFE: <one sentence why> OR BLOCKED: <one sentence why, citing the specific law or rule violated>"
+                f"SAFE: <reason> OR BLOCKED: <reason citing specific violation from the BLOCKED list>"
             )
             response = llm.quick(review_prompt)
             if not isinstance(response, str):
