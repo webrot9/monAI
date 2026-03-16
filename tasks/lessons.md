@@ -1,5 +1,11 @@
 # Lessons Learned
 
+### 2026-03-16 - Static blocklist killed 8 strategies without even trying
+- **Mistake**: `TOR_BLOCKED_STRATEGIES` was a hardcoded dict that permanently paused 8 out of 13 strategies whenever proxy mode was active. These strategies were NEVER given a chance to run — the system assumed Tor would fail on Upwork, Gumroad, etc. without testing. Meanwhile the proxy fallback chain (Tor → residential → datacenter) existed but was useless because: (1) no residential/datacenter proxy was configured, and (2) the blocklist prevented strategies from ever reaching the fallback code.
+- **Root cause**: Over-conservative approach to anonymity. Instead of letting the system try and learn, we pre-decided which platforms were incompatible with Tor and hard-killed those strategies at cycle start.
+- **Fix**: (1) Removed static blocklist entirely. (2) Added self-healing: strategies try, auto-pause after 3 real proxy failures, retry with exponential backoff (1h→2h→...→24h). (3) Added free proxy auto-scraping as 4th fallback tier — system self-procures proxies from public lists when Tor fails and no paid proxy is configured.
+- **Rule**: Never make a static list of "things that won't work." Let the system try, fail, learn, and retry. Use dynamic health tracking, not hardcoded assumptions. When a platform blocks one proxy type, fall back to alternatives — don't kill the entire strategy.
+
 ### 2026-03-16 - Executor fail() treated as success by content_marketer
 - **Mistake**: Executor correctly called `fail("Unable to access LinkedIn due to authentication")` returning `{"status": "failed"}`. But content_marketer only checked `status != "error"`, so `"failed"` passed the check and content was marked "published" in DB despite never being published.
 - **Root cause**: (1) Status check in `content_marketer.py` line 141 only rejected `"error"`, not `"failed"/"cancelled"/"timeout"`. (2) `ensure_platform_account` in base.py trusted any DB account entry without validating credentials exist, causing "Already have LinkedIn account" hallucination for stale/empty entries.

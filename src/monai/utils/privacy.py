@@ -105,10 +105,11 @@ class AllProxiesBlockedError(AnonymityError):
 PROXY_TOR = "tor"
 PROXY_RESIDENTIAL = "residential"
 PROXY_DATACENTER = "datacenter"
+PROXY_FREE = "free"  # Auto-scraped free proxies — last resort before aborting
 PROXY_DIRECT = "direct"  # NEVER actually used — exists only as a sentinel
 
-# Ordered preference: best anonymity first
-PROXY_CHAIN_ORDER = [PROXY_TOR, PROXY_RESIDENTIAL, PROXY_DATACENTER]
+# Ordered preference: best anonymity first, free proxies as last resort
+PROXY_CHAIN_ORDER = [PROXY_TOR, PROXY_RESIDENTIAL, PROXY_DATACENTER, PROXY_FREE]
 
 # Block-detection patterns in page content (case-insensitive)
 BLOCK_PATTERNS = [
@@ -178,6 +179,9 @@ class ProxyFallbackChain:
         # domain,proxy_type → block count (for adaptive TTL)
         self._block_counts: dict[tuple[str, str], int] = {}
 
+        # Free proxy pool — lazy-initialized on first use
+        self._free_proxy_pool = None
+
         # Initialize DB schema and load persisted blocks
         if self._db:
             try:
@@ -197,7 +201,29 @@ class ProxyFallbackChain:
             return self._privacy.residential_proxy or None
         elif proxy_type == PROXY_DATACENTER:
             return self._privacy.datacenter_proxy or None
+        elif proxy_type == PROXY_FREE:
+            return self._get_free_proxy()
         return None  # PROXY_DIRECT — never returned
+
+    def _get_free_proxy(self) -> str | None:
+        """Get a proxy from the free proxy pool (lazy init)."""
+        if self._free_proxy_pool is None:
+            try:
+                from monai.utils.free_proxies import FreeProxyPool
+                self._free_proxy_pool = FreeProxyPool(db=self._db)
+            except Exception as e:
+                logger.warning(f"Failed to init free proxy pool: {e}")
+                return None
+        return self._free_proxy_pool.get_proxy()
+
+    def report_free_proxy_result(self, proxy_url: str, success: bool) -> None:
+        """Report success/failure for a free proxy so the pool can adapt."""
+        if self._free_proxy_pool is None:
+            return
+        if success:
+            self._free_proxy_pool.report_success(proxy_url)
+        else:
+            self._free_proxy_pool.report_failure(proxy_url)
 
     def _available_chain(self) -> list[str]:
         """Return proxy types that are actually configured."""
