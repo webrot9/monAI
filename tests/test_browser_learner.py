@@ -261,3 +261,102 @@ class TestBrowserLearner:
         # The __MISSING__ cache should now be __CODEGEN__
         known = bl._get_known_selector("stripe.com", ".country-select")
         assert known == "__CODEGEN__"
+
+    def test_pre_resolve_custom_dropdown_returns_marker(self, config, db, mock_llm):
+        """Fields cached as __CUSTOM_DROPDOWN__ should resolve to the marker string."""
+        bl = BrowserLearner(config, db, mock_llm)
+        bl._update_playbook_selector(
+            "stripe.com", ".SearchableSelect", "__CUSTOM_DROPDOWN__")
+        resolved = bl._pre_resolve_selectors(
+            {".SearchableSelect": "US"}, domain="stripe.com"
+        )
+        assert resolved[".SearchableSelect"] == "__CUSTOM_DROPDOWN__"
+
+    def test_stripe_playbook_has_custom_dropdown(self, config, db, mock_llm):
+        """Stripe playbook should pre-seed SearchableSelect as __CUSTOM_DROPDOWN__."""
+        bl = BrowserLearner(config, db, mock_llm)
+        known = bl._get_known_selector(
+            "dashboard.stripe.com",
+            ".SearchableSelect-element[aria-label='Select country']",
+        )
+        assert known == "__CUSTOM_DROPDOWN__"
+
+    @pytest.mark.asyncio
+    async def test_smart_fill_routes_custom_dropdown(self, config, db, mock_llm):
+        """Fields resolved as __CUSTOM_DROPDOWN__ should use the dropdown handler."""
+        bl = BrowserLearner(config, db, mock_llm)
+        mock_browser = AsyncMock()
+        bl.browser = mock_browser
+
+        bl._update_playbook_selector(
+            "stripe.com",
+            ".SearchableSelect[aria-label='Select country']",
+            "__CUSTOM_DROPDOWN__",
+        )
+
+        dropdown_calls = []
+
+        async def mock_dropdown(selector, value, domain):
+            dropdown_calls.append((selector, value, domain))
+            return {"success": True}
+
+        bl._fill_custom_dropdown = mock_dropdown
+        bl.smart_type = AsyncMock(return_value={"success": True})
+        bl._reveal_if_hidden = AsyncMock(return_value={})
+        bl._human_delay = AsyncMock()
+        bl._discover_form_elements = AsyncMock(return_value=[])
+
+        # Should NOT go through codegen since custom dropdown handler succeeds
+        codegen_called = False
+        original_codegen = bl._codegen_fill_form
+
+        async def track_codegen(fields, domain):
+            nonlocal codegen_called
+            codegen_called = True
+            return await original_codegen(fields, domain)
+
+        bl._codegen_fill_form = track_codegen
+
+        result = await bl.smart_fill_form(
+            {
+                "#email": "test@test.com",
+                ".SearchableSelect[aria-label='Select country']": "US",
+            },
+            domain="stripe.com",
+        )
+
+        # Dropdown handler should have been called
+        assert len(dropdown_calls) == 1
+        assert dropdown_calls[0][1] == "US"
+
+        # Result should be successful
+        assert result["success"] is True
+
+        # Codegen should NOT have been called for the dropdown field
+        # (it was handled by the custom dropdown handler already)
+        assert not codegen_called
+
+    @pytest.mark.asyncio
+    async def test_codegen_detects_dropdown_selectors(self, config, db, mock_llm):
+        """_codegen_fill_form should detect dropdown-like selectors and
+        route them through _fill_custom_dropdown first."""
+        bl = BrowserLearner(config, db, mock_llm)
+        mock_browser = AsyncMock()
+        bl.browser = mock_browser
+
+        dropdown_calls = []
+
+        async def mock_dropdown(selector, value, domain):
+            dropdown_calls.append((selector, value))
+            return {"success": True}
+
+        bl._fill_custom_dropdown = mock_dropdown
+
+        # A field with "Select" in the selector should be auto-detected
+        result = await bl._codegen_fill_form(
+            {".SearchableSelect-country": "US"}, domain="test.com"
+        )
+
+        assert len(dropdown_calls) == 1
+        assert dropdown_calls[0] == (".SearchableSelect-country", "US")
+        assert result.get("success") is True

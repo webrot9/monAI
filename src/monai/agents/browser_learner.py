@@ -123,6 +123,9 @@ class BrowserLearner:
         "dashboard.stripe.com": {
             "input[name='email']": "#email",
             "input[name='password']": "#password",
+            # Country dropdown is a custom SearchableSelect React component.
+            # Route it to the custom dropdown handler, not standard fill.
+            ".SearchableSelect-element[aria-label='Select country']": "__CUSTOM_DROPDOWN__",
         },
         "www.linkedin.com": {
             # LinkedIn signup — multi-step form
@@ -364,6 +367,14 @@ class BrowserLearner:
                     f"Skipping field '{selector}' — not present on {domain}")
                 continue
 
+            # Custom dropdown components (SearchableSelect, React-Select, etc.)
+            # These need click → type → select-option, not standard text input
+            if effective == "__CUSTOM_DROPDOWN__":
+                result = await self._fill_custom_dropdown(
+                    selector, value, domain)
+                results[selector] = result
+                continue
+
             await self._human_delay(short=True)
 
             # Handle multi-step forms: if the target element is hidden,
@@ -392,10 +403,17 @@ class BrowserLearner:
         # --- Code-gen fallback: when standard fill fails, write & execute a script ---
         # Include BOTH failed fields AND skipped fields (complex UI components
         # like SearchableSelect that weren't matched to standard form elements
-        # but likely exist as custom React/Vue components on the page)
+        # but likely exist as custom React/Vue components on the page).
+        # Exclude fields already handled by _fill_custom_dropdown (they already
+        # went through their own codegen path).
+        custom_dropdown_fields = {
+            sel for sel, eff in resolved_fields.items()
+            if eff == "__CUSTOM_DROPDOWN__"
+        }
         unfilled_fields = {
             sel: val for sel, val in fields.items()
             if not results.get(sel, {}).get("success")
+            and sel not in custom_dropdown_fields
         }
         if unfilled_fields:
             logger.info(
@@ -819,6 +837,13 @@ class BrowserLearner:
                 logger.info(
                     f"Field '{selector}' handled by codegen on {domain} "
                     f"(cached) — routing to codegen fallback")
+            elif known == "__CUSTOM_DROPDOWN__":
+                # Known custom dropdown component (SearchableSelect, etc.)
+                # Skip standard fill — handled by _fill_custom_dropdown
+                resolved[selector] = "__CUSTOM_DROPDOWN__"
+                logger.info(
+                    f"Field '{selector}' is a custom dropdown on {domain} "
+                    f"— routing to dropdown handler")
             elif known:
                 resolved[selector] = known
             else:
@@ -891,6 +916,179 @@ class BrowserLearner:
                 (domain, json.dumps({old_selector: new_selector})),
             )
 
+    # ── Custom Dropdown Handler ──────────────────────────────────
+    #
+    # Handles custom React/Vue dropdown components (SearchableSelect,
+    # react-select, combobox, etc.) that can't be filled with standard
+    # text input.  Uses a reliable click → type → select pattern.
+
+    async def _fill_custom_dropdown(
+        self, selector: str, value: str, domain: str
+    ) -> dict[str, Any]:
+        """Fill a custom dropdown component (SearchableSelect, react-select, etc.).
+
+        Strategy:
+        1. Discover the actual dropdown elements on the page
+        2. Generate a targeted script that clicks the trigger, types the
+           value to filter options, then clicks the matching option
+        3. Cache the script for future use on this domain
+        """
+        logger.info(
+            f"Filling custom dropdown '{selector}' = '{value}' on {domain}")
+        try:
+            page = await self.browser._get_page()
+
+            # Extract the dropdown's DOM structure for targeted script gen
+            dropdown_info = await page.evaluate("""(sel) => {
+                // Find the dropdown container by the original selector or
+                // common patterns (aria-label, class, role)
+                const ariaMatch = sel.match(/aria-label=['\"]([^'\"]+)['\"]/);
+                const label = ariaMatch ? ariaMatch[1] : '';
+
+                // Strategy: find all potential dropdown triggers
+                const candidates = [
+                    ...document.querySelectorAll('[role="combobox"]'),
+                    ...document.querySelectorAll('[aria-haspopup="listbox"]'),
+                    ...document.querySelectorAll('[class*="SearchableSelect"]'),
+                    ...document.querySelectorAll('[class*="select"]'),
+                    ...document.querySelectorAll('[class*="Select"]'),
+                ];
+                // Also try the original selector directly
+                const direct = document.querySelector(sel);
+                if (direct && !candidates.includes(direct)) {
+                    candidates.unshift(direct);
+                }
+
+                return candidates.map(el => ({
+                    tag: el.tagName.toLowerCase(),
+                    id: el.id || '',
+                    className: (typeof el.className === 'string' ? el.className : '') || '',
+                    role: el.getAttribute('role') || '',
+                    ariaLabel: el.getAttribute('aria-label') || '',
+                    ariaExpanded: el.getAttribute('aria-expanded'),
+                    ariaHaspopup: el.getAttribute('aria-haspopup') || '',
+                    text: (el.textContent || '').substring(0, 100).trim(),
+                    rect: (() => {
+                        const r = el.getBoundingClientRect();
+                        return {x: r.x, y: r.y, w: r.width, h: r.height};
+                    })(),
+                    // Check for nested input (searchable dropdowns)
+                    hasInput: !!el.querySelector('input'),
+                    inputSelector: el.querySelector('input')
+                        ? (el.querySelector('input').id
+                            ? '#' + el.querySelector('input').id
+                            : 'input')
+                        : null,
+                })).filter(e => e.rect.w > 0 && e.rect.h > 0);
+            }""", selector)
+
+            if not dropdown_info:
+                logger.warning(
+                    f"No custom dropdown elements found for '{selector}' "
+                    f"on {domain}")
+                return {"success": False, "error": "No dropdown elements found"}
+
+            # Generate a targeted dropdown-fill script
+            script = self._generate_dropdown_script(
+                selector, value, dropdown_info, domain)
+            if not script:
+                return {
+                    "success": False,
+                    "error": "Failed to generate dropdown script",
+                }
+
+            # Execute it
+            await self._human_delay(short=True)
+            result = await self._execute_form_script(
+                page, script, {selector: value})
+
+            if result.get("success"):
+                # Cache as __CODEGEN__ so future calls use codegen path
+                self._update_playbook_selector(
+                    domain, selector, "__CODEGEN__")
+                # Also cache the script itself
+                form_sig = self._form_signature({selector: value})
+                url_path = urlparse(page.url).path
+                self._cache_form_script(
+                    domain, url_path, form_sig, script, {selector: value})
+                logger.info(
+                    f"Custom dropdown filled and cached for {domain}")
+            else:
+                logger.warning(
+                    f"Custom dropdown fill failed on {domain}: "
+                    f"{result.get('error')}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Custom dropdown handler failed on {domain}: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _generate_dropdown_script(
+        self,
+        selector: str,
+        value: str,
+        dropdown_info: list[dict],
+        domain: str,
+    ) -> str | None:
+        """Generate JS to interact with a custom dropdown component.
+
+        Uses a more specific prompt than generic codegen, with explicit
+        patterns for SearchableSelect, react-select, etc.
+        """
+        info_json = json.dumps(dropdown_info[:10], indent=2)
+
+        prompt = (
+            f"Write JavaScript to select '{value}' in a custom dropdown "
+            f"component on {domain}.\n\n"
+            f"## Dropdown Elements Found\n"
+            f"```json\n{info_json}\n```\n\n"
+            f"## Original Selector\n`{selector}`\n\n"
+            f"## Required Steps\n"
+            f"1. Click the dropdown trigger/container to open it\n"
+            f"2. Wait 300ms for the options list to render\n"
+            f"3. If the dropdown has a search input, type the value to filter\n"
+            f"4. Wait 300ms for filtering\n"
+            f"5. Find and click the matching option by text content\n"
+            f"6. Return {{filled: ['{selector}'], failed: []}}\n\n"
+            f"## Common Patterns\n"
+            f"- SearchableSelect: click container → type in nested input → "
+            f"  click [role='option'] or [data-value='XX']\n"
+            f"- React-Select: click .Select__control → type in "
+            f"  .Select__input input → click .Select__option\n"
+            f"- Combobox: click [role='combobox'] → type → click "
+            f"  [role='option']\n\n"
+            f"## Template\n"
+            f"Code runs as: `async (FIELD_VALUES) => {{ <YOUR CODE> }}`\n"
+            f"Use `sleep(ms)` for delays. Use document.querySelector.\n"
+            f"Try MULTIPLE selector strategies if the first fails.\n"
+            f"Return ONLY raw JavaScript, no markdown fences."
+        )
+
+        try:
+            response = self.llm.quick(prompt)
+            script = response.strip()
+            if script.startswith("```"):
+                script = script.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+            # Ethics review
+            from monai.agents.ethics import is_script_ethical
+            is_ethical, reason = is_script_ethical(
+                script,
+                context=f"Custom dropdown fill on {domain}: {selector}",
+                task_context=self.task_context,
+                script_type="browser_js",
+                llm=self.llm,
+            )
+            if not is_ethical:
+                logger.warning(
+                    f"Dropdown script BLOCKED by ethics: {reason}")
+                return None
+            return script
+        except Exception as e:
+            logger.error(f"Dropdown script generation failed: {e}")
+            return None
+
     # ── Code-Generation Fallback ─────────────────────────────────
     #
     # When standard selector-based form filling fails, the agent writes
@@ -913,6 +1111,44 @@ class BrowserLearner:
         same form in future sessions.
         """
         try:
+            # Pre-check: detect dropdown-like selectors and route them
+            # through the specialized handler for better reliability.
+            dropdown_patterns = (
+                "Select", "select", "Dropdown", "dropdown",
+                "Combobox", "combobox", "aria-haspopup",
+            )
+            dropdown_fields = {}
+            regular_fields = {}
+            for sel, val in fields.items():
+                if any(p in sel for p in dropdown_patterns):
+                    dropdown_fields[sel] = val
+                else:
+                    regular_fields[sel] = val
+
+            # Handle detected dropdowns via specialized handler
+            dropdown_results = {}
+            if dropdown_fields:
+                for sel, val in dropdown_fields.items():
+                    result = await self._fill_custom_dropdown(
+                        sel, val, domain)
+                    dropdown_results[sel] = result
+
+                # If all fields were dropdowns and all succeeded, done
+                if not regular_fields and all(
+                    r.get("success") for r in dropdown_results.values()
+                ):
+                    return {"success": True, "codegen": True,
+                            "dropdown_handled": True}
+
+                # Continue with regular fields only
+                fields = regular_fields
+                if not fields:
+                    # Only dropdown fields, some failed
+                    any_ok = any(
+                        r.get("success") for r in dropdown_results.values())
+                    return {"success": any_ok, "codegen": True,
+                            "dropdown_results": dropdown_results}
+
             page = await self.browser._get_page()
             url = page.url
             url_path = urlparse(url).path
