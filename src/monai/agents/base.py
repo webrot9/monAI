@@ -50,6 +50,7 @@ class BaseAgent(ABC):
         self._reviewer = None  # Lazy-loaded
         self._api_provisioner = None  # Lazy-loaded
         self._product_iterator = None  # Lazy-loaded
+        self._payment_manager = None  # Set by orchestrator via register_strategy
 
     @property
     def coder(self):
@@ -130,6 +131,96 @@ class BaseAgent(ABC):
     @product_iterator.setter
     def product_iterator(self, value):
         self._product_iterator = value
+
+    @property
+    def payment_manager(self):
+        """Access the unified payment manager (set by orchestrator)."""
+        return self._payment_manager
+
+    @payment_manager.setter
+    def payment_manager(self, value):
+        self._payment_manager = value
+
+    def create_checkout_link(
+        self, amount: float, product: str, currency: str = "EUR",
+        provider: str = "kofi", brand: str = "",
+        customer_email: str = "", metadata: dict | None = None,
+    ) -> dict:
+        """Create a payment/checkout link for a product or service.
+
+        This is the critical bridge between strategy execution and actual
+        money collection. Without this, strategies sell things but never
+        provide a way for customers to pay.
+
+        Args:
+            amount: Price in the specified currency
+            product: Product/service description
+            currency: Payment currency (default EUR)
+            provider: Payment provider (kofi, gumroad, lemonsqueezy, stripe, monero)
+            brand: Brand name (defaults to strategy name)
+            customer_email: Customer email if known
+            metadata: Extra metadata (strategy_id, product_id, etc.)
+
+        Returns:
+            {"checkout_url": str, "payment_ref": str, "status": str}
+        """
+        if not self._payment_manager:
+            self.log_action(
+                "checkout_unavailable",
+                "No payment manager — cannot create checkout link",
+            )
+            return {"status": "error", "reason": "Payment manager not available"}
+
+        from monai.payments.types import PaymentIntent
+        import asyncio
+
+        intent = PaymentIntent(
+            amount=amount,
+            currency=currency,
+            product=product,
+            customer_email=customer_email,
+            brand=brand or self.name,
+            metadata=metadata or {},
+        )
+
+        try:
+            # Run async create_payment in sync context
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    result = pool.submit(
+                        asyncio.run,
+                        self._payment_manager.create_payment(
+                            brand or self.name, provider, intent
+                        ),
+                    ).result(timeout=30)
+            else:
+                result = asyncio.run(
+                    self._payment_manager.create_payment(
+                        brand or self.name, provider, intent
+                    )
+                )
+
+            if result.success:
+                self.log_action(
+                    "checkout_created",
+                    f"{product}: {result.checkout_url[:80]}",
+                )
+                return {
+                    "checkout_url": result.checkout_url,
+                    "payment_ref": result.payment_ref,
+                    "status": "created",
+                    "amount": amount,
+                    "currency": currency,
+                }
+            else:
+                self.log_action("checkout_failed", f"{product}: {result.error}")
+                return {"status": "error", "reason": result.error}
+
+        except Exception as e:
+            self.log_action("checkout_error", f"{product}: {e}")
+            return {"status": "error", "reason": str(e)}
 
     def write_code(self, spec: str, project_dir: str | None = None,
                    language: str = "python") -> dict:

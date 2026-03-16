@@ -128,7 +128,8 @@ class TestContentSitesContentReview:
         }))
 
         steps = agent.plan()
-        assert "find_affiliate_programs" in steps
+        # Reviewed articles go to publish first, then find_affiliate_programs
+        assert "publish_article" in steps
 
 
 # ── Newsletter ───────────────────────────────────────────────────

@@ -169,6 +169,8 @@ class Orchestrator(BaseAgent):
 
     def register_strategy(self, agent: BaseAgent):
         self._strategy_agents[agent.name] = agent
+        # Give strategy access to payment infrastructure
+        agent.payment_manager = self.payment_manager
         self.workflow_engine.register_agent(agent.name, agent)
         # Auto-register brand for social presence and web presence
         self.social_presence.register_brand(agent.name)
@@ -267,14 +269,22 @@ class Orchestrator(BaseAgent):
         }, indent=2, default=str)
 
         plan_response = self.think_json(
-            "You are a fully autonomous AI business. Plan your next cycle. "
-            "Consider ALL of the following:\n"
-            "1. INFRASTRUCTURE: Do I need accounts, emails, domains, API keys? Provision them.\n"
-            "2. OPPORTUNITIES: What new ways to make money should I explore?\n"
-            "3. CLIENT WORK: Who needs follow-up? What work needs delivering?\n"
-            "4. MARKETING: Should I do outreach, post content, bid on jobs?\n"
-            "5. OPTIMIZATION: Which strategies are working? Scale winners, cut losers.\n"
-            "6. NEW STRATEGIES: Should I start something entirely new?\n\n"
+            "You are a fully autonomous AI business. Plan your next cycle.\n\n"
+            "RULES:\n"
+            "- Infrastructure provisioning is handled SEPARATELY — do NOT plan "
+            "'provision accounts' or 'set up email' here.\n"
+            "- Each action MUST be specific and actionable, not vague. "
+            "BAD: 'explore new revenue streams'. "
+            "GOOD: 'bid on 3 copywriting gigs on Upwork'.\n"
+            "- Each sub-agent task MUST include ALL details needed to execute "
+            "(platform names, URLs, credentials to use, exact deliverables).\n"
+            "- Do NOT delegate research-only tasks to sub-agents — they have "
+            "browser access, not internet research. Use direct actions instead.\n"
+            "- Max 5 actions per cycle to stay within LLM budget.\n\n"
+            "Consider:\n"
+            "1. CLIENT WORK: Who needs follow-up? What work needs delivering?\n"
+            "2. MARKETING: Should I do outreach, post content, bid on jobs?\n"
+            "3. OPTIMIZATION: Which strategies are working? Scale winners, cut losers.\n\n"
             "Return: {\"actions\": [{\"action\": str, \"priority\": int (1=highest), "
             "\"reason\": str, \"delegate_to_subagent\": bool}]}",
             context=context,
@@ -839,6 +849,12 @@ class Orchestrator(BaseAgent):
                     rule="Always verify assets before using them",
                     severity="warning",
                 )
+            elif result.get("errors"):
+                self.log_action(
+                    "asset_verification",
+                    f"{len(result['verified'])} verified OK, "
+                    f"{len(result['errors'])} unverifiable"
+                )
             else:
                 self.log_action(
                     "asset_verification",
@@ -878,7 +894,7 @@ class Orchestrator(BaseAgent):
             saved_limit = tracker.max_cycle_calls
             tracker.max_cycle_calls = calls_before + max_provisioning_calls
             try:
-                result = self.provisioner.run()
+                result = self.provisioner.run(needs=needs)
             except BudgetExceededError:
                 logger.warning(
                     "Provisioning hit budget cap — saving remaining "
@@ -892,11 +908,15 @@ class Orchestrator(BaseAgent):
         result["bootstrap_phase"] = bootstrap_phase
 
         if bootstrap_phase == "pre_bootstrap":
-            self.log_action("bootstrap",
-                            "No funding source configured. Starting Ko-fi campaign.")
-            # Auto-setup Ko-fi campaign as primary funding source
-            kofi_result = self._setup_kofi_campaign()
-            result["bootstrap"] = kofi_result
+            # Ko-fi blocks Tor — skip campaign setup when behind proxy
+            if self.config.privacy.proxy_type != "none":
+                self.log_action("bootstrap",
+                                "Ko-fi blocks Tor — skipping campaign setup")
+            else:
+                self.log_action("bootstrap",
+                                "No funding source configured. Starting Ko-fi campaign.")
+                kofi_result = self._setup_kofi_campaign()
+                result["bootstrap"] = kofi_result
         else:
             # Campaign exists — sync donations periodically
             if self._cycle % 3 == 0:

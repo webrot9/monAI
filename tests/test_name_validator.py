@@ -688,11 +688,14 @@ class TestActionableReflection:
         # Should NOT call LLM for lesson extraction
         mock_llm.quick.assert_not_called()
 
-    def test_domain_block_stored_in_memory(self, executor, db, mock_llm):
-        """Domains that fail get stored as warnings in shared memory."""
-        from monai.agents.memory import SharedMemory
-        SharedMemory(db)
+    def test_domain_block_stored_in_executor_config(self, executor, db, mock_llm):
+        """Learned actions are stored as executor custom rules in agent_config.
 
+        Domain blocks are NOT stored in the knowledge table — they are
+        transient (proxy/Tor circuit rotation changes reachability) and
+        permanently blocking domains caused the executor to preemptively
+        fail without even trying. Instead, rules go to agent_config.
+        """
         executor._apply_learned_action(
             "Skip domain blocked.example.com — always returns 403",
             {"blocked.example.com"},
@@ -700,10 +703,11 @@ class TestActionableReflection:
         )
 
         rows = db.execute(
-            "SELECT * FROM knowledge WHERE category = 'warning' "
-            "AND topic LIKE '%blocked.example.com%'"
+            "SELECT config_value FROM agent_config "
+            "WHERE agent_name = 'executor' AND config_key = 'custom_rules'"
         )
         assert len(rows) >= 1
+        assert "blocked.example.com" in rows[0]["config_value"]
 
 
 class TestIdentityManagerValidation:

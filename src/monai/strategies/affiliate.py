@@ -51,6 +51,8 @@ class AffiliateAgent(BaseAgent):
         if statuses.get("draft", 0) > 0:
             return ["review_content"]
         if statuses.get("reviewed", 0) > 0:
+            return ["publish_content"]
+        if statuses.get("published", 0) > 0 and statuses.get("reviewed", 0) == 0:
             return ["write_comparison"]  # Create more content types
 
         # All content published — research new programs
@@ -66,6 +68,7 @@ class AffiliateAgent(BaseAgent):
             "research_products": self._research_products,
             "write_review": self._write_review,
             "review_content": self._review_content,
+            "publish_content": self._publish_content,
             "write_comparison": self._write_comparison,
         }
 
@@ -312,6 +315,69 @@ class AffiliateAgent(BaseAgent):
             return result.to_dict()
 
         return {"status": "no_content_to_review"}
+
+    def _publish_content(self) -> dict[str, Any]:
+        """Publish reviewed affiliate content to a real platform.
+
+        Publishes to Medium (free, no domain needed) as the primary platform.
+        Content must be on the internet where people can find it and click
+        affiliate links — local JSON files generate zero revenue.
+        """
+        published = 0
+
+        for path in self.content_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("status") != "reviewed":
+                continue
+
+            title = data.get("title", data.get("name", "untitled"))
+            content = data.get("content", data.get("review", {}).get("content", ""))
+
+            if not content:
+                self.log_action("publish_skip", f"No content body for: {title}")
+                continue
+
+            # Ensure Medium account exists
+            account = self.ensure_platform_account("medium")
+            if account.get("status") in ("blocked", "error"):
+                self.log_action("publish_blocked", f"Medium account unavailable")
+                return {"status": "blocked", "reason": "Medium account unavailable"}
+
+            # Publish via browser automation
+            try:
+                result = self.execute_task(
+                    f"Publish an article on Medium.\n"
+                    f"Title: {title}\n"
+                    f"Content (first 2000 chars):\n{content[:2000]}\n\n"
+                    f"Steps:\n"
+                    f"1. Go to medium.com and navigate to write a new story\n"
+                    f"2. Enter the title and paste the content\n"
+                    f"3. Add relevant tags for SEO\n"
+                    f"4. Publish the article (not draft)\n"
+                    f"5. Return the published URL\n\n"
+                    f"IMPORTANT: Use ONLY stored Medium credentials.\n"
+                    f"Return: {{\"url\": str, \"status\": str}}",
+                    f"Publishing affiliate review: {title}",
+                )
+
+                if result.get("status") == "completed" or result.get("url"):
+                    data["status"] = "published"
+                    data["published_url"] = result.get("url", "")
+                    data["published_platform"] = "medium"
+                    path.write_text(json.dumps(data, indent=2))
+                    published += 1
+                    self.log_action("content_published", f"{title} → {result.get('url', 'medium')}")
+                else:
+                    self.log_action("publish_failed", f"{title}: {result}")
+
+            except Exception as e:
+                self.log_action("publish_failed", f"{title}: {e}")
+                self.learn_from_error(e, f"Publishing '{title}' to Medium")
+
+        return {"published": published}
 
     def _write_comparison(self) -> dict[str, Any]:
         """Write a product comparison (e.g., 'X vs Y vs Z')."""

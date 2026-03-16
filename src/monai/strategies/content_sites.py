@@ -51,6 +51,8 @@ class ContentSiteAgent(BaseAgent):
         if statuses.get("draft", 0) > 0:
             return ["review_content"]
         if statuses.get("reviewed", 0) > 0:
+            return ["publish_article"]
+        if statuses.get("published", 0) > 0 and statuses.get("reviewed", 0) == 0:
             return ["find_affiliate_programs"]
 
         # All content published — research more keywords
@@ -65,6 +67,7 @@ class ContentSiteAgent(BaseAgent):
             "research_keywords": self._research_keywords,
             "create_article": self._create_article,
             "review_content": self._review_content,
+            "publish_article": self._publish_article,
             "find_affiliate_programs": self._find_affiliate_programs,
             "plan_new_site": self._plan_new_site,
         }
@@ -230,6 +233,74 @@ class ContentSiteAgent(BaseAgent):
             return result.to_dict()
 
         return {"status": "no_content_to_review"}
+
+    def _publish_article(self) -> dict[str, Any]:
+        """Publish reviewed articles to a real platform where they get indexed.
+
+        Uses dev.to (free, SEO-friendly, no domain needed) for publishing.
+        Articles sitting in local JSON files are invisible to the internet
+        and generate zero traffic/revenue.
+        """
+        published = 0
+
+        for path in self.sites_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("status") != "reviewed":
+                continue
+
+            title = data.get("title", "untitled")
+            content = data.get("content", "")
+            keywords = data.get("keywords", [])
+
+            if not content:
+                continue
+
+            # Ensure dev.to account
+            account = self.ensure_platform_account("devto")
+            if account.get("status") in ("blocked", "error"):
+                # Fallback to Medium
+                account = self.ensure_platform_account("medium")
+                if account.get("status") in ("blocked", "error"):
+                    return {"status": "blocked", "reason": "No publishing platform available"}
+                platform = "medium"
+            else:
+                platform = "devto"
+
+            try:
+                result = self.execute_task(
+                    f"Publish an SEO article on {platform}.\n"
+                    f"Title: {title}\n"
+                    f"Keywords/tags: {', '.join(keywords[:5]) if keywords else 'technology'}\n"
+                    f"Content (first 2000 chars):\n{content[:2000]}\n\n"
+                    f"Steps:\n"
+                    f"1. Navigate to {platform} new post editor\n"
+                    f"2. Enter the title and paste the full content\n"
+                    f"3. Add tags: {', '.join(keywords[:4]) if keywords else 'technology'}\n"
+                    f"4. Set a cover image if possible\n"
+                    f"5. Publish (not save as draft)\n"
+                    f"6. Return the published URL\n\n"
+                    f"Return: {{\"url\": str, \"status\": str}}",
+                    f"Publishing article: {title}",
+                )
+
+                if result.get("status") == "completed" or result.get("url"):
+                    data["status"] = "published"
+                    data["published_url"] = result.get("url", "")
+                    data["published_platform"] = platform
+                    path.write_text(json.dumps(data, indent=2))
+                    published += 1
+                    self.log_action("article_published", f"{title} → {result.get('url', platform)}")
+                else:
+                    self.log_action("publish_failed", f"{title}: {result}")
+
+            except Exception as e:
+                self.log_action("publish_failed", f"{title}: {e}")
+                self.learn_from_error(e, f"Publishing article '{title}' to {platform}")
+
+        return {"published": published}
 
     def _find_affiliate_programs(self) -> dict[str, Any]:
         """Research affiliate programs using REAL data from affiliate networks."""

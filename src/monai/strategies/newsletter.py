@@ -96,6 +96,13 @@ class NewsletterAgent(BaseAgent):
             s = nl["status"] if nl["status"] else "unknown"
             statuses[s] = statuses.get(s, 0) + 1
 
+        # Check for reviewed issues that need publishing (highest priority)
+        reviewed_issues = self.db.execute(
+            "SELECT COUNT(*) as c FROM newsletter_issues WHERE status = 'reviewed'"
+        )
+        if reviewed_issues and reviewed_issues[0]["c"] > 0:
+            return ["publish_issue"]
+
         # Check for draft issues that need review before anything else
         draft_issues = self.db.execute(
             "SELECT COUNT(*) as c FROM newsletter_issues WHERE status = 'draft'"
@@ -107,7 +114,7 @@ class NewsletterAgent(BaseAgent):
         if not statuses:
             return ["research_niches"]
         if statuses.get("planning", 0) > 0:
-            return ["plan_newsletter"]
+            return ["launch_newsletter"]
         if statuses.get("launched", 0) > 0:
             return ["write_issue"]
         if statuses.get("growing", 0) > 0:
@@ -126,8 +133,10 @@ class NewsletterAgent(BaseAgent):
         step_methods = {
             "research_niches": self._research_niches,
             "plan_newsletter": self._plan_newsletter,
+            "launch_newsletter": self._launch_newsletter,
             "write_issue": self._write_issue,
             "review_issue": self._review_issue,
+            "publish_issue": self._publish_issue,
             "find_sponsors": self._find_sponsors,
             "grow_subscribers": self._grow_subscribers,
         }
@@ -247,6 +256,76 @@ class NewsletterAgent(BaseAgent):
         )
         self.log_action("newsletter_planned", name)
         return plan
+
+    def _launch_newsletter(self) -> dict[str, Any]:
+        """Create the newsletter on a real platform (Substack/Beehiiv) via browser.
+
+        Registers an account, creates the publication, and sets it to 'launched'.
+        Without this step, newsletters exist only in DB and never get real subscribers.
+        """
+        newsletters = self.db.execute(
+            "SELECT * FROM newsletters WHERE status = 'planning' LIMIT 1"
+        )
+        if not newsletters:
+            return {"status": "no_newsletters_to_launch"}
+
+        nl = newsletters[0]
+        name = nl["name"]
+        platform = nl["platform"] or "substack"
+
+        # Ensure we have a platform account
+        account_result = self.ensure_platform_account(platform)
+        if account_result.get("status") in ("blocked", "error"):
+            self.log_action(
+                "launch_blocked", name,
+                f"{platform} account setup failed: {account_result}"
+            )
+            # Try Beehiiv as fallback
+            if platform != "beehiiv":
+                platform = "beehiiv"
+                account_result = self.ensure_platform_account("beehiiv")
+                if account_result.get("status") in ("blocked", "error"):
+                    return {"status": "blocked", "reason": "Both Substack and Beehiiv unavailable"}
+
+        # Create the publication on the platform
+        try:
+            create_result = self.execute_task(
+                f"Create a new newsletter publication on {platform}.\n"
+                f"Name: {name}\n"
+                f"Description: {nl['description']}\n"
+                f"Niche: {nl['niche']}\n"
+                f"Frequency: {nl['frequency']}\n\n"
+                f"Steps:\n"
+                f"1. Go to {platform}.com and navigate to create a new publication\n"
+                f"2. Enter the newsletter name and description\n"
+                f"3. Choose the appropriate category\n"
+                f"4. Set up the welcome email for new subscribers\n"
+                f"5. Return the publication URL\n\n"
+                f"IMPORTANT: Use ONLY the credentials from your stored {platform} account.\n"
+                f"Return: {{\"url\": str, \"status\": str}}",
+                f"Launching newsletter '{name}' on {platform}"
+            )
+
+            pub_url = create_result.get("url", "")
+
+            if create_result.get("status") == "completed" or pub_url:
+                self.db.execute(
+                    "UPDATE newsletters SET status = 'launched', platform = ? WHERE name = ?",
+                    (platform, name),
+                )
+                self.log_action("newsletter_launched", f"{name} on {platform}: {pub_url}")
+                return {"status": "launched", "platform": platform, "url": pub_url}
+            else:
+                self.log_action(
+                    "newsletter_launch_failed", name,
+                    f"Platform creation returned: {create_result}"
+                )
+                return {"status": "failed", "reason": str(create_result)}
+
+        except Exception as e:
+            self.log_action("newsletter_launch_failed", name, str(e)[:300])
+            self.learn_from_error(e, f"Launching newsletter '{name}' on {platform}")
+            return {"status": "error", "error": str(e)}
 
     def _write_issue(self) -> dict[str, Any]:
         """Write a newsletter issue for an active newsletter using LLM content creation."""
@@ -406,6 +485,81 @@ class NewsletterAgent(BaseAgent):
 
         return result.to_dict()
 
+    def _publish_issue(self) -> dict[str, Any]:
+        """Publish reviewed newsletter issues to the actual platform.
+
+        Without this step, issues sit at 'reviewed' status forever and no
+        subscribers ever receive them. This publishes to Substack/Beehiiv
+        via browser automation.
+        """
+        reviewed = self.db.execute(
+            "SELECT ni.*, n.platform, n.name as newsletter_name "
+            "FROM newsletter_issues ni "
+            "JOIN newsletters n ON ni.newsletter_id = n.id "
+            "WHERE ni.status = 'reviewed' LIMIT 1"
+        )
+        if not reviewed:
+            return {"status": "no_reviewed_issues"}
+
+        issue = dict(reviewed[0])
+        subject = issue.get("subject", "Untitled")
+        platform = issue.get("platform", "substack")
+        newsletter_name = issue.get("newsletter_name", "")
+
+        # Load content from file
+        content = ""
+        content_path = self.content_dir / f"issue_{issue['newsletter_id']}_{subject.replace(' ', '_')[:30]}.json"
+        if content_path.exists():
+            try:
+                file_data = json.loads(content_path.read_text())
+                content = file_data.get("content", "")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if not content:
+            # Try from DB if file not found
+            content = issue.get("content", "")
+
+        if not content:
+            self.log_action("publish_skip", f"No content for issue: {subject}")
+            return {"status": "no_content"}
+
+        try:
+            result = self.execute_task(
+                f"Publish a newsletter issue on {platform}.\n"
+                f"Newsletter: {newsletter_name}\n"
+                f"Subject line: {subject}\n"
+                f"Content (first 2000 chars):\n{content[:2000]}\n\n"
+                f"Steps:\n"
+                f"1. Go to {platform}.com dashboard for '{newsletter_name}'\n"
+                f"2. Create a new post/issue\n"
+                f"3. Set the subject line: {subject}\n"
+                f"4. Paste the full content\n"
+                f"5. Send/publish to all subscribers\n"
+                f"6. Return the published URL\n\n"
+                f"Return: {{\"url\": str, \"status\": str}}",
+                f"Publishing newsletter issue: {subject}",
+            )
+
+            if result.get("status") == "completed" or result.get("url"):
+                self.db.execute(
+                    "UPDATE newsletter_issues SET status = 'sent' WHERE id = ?",
+                    (issue["id"],),
+                )
+                self.log_action(
+                    "issue_published",
+                    f"{subject} → {result.get('url', platform)}",
+                )
+                return {"status": "published", "url": result.get("url", "")}
+            else:
+                self.log_action("issue_publish_failed", f"{subject}: {result}")
+                return {"status": "failed", "reason": str(result)}
+
+        except Exception as e:
+            self.log_action("issue_publish_failed", f"{subject}: {e}")
+            self.learn_from_error(e, f"Publishing newsletter issue '{subject}' on {platform}")
+            return {"status": "error", "error": str(e)}
+
     def _find_sponsors(self) -> dict[str, Any]:
         """Find REAL potential sponsors by browsing sponsor platforms and newsletters."""
         newsletters = self.db.execute(
@@ -487,6 +641,47 @@ class NewsletterAgent(BaseAgent):
             "\"relevance\": str, \"estimated_cpm\": float, "
             "\"contact_method\": str, \"source\": str}]}"
         )
+
+        # Create a checkout link for sponsorship slots and pitch sponsors
+        subscriber_count = nl.get("subscriber_count", 0) or 100
+        cpm_rate = 25.0  # Conservative newsletter CPM
+        slot_price = round(max(subscriber_count * cpm_rate / 1000, 25.0), 2)
+
+        checkout = self.create_checkout_link(
+            amount=slot_price,
+            product=f"Newsletter Sponsorship: {nl['name']} ({subscriber_count} subscribers)",
+            provider="kofi",
+            metadata={"newsletter_id": nl["id"], "type": "sponsorship"},
+        )
+        checkout_url = checkout.get("checkout_url", "")
+
+        # Reach out to the best sponsors with our pitch + checkout link
+        for sponsor in sponsors.get("sponsors", [])[:3]:
+            contact = sponsor.get("contact_method", "")
+            if not contact or "@" not in contact:
+                continue
+            try:
+                pitch_body = (
+                    f"Sponsorship slot in '{nl['name']}' newsletter.\n"
+                    f"- {subscriber_count} engaged subscribers in {nl['niche']}\n"
+                    f"- Price: €{slot_price:.2f} per issue\n"
+                    f"- Includes: dedicated section + link + CTA\n"
+                )
+                if checkout_url:
+                    pitch_body += f"- Book instantly: {checkout_url}\n"
+
+                self.platform_action(
+                    "email",
+                    f"Send a sponsorship pitch email.\n"
+                    f"To: {contact}\n"
+                    f"Subject: Sponsorship opportunity — {nl['name']} newsletter\n"
+                    f"Body: {pitch_body}\n"
+                    f"Keep it professional and concise.",
+                    f"Pitching {sponsor.get('company', 'sponsor')}",
+                )
+                self.log_action("sponsor_pitched", f"{sponsor.get('company', '')} for {nl['name']}")
+            except Exception:
+                pass
 
         self.log_action("sponsors_found", f"{len(sponsors.get('sponsors', []))} potential sponsors")
         return sponsors

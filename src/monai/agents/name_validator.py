@@ -107,10 +107,51 @@ class NameValidator:
         self._anonymizer = get_anonymizer(config)
         self._http = self._anonymizer.create_http_client(timeout=15)
         self._init_schema()
+        # In-memory cache: (check_type, target) → ValidationResult
+        # Avoids repeated network calls for the same name within one cycle.
+        self._cache: dict[tuple[str, str], ValidationResult] = {}
 
     def _init_schema(self):
         with self.db.connect() as conn:
             conn.executescript(VALIDATION_SCHEMA)
+
+    def _get_cached(self, check_type: str, target: str, max_age_hours: int = 24) -> ValidationResult | None:
+        """Check in-memory cache first, then DB for recent validation results."""
+        key = (check_type, target.lower())
+        if key in self._cache:
+            return self._cache[key]
+
+        # Check DB for results within max_age_hours
+        try:
+            rows = self.db.execute(
+                "SELECT status, details FROM name_validations "
+                "WHERE validation_type = ? AND name = ? "
+                "AND checked_at > datetime('now', ?) "
+                "ORDER BY checked_at DESC LIMIT 1",
+                (check_type, target.lower(), f"-{max_age_hours} hours"),
+            )
+            if rows:
+                row = rows[0]
+                available = True if row["status"] == "available" else (
+                    False if row["status"] == "taken" else None
+                )
+                result = ValidationResult(
+                    check_type=check_type,
+                    target=target,
+                    available=available,
+                    details=f"[cached] {row['details']}",
+                )
+                self._cache[key] = result
+                logger.debug(f"Cache hit for {check_type}:{target}")
+                return result
+        except Exception:
+            pass
+        return None
+
+    def _cache_and_store(self, result: ValidationResult):
+        """Store result in both memory cache and DB."""
+        self._cache[(result.check_type, result.target.lower())] = result
+        self._store_result(result)
 
     def close(self):
         """Clean up HTTP client."""
@@ -138,6 +179,10 @@ class NameValidator:
                 details=f"Invalid domain format: {domain}",
             )
 
+        cached = self._get_cached("domain", domain)
+        if cached is not None:
+            return cached
+
         try:
             # DNS A record lookup — if it resolves, domain is registered
             socket.getaddrinfo(domain, None, socket.AF_INET)
@@ -163,7 +208,7 @@ class NameValidator:
                 details=f"DNS check error: {e}",
             )
 
-        self._store_result(result)
+        self._cache_and_store(result)
         return result
 
     def check_domain_whois(self, domain: str) -> ValidationResult:
@@ -173,6 +218,11 @@ class NameValidator:
         Falls back to DNS check if WHOIS fails.
         """
         domain = domain.strip().lower()
+
+        cached = self._get_cached("domain", domain)
+        if cached is not None:
+            return cached
+
         try:
             # Use a public WHOIS API
             self._anonymizer.maybe_rotate()
@@ -216,7 +266,7 @@ class NameValidator:
         except Exception:
             return self.check_domain(domain)
 
-        self._store_result(result)
+        self._cache_and_store(result)
         return result
 
     def check_username(self, username: str, platform: str) -> ValidationResult:
@@ -227,6 +277,10 @@ class NameValidator:
         """
         username = username.strip().lower()
         platform = platform.strip().lower()
+
+        cached = self._get_cached("username", f"{username}@{platform}")
+        if cached is not None:
+            return cached
 
         url_template = PLATFORM_USERNAME_URLS.get(platform)
         if not url_template:
@@ -272,7 +326,7 @@ class NameValidator:
                 details=f"Check failed for {platform}: {e}",
             )
 
-        self._store_result(result)
+        self._cache_and_store(result)
         return result
 
     def check_llc_name(self, name: str, jurisdiction: str = "US-WY") -> ValidationResult:
@@ -280,6 +334,10 @@ class NameValidator:
 
         Uses web search to check if a similar LLC already exists.
         """
+        cached = self._get_cached("llc_name", name)
+        if cached is not None:
+            return cached
+
         try:
             # Search for the business name via web
             self._anonymizer.maybe_rotate()
@@ -330,7 +388,7 @@ class NameValidator:
                 details=f"LLC name check failed: {e}",
             )
 
-        self._store_result(result)
+        self._cache_and_store(result)
         return result
 
     def check_trademark(self, name: str) -> ValidationResult:
@@ -339,6 +397,10 @@ class NameValidator:
         Uses LLM to analyze the name for obvious trademark issues,
         and performs a basic web search for existing trademarks.
         """
+        cached = self._get_cached("trademark", name)
+        if cached is not None:
+            return cached
+
         try:
             # Ask LLM to assess trademark risk
             assessment = self.llm.quick_json(
@@ -388,7 +450,7 @@ class NameValidator:
                 details=f"Trademark check failed: {e}",
             )
 
-        self._store_result(result)
+        self._cache_and_store(result)
         return result
 
     # ── Full Validation Pipeline ────────────────────────────────

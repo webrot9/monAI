@@ -329,6 +329,10 @@ _GOAL_TO_ACTIONS: dict[str, list[str]] = {
     "stripe_setup": ["llc_formation", "payment_processing_setup"],
     "email": ["email_creation"],
     "create_email": ["email_creation"],
+    # Specific infrastructure goals — minimal deps, no LLM expansion
+    "telegram_bot": ["email_creation"],
+    "telegram": ["email_creation"],
+    "identity": [],
 }
 
 
@@ -414,21 +418,15 @@ class ConstraintPlanner:
         # 1. Try hardcoded rules (fast path for known patterns)
         standard_chain = self._match_standard_goal(goal_lower, inventory)
 
-        # 2. Also ask LLM for dependency analysis — catches edge cases
-        #    and handles novel goals that hardcoded rules can't
-        llm_chain = self._llm_dependency_chain(goal, inventory)
-
-        # 3. If we have a standard chain, merge LLM additions
         if standard_chain is not None:
-            # Add any LLM steps that aren't already covered
-            existing_actions = {s.action for s in standard_chain}
-            for llm_step in llm_chain:
-                if llm_step.action not in existing_actions:
-                    standard_chain.append(llm_step)
+            # Hardcoded rules are authoritative — skip LLM enrichment.
+            # LLM enrichment caused scope explosion: "telegram_bot" → 16
+            # steps because the LLM inferred domain, hosting, payment
+            # processing, LLC, GitHub, etc. as dependencies.
             return standard_chain
 
-        # 4. No standard match — use LLM chain entirely
-        return llm_chain
+        # 2. No standard match — ask LLM for novel goals only
+        return self._llm_dependency_chain(goal, inventory)
 
     def _match_standard_goal(
         self, goal: str, inventory: AssetInventory
