@@ -107,7 +107,7 @@ class NewsletterAgent(BaseAgent):
         if not statuses:
             return ["research_niches"]
         if statuses.get("planning", 0) > 0:
-            return ["plan_newsletter"]
+            return ["launch_newsletter"]
         if statuses.get("launched", 0) > 0:
             return ["write_issue"]
         if statuses.get("growing", 0) > 0:
@@ -126,6 +126,7 @@ class NewsletterAgent(BaseAgent):
         step_methods = {
             "research_niches": self._research_niches,
             "plan_newsletter": self._plan_newsletter,
+            "launch_newsletter": self._launch_newsletter,
             "write_issue": self._write_issue,
             "review_issue": self._review_issue,
             "find_sponsors": self._find_sponsors,
@@ -247,6 +248,76 @@ class NewsletterAgent(BaseAgent):
         )
         self.log_action("newsletter_planned", name)
         return plan
+
+    def _launch_newsletter(self) -> dict[str, Any]:
+        """Create the newsletter on a real platform (Substack/Beehiiv) via browser.
+
+        Registers an account, creates the publication, and sets it to 'launched'.
+        Without this step, newsletters exist only in DB and never get real subscribers.
+        """
+        newsletters = self.db.execute(
+            "SELECT * FROM newsletters WHERE status = 'planning' LIMIT 1"
+        )
+        if not newsletters:
+            return {"status": "no_newsletters_to_launch"}
+
+        nl = newsletters[0]
+        name = nl["name"]
+        platform = nl["platform"] or "substack"
+
+        # Ensure we have a platform account
+        account_result = self.ensure_platform_account(platform)
+        if account_result.get("status") in ("blocked", "error"):
+            self.log_action(
+                "launch_blocked", name,
+                f"{platform} account setup failed: {account_result}"
+            )
+            # Try Beehiiv as fallback
+            if platform != "beehiiv":
+                platform = "beehiiv"
+                account_result = self.ensure_platform_account("beehiiv")
+                if account_result.get("status") in ("blocked", "error"):
+                    return {"status": "blocked", "reason": "Both Substack and Beehiiv unavailable"}
+
+        # Create the publication on the platform
+        try:
+            create_result = self.execute_task(
+                f"Create a new newsletter publication on {platform}.\n"
+                f"Name: {name}\n"
+                f"Description: {nl['description']}\n"
+                f"Niche: {nl['niche']}\n"
+                f"Frequency: {nl['frequency']}\n\n"
+                f"Steps:\n"
+                f"1. Go to {platform}.com and navigate to create a new publication\n"
+                f"2. Enter the newsletter name and description\n"
+                f"3. Choose the appropriate category\n"
+                f"4. Set up the welcome email for new subscribers\n"
+                f"5. Return the publication URL\n\n"
+                f"IMPORTANT: Use ONLY the credentials from your stored {platform} account.\n"
+                f"Return: {{\"url\": str, \"status\": str}}",
+                f"Launching newsletter '{name}' on {platform}"
+            )
+
+            pub_url = create_result.get("url", "")
+
+            if create_result.get("status") == "completed" or pub_url:
+                self.db.execute(
+                    "UPDATE newsletters SET status = 'launched', platform = ? WHERE name = ?",
+                    (platform, name),
+                )
+                self.log_action("newsletter_launched", f"{name} on {platform}: {pub_url}")
+                return {"status": "launched", "platform": platform, "url": pub_url}
+            else:
+                self.log_action(
+                    "newsletter_launch_failed", name,
+                    f"Platform creation returned: {create_result}"
+                )
+                return {"status": "failed", "reason": str(create_result)}
+
+        except Exception as e:
+            self.log_action("newsletter_launch_failed", name, str(e)[:300])
+            self.learn_from_error(e, f"Launching newsletter '{name}' on {platform}")
+            return {"status": "error", "error": str(e)}
 
     def _write_issue(self) -> dict[str, Any]:
         """Write a newsletter issue for an active newsletter using LLM content creation."""

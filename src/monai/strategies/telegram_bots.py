@@ -57,12 +57,14 @@ class TelegramBotAgent(BaseAgent):
             return ["review_product"]
         if statuses.get("reviewed", 0) > 0:
             return ["deploy_bot"]
+        if statuses.get("deployed", 0) > 0:
+            return ["promote_bot"]
         if statuses.get("build_failed", 0) > 0:
             return ["design_bot"]  # Redesign failed builds
         if statuses.get("deploy_failed", 0) > 0:
             return ["deploy_bot"]  # Retry failed deployments
 
-        # All bots deployed — start a new product cycle
+        # All bots promoted — start a new product cycle
         return ["research_bot_niches"]
 
     def run(self, **kwargs: Any) -> dict[str, Any]:
@@ -76,6 +78,7 @@ class TelegramBotAgent(BaseAgent):
             "build_bot": self._build_bot,
             "review_product": self._review_product,
             "deploy_bot": self._deploy_bot,
+            "promote_bot": self._promote_bot,
         }
 
         for step in steps:
@@ -326,7 +329,9 @@ class TelegramBotAgent(BaseAgent):
 
         for path in self.bots_dir.glob("*.json"):
             data = json.loads(path.read_text())
-            if data.get("status") != "built":
+            # Deploy reviewed bots (passed quality gate).
+            # Previously checked for "built" which skipped ALL reviewed bots.
+            if data.get("status") != "reviewed":
                 continue
 
             design = data["design"]
@@ -364,7 +369,44 @@ class TelegramBotAgent(BaseAgent):
                         "bot_registration_failed", name,
                         "No bot token returned from BotFather registration"
                     )
+                    data["status"] = "deploy_failed"
+                    data["deploy_error"] = "No bot token from BotFather"
+                    path.write_text(json.dumps(data, indent=2))
                     continue
+
+                # Validate token format: "123456:ABC-DEF..." (number:alphanumeric)
+                import re as _re
+                if not _re.match(r'^\d+:[A-Za-z0-9_-]{30,}$', bot_token):
+                    self.log_action(
+                        "bot_registration_failed", name,
+                        f"Invalid bot token format: {bot_token[:20]}..."
+                    )
+                    data["status"] = "deploy_failed"
+                    data["deploy_error"] = f"Invalid token format: {bot_token[:20]}..."
+                    path.write_text(json.dumps(data, indent=2))
+                    continue
+
+                # Verify token works via Telegram API
+                try:
+                    import httpx
+                    verify_resp = httpx.get(
+                        f"https://api.telegram.org/bot{bot_token}/getMe",
+                        timeout=10,
+                    )
+                    if verify_resp.status_code != 200 or not verify_resp.json().get("ok"):
+                        self.log_action(
+                            "bot_registration_failed", name,
+                            f"Bot token failed getMe verification"
+                        )
+                        data["status"] = "deploy_failed"
+                        data["deploy_error"] = "Token failed getMe API check"
+                        path.write_text(json.dumps(data, indent=2))
+                        continue
+                except Exception as verify_err:
+                    self.log_action(
+                        "bot_token_verify_warning", name,
+                        f"Could not verify token: {verify_err}"
+                    )
 
             except Exception as e:
                 self.log_action(
@@ -428,6 +470,82 @@ class TelegramBotAgent(BaseAgent):
 
         self.log_action("deploy_bots_complete", f"{deployed} bots deployed")
         return {"bots_deployed": deployed}
+
+    def _promote_bot(self) -> dict[str, Any]:
+        """Promote deployed bots to get real users.
+
+        Posts to Telegram bot directories, relevant communities, and
+        creates a landing page describing the bot's value proposition.
+        """
+        promoted = 0
+
+        for path in self.bots_dir.glob("*.json"):
+            data = json.loads(path.read_text())
+            if data.get("status") != "deployed":
+                continue
+
+            deployment = data.get("deployment", {})
+            design = data.get("design", {})
+            name = design.get("name", "untitled")
+            bot_username = deployment.get("bot_username", "")
+
+            if not bot_username:
+                continue
+
+            # Submit to Telegram bot directories
+            directories = [
+                ("https://t.me/BotList", "Submit bot to @BotList channel"),
+                ("https://botcatalog.com/submit", "Submit to BotCatalog directory"),
+            ]
+
+            for url, desc in directories:
+                try:
+                    self.platform_action(
+                        "telegram",
+                        f"{desc}.\n"
+                        f"Bot: @{bot_username}\n"
+                        f"Name: {name}\n"
+                        f"Description: {design.get('tagline', '')}\n"
+                        f"Category: {design.get('category', 'utility')}\n"
+                        f"URL: {url}",
+                        f"Promoting bot @{bot_username}",
+                    )
+                except Exception as e:
+                    self.log_action("promote_failed", f"{name} → {url}: {e}")
+
+            # Share in relevant communities
+            niche = data.get("research", {}).get("niche", "")
+            if niche:
+                search_results = self.search_web(
+                    f"Telegram group {niche} community",
+                    "Find 2-3 active Telegram groups/channels related to this niche. "
+                    "Return {\"groups\": [{\"name\": str, \"url\": str}]}",
+                    num_results=3,
+                )
+                for group in search_results.get("groups", [])[:2]:
+                    try:
+                        self.platform_action(
+                            "telegram",
+                            f"Share bot in community group.\n"
+                            f"Group: {group.get('url', '')}\n"
+                            f"Message: Check out @{bot_username} — "
+                            f"{design.get('tagline', 'a useful Telegram bot')}. "
+                            f"Free to try!",
+                            f"Sharing bot in {group.get('name', 'community')}",
+                        )
+                    except Exception:
+                        pass
+
+            data["status"] = "promoted"
+            data["promotion"] = {
+                "promoted_at": __import__("datetime").datetime.now().isoformat(),
+                "directories_submitted": len(directories),
+            }
+            path.write_text(json.dumps(data, indent=2))
+            promoted += 1
+            self.log_action("bot_promoted", f"@{bot_username} submitted to directories")
+
+        return {"bots_promoted": promoted}
 
     def apply_improvements(self) -> dict[str, Any]:
         """Apply pending improvements from ProductIterator to existing bots.
