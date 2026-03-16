@@ -1,5 +1,10 @@
 # Lessons Learned
 
+### 2026-03-16 - Custom dropdowns (SearchableSelect) burn 10+ steps per task
+- **Mistake**: Stripe registration's country dropdown (SearchableSelect) caused the executor to waste 10-14 steps per cycle. `fill_form` partially succeeds (email+password) but fails on the custom dropdown. The executor then retries via `run_page_script` with slightly varied JS each time, dodging the stuck-loop detector since the code differs. 3 cycles × 14 steps = 42 wasted LLM calls on one dropdown.
+- **Root cause**: (1) Stripe playbook only had email/password mapped — no entry for the SearchableSelect. (2) Codegen fallback generates generic JS that doesn't reliably interact with custom React dropdown components. (3) Executor's stuck-loop watchdog only catches identical args, not semantically equivalent retries. (4) No specialized handling for custom dropdown components (click→type→select pattern).
+- **Rule**: Pre-seed known custom dropdown components with `__CUSTOM_DROPDOWN__` marker in platform playbooks. Add a `_fill_custom_dropdown` handler that uses targeted discovery + specialized prompt. Auto-detect dropdown-like selectors in `_codegen_fill_form` and route them through the specialized handler. Add semantic dedup in executor that detects repeated `run_page_script` failures targeting the same DOM elements.
+
 ### 2026-03-15 - Strategies don't learn from failures — they retry the same approach forever
 - **Mistake**: Strategy `run()` methods call step methods directly without tracking outcomes. If `_research_programs()` fails, next cycle calls it again identically. No failure tracking, no adaptation, no alternative approaches attempted.
 - **Root cause**: (1) Steps didn't record success/failure outcomes. (2) No mechanism to detect 3+ consecutive failures and try a different approach. (3) Silent failures (empty results, None) treated as success. (4) `plan()` is hardcoded state machine that never reads failure history.

@@ -266,6 +266,46 @@ class AutonomousExecutor:
                             "history": self.action_history,
                         }
 
+                # Semantic dedup: detect when run_page_script keeps failing
+                # on the same DOM target even with varying code.
+                # The LLM often rewrites the same broken JS with minor
+                # variations, dodging the exact-match stuck loop above.
+                if (is_failure and tool == "run_page_script"
+                        and len(self.action_history) >= 3):
+                    recent_script_fails = [
+                        a for a in self.action_history[-6:]
+                        if a["tool"] == "run_page_script"
+                        and (a["result"].startswith("ERROR:")
+                             or "failed" in a["result"].lower()
+                             or "[]" in a["result"])
+                    ]
+                    if len(recent_script_fails) >= 3:
+                        # Extract target selectors from script code
+                        import re
+                        targets = set()
+                        for a in recent_script_fails:
+                            script_code = a["args"].get("script", "")
+                            # Find querySelector targets
+                            for m in re.finditer(
+                                r"querySelector\(['\"]([^'\"]+)['\"]\)",
+                                script_code
+                            ):
+                                targets.add(m.group(1))
+                        # If all scripts target the same selector(s),
+                        # the LLM is stuck retrying the same approach
+                        if len(targets) <= 2 and targets:
+                            reason = (
+                                f"Semantic dedup: run_page_script failed "
+                                f"{len(recent_script_fails)} times targeting "
+                                f"same element(s) {targets} — this approach "
+                                f"won't work, try a fundamentally different "
+                                f"strategy or skip this element"
+                            )
+                            logger.warning(reason)
+                            # Don't abort — inject as feedback so LLM
+                            # changes strategy instead of retrying
+                            self.action_history[-1]["result"] = reason
+
                 # Check if task is done — but verify claims first
                 if tool == "done":
                     verification = await self._verify_completion(
