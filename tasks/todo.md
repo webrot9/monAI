@@ -117,6 +117,19 @@
 - [x] Orchestrator: TOR_BLOCKED_STRATEGIES mapping + auto-pause in _run_strategies
 - [x] Orchestrator: Skip Tor-blocked strategies in _ensure_strategy_payment_providers
 
+## Active — Revenue Pipeline Fixes (2026-03-16)
+- [x] checkout_links table: payment_ref → strategy mapping
+- [x] create_checkout_link() auto-stores mapping in DB
+- [x] BaseAgent.check_pending_sales() polls providers + records revenue
+- [x] affiliate: monetize_content step + check_sales step
+- [x] content_sites: monetize_article step + check_sales step
+- [x] lead_gen: check_sales step + marks lists as 'sold'
+- [x] newsletter: check_sales step for sponsor payments
+- [x] telegram_bots: check_sales step for premium subscriptions
+- [x] Webhook revenue handler: make_checkout_revenue_handler()
+- [x] Reduced browsing from 3-4 sessions to 1 per research step (saves 20-40 LLM calls/cycle)
+- [x] Added "no real data" detection — skip hallucination, retry next cycle
+
 ## Active — Revenue-Viable Strategies (work via Tor)
 These 5 strategies can generate revenue without Tor-blocked platform registration:
 

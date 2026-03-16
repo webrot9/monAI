@@ -95,33 +95,17 @@ class AffiliateAgent(BaseAgent):
         return results
 
     def _research_programs(self) -> dict[str, Any]:
-        """Find high-commission affiliate programs using REAL web data."""
-        self.log_action("program_research", "Browsing real affiliate networks")
+        """Find high-commission affiliate programs using web data.
 
-        # Browse ShareASale for real high-commission programs
-        shareasale_data = self.browse_and_extract(
-            "https://www.shareasale.com/info/",
-            "Extract any affiliate program listings, merchant names, commission "
-            "rates, categories, cookie durations, and program details shown on "
-            "this page. Only include REAL data visible on the page. Do NOT make "
-            "up any information. Return as JSON: {\"programs\": [{\"name\": str, "
-            "\"commission\": str, \"category\": str, \"cookie_days\": str, "
-            "\"details\": str}]}"
-        )
+        Uses a single focused search to minimize LLM calls — previous approach
+        burned 4 separate browser sessions (ShareASale, CJ, 2x web search) that
+        mostly failed via Tor, wasting 20-40 LLM calls per cycle.
+        """
+        self.log_action("program_research", "Searching for affiliate programs")
 
-        # Browse CJ Affiliate for real programs
-        cj_data = self.browse_and_extract(
-            "https://www.cj.com/",
-            "Extract any affiliate program listings, advertiser names, commission "
-            "structures, categories, and details shown on this page. Only include "
-            "REAL data visible on the page. Do NOT make up any information. "
-            "Return as JSON: {\"programs\": [{\"name\": str, "
-            "\"commission\": str, \"category\": str, \"details\": str}]}"
-        )
-
-        # Search for high-commission programs in profitable niches
+        # Single focused search — DuckDuckGo works via Tor
         search_data = self.search_web(
-            "highest commission affiliate programs SaaS hosting VPN 2026",
+            "highest commission recurring affiliate programs SaaS hosting VPN 2026",
             "Extract affiliate program names, commission rates, whether commissions "
             "are recurring, cookie durations, average sale values, and signup URLs. "
             "Only include REAL data visible on the page. Do NOT make up any "
@@ -130,36 +114,36 @@ class AffiliateAgent(BaseAgent):
             "\"cookie_days\": str, \"avg_sale_value\": str, \"signup_url\": str}]}"
         )
 
-        # Search specifically for recurring commission programs
-        recurring_data = self.search_web(
-            "best recurring commission affiliate programs 2026",
-            "Extract program names, products, recurring commission rates, and "
-            "any details about payment structure. Only include REAL data visible "
-            "on the page. Do NOT make up any information. "
-            "Return as JSON: {\"programs\": [{\"name\": str, \"product\": str, "
-            "\"commission\": str, \"recurring\": str, \"niche\": str}]}"
+        # Check if we got any real data — don't hallucinate if search failed
+        has_real_data = (
+            isinstance(search_data, dict)
+            and search_data.get("programs")
+            and search_data.get("status") != "error"
         )
 
-        # Use LLM to select the best programs from real data
-        raw_data = {
-            "shareasale": shareasale_data,
-            "cj": cj_data,
-            "web_search": search_data,
-            "recurring": recurring_data,
-        }
+        if not has_real_data:
+            self.log_action("research_failed", "No real data from web search")
+            # Save a minimal researched marker so pipeline advances
+            path = self.content_dir / "programs_researched.json"
+            path.write_text(json.dumps({
+                "status": "researched",
+                "programs": [],
+                "note": "Web search failed — will retry next cycle",
+            }, indent=2))
+            return {"programs": [], "status": "no_data"}
+
         programs = self.think_json(
             "Based on the following REAL affiliate program data from the web, "
             "select the 5 best high-commission programs.\n\n"
-            f"Raw research data:\n{json.dumps(raw_data, default=str)[:4000]}\n\n"
+            f"Raw research data:\n{json.dumps(search_data, default=str)[:4000]}\n\n"
             "Focus on:\n"
             "- Commission rate >10% or >$20 per sale\n"
             "- Recurring commissions (SaaS products)\n"
             "- Products with genuine value (no scams)\n"
             "- Growing markets\n\n"
-            "Categories: SaaS tools, hosting, VPNs, online courses, "
-            "financial products, productivity tools, design software.\n\n"
             "IMPORTANT: Only include programs that appeared in the real data "
-            "above. Do not invent programs.\n\n"
+            "above. Do not invent programs. If no real data was found, return "
+            "an empty list.\n\n"
             "Return: {\"programs\": [{\"name\": str, \"product\": str, "
             "\"commission\": str, \"cookie_days\": int, \"recurring\": bool, "
             "\"avg_sale_value\": float, \"niche\": str, \"signup_url\": str, "
@@ -173,10 +157,9 @@ class AffiliateAgent(BaseAgent):
         return programs
 
     def _research_products(self) -> dict[str, Any]:
-        """Research specific products to review using REAL web data."""
-        self.log_action("product_research", "Browsing real product listings")
+        """Research specific products to review using a single focused search."""
+        self.log_action("product_research", "Searching for products to review")
 
-        # First, decide what niche to research based on existing knowledge
         niche_pick = self.think_json(
             "Pick a profitable niche for affiliate product reviews. "
             "Choose from: SaaS tools, web hosting, VPNs, online course platforms, "
@@ -184,56 +167,31 @@ class AffiliateAgent(BaseAgent):
             "Return: {\"niche\": str, \"search_queries\": [str]}"
         )
         niche = niche_pick.get("niche", "SaaS tools")
-        search_queries = niche_pick.get("search_queries", [f"best {niche} 2026"])
 
-        # Search for real products in this niche
+        # Single search instead of 3 browser sessions
         product_search = self.search_web(
-            search_queries[0] if search_queries else f"best {niche} 2026",
-            "Extract product names, pricing, key features, and any affiliate "
-            "program details mentioned. Only include REAL data visible on the "
-            "page. Do NOT make up any information. "
-            "Return as JSON: {\"products\": [{\"name\": str, \"price\": str, "
-            "\"key_features\": [str], \"affiliate_info\": str}]}"
-        )
-
-        # Browse Amazon for real product listings in this niche
-        amazon_data = self.browse_and_extract(
-            f"https://www.amazon.com/s?k={niche.replace(' ', '+')}",
-            "Extract product names, prices, ratings, number of reviews, and any "
-            "key features shown. Only include REAL data visible on the page. "
-            "Do NOT make up any information. "
-            "Return as JSON: {\"products\": [{\"name\": str, \"price\": str, "
-            "\"rating\": str, \"num_reviews\": str, \"features\": [str]}]}"
-        )
-
-        # Browse a review/comparison site for expert opinions
-        review_data = self.search_web(
-            f"{niche} comparison review 2026",
-            "Extract product names, ratings, pros, cons, and pricing mentioned "
-            "in product reviews and comparisons. Only include REAL data visible "
+            f"best {niche} 2026 review comparison pricing affiliate",
+            "Extract product names, pricing, key features, ratings, pros, cons, "
+            "and any affiliate program details. Only include REAL data visible "
             "on the page. Do NOT make up any information. "
-            "Return as JSON: {\"products\": [{\"name\": str, \"rating\": str, "
-            "\"pros\": [str], \"cons\": [str], \"price\": str}]}"
+            "Return as JSON: {\"products\": [{\"name\": str, \"price\": str, "
+            "\"rating\": str, \"key_features\": [str], \"affiliate_info\": str}]}"
         )
 
-        # Use LLM to synthesize real data into actionable product list
-        raw_data = {
-            "niche": niche,
-            "product_search": product_search,
-            "amazon": amazon_data,
-            "reviews": review_data,
-        }
+        has_real_data = (
+            isinstance(product_search, dict)
+            and product_search.get("products")
+            and product_search.get("status") != "error"
+        )
+
+        if not has_real_data:
+            return {"niche": niche, "products": [], "status": "no_data"}
+
         products = self.think_json(
             "Based on the following REAL product research data, select 3-5 "
             "products to create comparison content for.\n\n"
-            f"Raw research data:\n{json.dumps(raw_data, default=str)[:4000]}\n\n"
-            "The products should be:\n"
-            "- Real products that appeared in the data above\n"
-            "- In the same category (so we can compare them)\n"
-            "- Have affiliate programs or are on Amazon\n"
-            "- Products people actively search for reviews of\n\n"
-            "IMPORTANT: Only include products that appeared in the real data "
-            "above. Do not invent products.\n\n"
+            f"Raw research data:\n{json.dumps(product_search, default=str)[:4000]}\n\n"
+            "IMPORTANT: Only include products from the real data above.\n\n"
             "Return: {\"niche\": str, \"products\": [{\"name\": str, "
             "\"category\": str, \"price\": str, \"key_features\": [str], "
             "\"affiliate_program\": str, \"commission\": str, \"source\": str}]}"
