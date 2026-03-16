@@ -696,6 +696,20 @@ class LeadGenAgent(BaseAgent):
             except Exception as e:
                 self.log_action("outreach_failed", f"{name}: {e}")
 
+            # Step 3: Create a payment link so buyers can pay directly
+            bundle_price = round(price * qualified_count * 0.8, 2)
+            checkout = self.create_checkout_link(
+                amount=bundle_price,
+                product=f"{niche.title()} Lead List ({qualified_count} qualified leads)",
+                provider="kofi",  # Works behind Tor, lowest friction
+                metadata={"list_id": list_id, "niche": niche},
+            )
+            checkout_url = checkout.get("checkout_url", "")
+            if checkout_url:
+                self.log_action(
+                    "checkout_created", f"{name}: {checkout_url}"
+                )
+
             # Mark as listed (still active, waiting for sales)
             self.db.execute(
                 "UPDATE lead_lists SET status = 'listed' WHERE id = ?", (list_id,)

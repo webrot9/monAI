@@ -1003,10 +1003,13 @@ class TestLLMConstraintPlanning:
         db.execute.side_effect = execute_side_effect
         return ConstraintPlanner(db, llm)
 
-    def test_standard_goal_also_calls_llm(self):
-        """Even for standard goals, LLM is consulted to enrich the plan."""
+    def test_standard_goal_skips_llm(self):
+        """Standard goals use only hardcoded rules — LLM is NOT consulted.
+
+        LLM enrichment was removed for standard goals because it caused scope
+        explosion (e.g. "telegram_bot" → 16 steps when only 1 needed).
+        """
         planner = self._make_planner()
-        # LLM returns an extra step not in hardcoded rules
         planner.llm.chat_json.return_value = {
             "steps": [
                 {"action": "verify_email", "platform": "gmail",
@@ -1017,11 +1020,12 @@ class TestLLMConstraintPlanning:
         }
         graph = planner.plan(["signup for upwork"])
         actions = [s.action for s in graph.steps]
-        # Should have both hardcoded (email_creation, platform_signup)
-        # AND LLM-added (verify_email)
+        # Hardcoded rules are authoritative — LLM step NOT included
         assert "email_creation" in actions
         assert "platform_signup" in actions
-        assert "verify_email" in actions
+        assert "verify_email" not in actions
+        # LLM should NOT have been called for standard goals
+        planner.llm.chat_json.assert_not_called()
 
     def test_llm_deps_dont_duplicate_hardcoded(self):
         """LLM steps that match hardcoded ones should be deduplicated."""

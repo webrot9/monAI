@@ -642,6 +642,47 @@ class NewsletterAgent(BaseAgent):
             "\"contact_method\": str, \"source\": str}]}"
         )
 
+        # Create a checkout link for sponsorship slots and pitch sponsors
+        subscriber_count = nl.get("subscriber_count", 0) or 100
+        cpm_rate = 25.0  # Conservative newsletter CPM
+        slot_price = round(max(subscriber_count * cpm_rate / 1000, 25.0), 2)
+
+        checkout = self.create_checkout_link(
+            amount=slot_price,
+            product=f"Newsletter Sponsorship: {nl['name']} ({subscriber_count} subscribers)",
+            provider="kofi",
+            metadata={"newsletter_id": nl["id"], "type": "sponsorship"},
+        )
+        checkout_url = checkout.get("checkout_url", "")
+
+        # Reach out to the best sponsors with our pitch + checkout link
+        for sponsor in sponsors.get("sponsors", [])[:3]:
+            contact = sponsor.get("contact_method", "")
+            if not contact or "@" not in contact:
+                continue
+            try:
+                pitch_body = (
+                    f"Sponsorship slot in '{nl['name']}' newsletter.\n"
+                    f"- {subscriber_count} engaged subscribers in {nl['niche']}\n"
+                    f"- Price: €{slot_price:.2f} per issue\n"
+                    f"- Includes: dedicated section + link + CTA\n"
+                )
+                if checkout_url:
+                    pitch_body += f"- Book instantly: {checkout_url}\n"
+
+                self.platform_action(
+                    "email",
+                    f"Send a sponsorship pitch email.\n"
+                    f"To: {contact}\n"
+                    f"Subject: Sponsorship opportunity — {nl['name']} newsletter\n"
+                    f"Body: {pitch_body}\n"
+                    f"Keep it professional and concise.",
+                    f"Pitching {sponsor.get('company', 'sponsor')}",
+                )
+                self.log_action("sponsor_pitched", f"{sponsor.get('company', '')} for {nl['name']}")
+            except Exception:
+                pass
+
         self.log_action("sponsors_found", f"{len(sponsors.get('sponsors', []))} potential sponsors")
         return sponsors
 

@@ -123,11 +123,15 @@ class TestLeadGenAgent:
 
     def test_build_list_inserts(self, config, db, mock_llm):
         mock_llm.chat_json.return_value = {
-            "name": "SaaS CTOs", "niche": "b2b_saas", "source": "linkedin",
-            "data_points": ["name", "email"], "target_count": 500,
-            "qualification_criteria": ["decision maker"], "price_per_lead": 2.0
+            "search_query": "saas cto", "location": "San Francisco",
+            "target_count": 500,
         }
         agent = LeadGenAgent(config, db, mock_llm)
+        # _build_list now requires a planned list in DB (created by _research_niches)
+        db.execute_insert(
+            "INSERT INTO lead_lists (name, niche, source, price_per_lead, status) "
+            "VALUES ('SaaS CTOs', 'b2b_saas', 'linkedin', 2.0, 'planned')"
+        )
         result = agent._build_list()
         assert result["list_id"] > 0
         rows = db.execute("SELECT * FROM lead_lists WHERE name = 'SaaS CTOs'")

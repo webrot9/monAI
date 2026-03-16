@@ -437,11 +437,20 @@ class TelegramBotAgent(BaseAgent):
                 deployment_status = deploy_result.get("status", "unknown")
 
                 if deployment_status == "success":
+                    # Create payment link for premium features
+                    premium_price = design.get("premium_price", 4.99)
+                    checkout = self.create_checkout_link(
+                        amount=premium_price,
+                        product=f"{name} Premium",
+                        provider="kofi",
+                        metadata={"bot_username": bot_username},
+                    )
                     data["status"] = "deployed"
                     data["deployment"] = {
                         "bot_token": bot_token,
                         "bot_username": bot_username,
                         "deployment_url": deployment_url,
+                        "checkout_url": checkout.get("checkout_url", ""),
                         "hosting_platform": deploy_result.get("platform", ""),
                     }
                     path.write_text(json.dumps(data, indent=2))

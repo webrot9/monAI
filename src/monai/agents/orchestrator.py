@@ -169,6 +169,8 @@ class Orchestrator(BaseAgent):
 
     def register_strategy(self, agent: BaseAgent):
         self._strategy_agents[agent.name] = agent
+        # Give strategy access to payment infrastructure
+        agent.payment_manager = self.payment_manager
         self.workflow_engine.register_agent(agent.name, agent)
         # Auto-register brand for social presence and web presence
         self.social_presence.register_brand(agent.name)

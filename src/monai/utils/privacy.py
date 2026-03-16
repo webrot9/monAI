@@ -79,6 +79,10 @@ TIMEZONE_LOCALE_PAIRS = [
     ("Australia/Sydney", "en-US"),
 ]
 
+# Derived sets for validation — tests and fingerprint checks use these
+TIMEZONES = [tz for tz, _ in TIMEZONE_LOCALE_PAIRS]
+LOCALES = [loc for _, loc in TIMEZONE_LOCALE_PAIRS]
+
 # IP check services (use multiple for reliability)
 IP_CHECK_URLS = [
     "https://api.ipify.org?format=json",
