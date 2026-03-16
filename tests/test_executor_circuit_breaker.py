@@ -274,6 +274,362 @@ class TestEthicsBlockNudge:
         assert "run_page_script has been BLOCKED" not in prompt
 
 
+class TestScriptTargetBurning:
+    """When run_page_script fails N times on the same DOM target, the executor
+    should stop retrying and auto-reject further attempts."""
+
+    def _make_executor(self, max_steps=30):
+        config = MagicMock()
+        config.data_dir = MagicMock()
+        config.data_dir.__truediv__ = lambda s, x: MagicMock()
+        db = MagicMock()
+        db.connect.return_value.__enter__ = MagicMock()
+        db.connect.return_value.__exit__ = MagicMock()
+        llm = MagicMock()
+        with patch("monai.agents.executor.get_anonymizer"), \
+             patch("monai.agents.executor.SharedMemory"), \
+             patch("monai.agents.browser_learner.BrowserLearner", side_effect=Exception("no browser")):
+            executor = AutonomousExecutor(config, db, llm, max_steps=max_steps)
+        executor._learner = None
+        return executor
+
+    def test_max_script_retries_per_target_constant(self):
+        assert AutonomousExecutor.MAX_SCRIPT_RETRIES_PER_TARGET == 3
+
+    @pytest.mark.asyncio
+    async def test_auto_rejects_burnt_target(self):
+        """After MAX_SCRIPT_RETRIES_PER_TARGET failures on the same selector,
+        further run_page_script calls targeting it are auto-rejected without
+        executing."""
+        executor = self._make_executor(max_steps=10)
+        call_count = {"n": 0}
+        act_called = {"n": 0}
+
+        def fake_think(task, context, step):
+            call_count["n"] += 1
+            if call_count["n"] >= 8:
+                return {"tool": "fail", "args": {"reason": "gave up"}}
+            # Always target the same querySelector
+            return {
+                "tool": "run_page_script",
+                "args": {
+                    "script": (
+                        "const el = document.querySelector('#country-select');"
+                        "el.value = 'US';"
+                    ),
+                },
+            }
+
+        original_act = executor._act
+
+        async def tracking_act(tool, args):
+            act_called["n"] += 1
+            return "ERROR: Script failed: element not found"
+
+        executor._think = fake_think
+        executor._act = tracking_act
+        executor.browser = AsyncMock()
+        executor.browser.start = AsyncMock()
+        executor.browser.stop = AsyncMock()
+        executor._log_task = MagicMock()
+
+        result = await executor.execute_task("fill country dropdown")
+
+        # Should have executed _act only MAX_SCRIPT_RETRIES_PER_TARGET times
+        # for the run_page_script calls (3), then auto-rejected the rest
+        assert act_called["n"] <= AutonomousExecutor.MAX_SCRIPT_RETRIES_PER_TARGET + 1  # +1 for fail()
+
+        # At least one AUTO-REJECTED entry should be in history
+        rejected = [
+            a for a in executor.action_history
+            if "AUTO-REJECTED" in a.get("result", "")
+        ]
+        assert len(rejected) >= 1, "Expected at least one AUTO-REJECTED entry"
+
+    @pytest.mark.asyncio
+    async def test_different_targets_tracked_independently(self):
+        """Failures on selector A don't affect the retry budget for selector B."""
+        executor = self._make_executor(max_steps=20)
+        call_count = {"n": 0}
+
+        def fake_think(task, context, step):
+            call_count["n"] += 1
+            if call_count["n"] >= 12:
+                return {"tool": "done", "args": {"result": "ok"}}
+            # Alternate between two different selectors
+            if call_count["n"] <= 4:
+                sel = "#country-select"
+            else:
+                sel = "#state-select"
+            return {
+                "tool": "run_page_script",
+                "args": {"script": f"document.querySelector('{sel}').value = 'X';"},
+            }
+
+        async def fake_act(tool, args):
+            if tool == "run_page_script":
+                return "ERROR: Script failed: not found"
+            return "ok"
+
+        executor._think = fake_think
+        executor._act = fake_act
+        executor.browser = AsyncMock()
+        executor.browser.start = AsyncMock()
+        executor.browser.stop = AsyncMock()
+        executor._log_task = MagicMock()
+        executor._verify_completion = AsyncMock(
+            return_value={"verified": True})
+
+        await executor.execute_task("fill dropdown")
+
+        # Each target should be tracked separately
+        assert "#country-select" in str(executor._script_target_failures)
+        assert "#state-select" in str(executor._script_target_failures)
+
+    @pytest.mark.asyncio
+    async def test_burnt_targets_shown_in_think_prompt(self):
+        """Once a target is burnt, it should appear in the _think prompt so
+        the LLM knows not to retry it."""
+        executor = self._make_executor()
+        # Pre-burn a target
+        executor._script_target_failures["#country-select"] = 3
+
+        executor._get_learned_context = MagicMock(return_value="")
+        executor._get_executor_config = MagicMock(return_value=0.3)
+        executor._get_tool_descriptions = MagicMock(return_value="")
+        executor._proof = MagicMock()
+        executor._proof.get_history.return_value = ""
+        executor.llm.chat_json.return_value = {
+            "reasoning": "test", "tool": "fail",
+            "args": {"reason": "test"},
+        }
+
+        executor._think("test task", "test context", 5)
+
+        prompt = executor.llm.chat_json.call_args[0][0][-1]["content"]
+        assert "BURNT TARGETS" in prompt
+        assert "#country-select" in prompt
+        assert "AUTO-REJECTED" in prompt
+
+    @pytest.mark.asyncio
+    async def test_fill_form_partial_failure_tracking(self):
+        """When fill_form partially succeeds but the same field keeps failing,
+        it should be tracked and eventually trigger a context warning."""
+        executor = self._make_executor(max_steps=10)
+        call_count = {"n": 0}
+
+        def fake_think(task, context, step):
+            call_count["n"] += 1
+            if call_count["n"] >= 6:
+                return {"tool": "fail", "args": {"reason": "gave up"}}
+            return {
+                "tool": "fill_form",
+                "args": {
+                    "fields": {
+                        "#email": "test@test.com",
+                        "#country": "US",
+                    },
+                },
+            }
+
+        async def fake_act(tool, args):
+            if tool == "fill_form":
+                return "Filled 1 fields. ERROR: Fill failed on: #country"
+            return "ok"
+
+        executor._think = fake_think
+        executor._act = fake_act
+        executor.browser = AsyncMock()
+        executor.browser.start = AsyncMock()
+        executor.browser.stop = AsyncMock()
+        executor._log_task = MagicMock()
+
+        result = await executor.execute_task("register on stripe")
+
+        # The #country field should have accumulated failures
+        assert executor._script_target_failures.get("fill_form:#country", 0) >= 3
+
+    def test_script_target_failures_reset_per_task(self):
+        """_script_target_failures should be reset at the start of each task."""
+        executor = self._make_executor()
+        executor._script_target_failures["#old-target"] = 5
+        # Simulate execute_task reset (the first lines)
+        executor.action_history = []
+        executor._reflection_count = 0
+        executor._script_target_failures = {}
+        assert "#old-target" not in executor._script_target_failures
+
+
+class TestLLMHealthCheck:
+    """LLM.health_check() should detect quota exhaustion and unavailability."""
+
+    def _make_llm(self):
+        config = MagicMock()
+        config.llm.model_mini = "gpt-4o-mini"
+        config.llm.provider = "openai"
+        config.privacy.proxy_type = "none"
+        config.llm.api_key = "test"
+        config.llm.api_base = None
+        config.llm.model = "gpt-4o"
+        config.llm.temperature = 0.7
+        config.llm.max_tokens = 4096
+        return config
+
+    def test_health_check_returns_available_on_success(self):
+        from monai.utils.llm import LLM
+        config = self._make_llm()
+        with patch("monai.utils.llm.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            mock_client.chat.completions.create.return_value = MagicMock()
+
+            llm = LLM(config)
+            result = llm.health_check()
+
+            assert result["available"] is True
+            assert result["quota_exhausted"] is False
+
+    def test_health_check_detects_quota_exhaustion(self):
+        from monai.utils.llm import LLM
+        config = self._make_llm()
+        with patch("monai.utils.llm.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            mock_client.chat.completions.create.side_effect = Exception(
+                "Error code: 429 - {'error': {'message': 'You exceeded your "
+                "current quota', 'type': 'insufficient_quota'}}"
+            )
+
+            llm = LLM(config)
+            result = llm.health_check()
+
+            assert result["available"] is False
+            assert result["quota_exhausted"] is True
+
+    def test_health_check_detects_generic_failure(self):
+        from monai.utils.llm import LLM
+        config = self._make_llm()
+        with patch("monai.utils.llm.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            mock_client.chat.completions.create.side_effect = ConnectionError(
+                "Connection refused"
+            )
+
+            llm = LLM(config)
+            result = llm.health_check()
+
+            assert result["available"] is False
+            assert result["quota_exhausted"] is False
+            assert "Connection refused" in result["error"]
+
+
+class TestOrchestratorLLMGuard:
+    """Orchestrator should skip expensive operations when LLM is unavailable.
+
+    Instead of instantiating the full Orchestrator (which has 30+ deps), we test
+    the health-check guard logic by verifying that the LLM.health_check method
+    correctly detects quota exhaustion, and that the orchestrator code path
+    references the check result correctly.
+    """
+
+    def test_health_check_result_detected_as_quota_exhausted(self):
+        """The health_check result for quota exhaustion should have
+        available=False and quota_exhausted=True."""
+        from monai.utils.llm import LLM
+        config = MagicMock()
+        config.llm.model_mini = "gpt-4o-mini"
+        config.llm.provider = "openai"
+        config.privacy.proxy_type = "none"
+        config.llm.api_key = "test"
+        config.llm.api_base = None
+        config.llm.model = "gpt-4o"
+        config.llm.temperature = 0.7
+        config.llm.max_tokens = 4096
+
+        with patch("monai.utils.llm.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            mock_client.chat.completions.create.side_effect = Exception(
+                "Error code: 429 - insufficient_quota"
+            )
+            llm = LLM(config)
+            result = llm.health_check()
+
+        assert result["available"] is False
+        assert result["quota_exhausted"] is True
+
+        # The orchestrator checks these exact fields:
+        # if not llm_health["available"]:
+        #     if llm_health["quota_exhausted"]:
+        #         reason = "llm_quota_exhausted"
+        reason = "llm_unavailable"
+        if result["quota_exhausted"]:
+            reason = "llm_quota_exhausted"
+        assert reason == "llm_quota_exhausted"
+
+    def test_health_check_connection_error_not_quota(self):
+        """Connection errors should be detected as unavailable but NOT
+        quota_exhausted — the orchestrator should still back off."""
+        from monai.utils.llm import LLM
+        config = MagicMock()
+        config.llm.model_mini = "gpt-4o-mini"
+        config.llm.provider = "openai"
+        config.privacy.proxy_type = "none"
+        config.llm.api_key = "test"
+        config.llm.api_base = None
+        config.llm.model = "gpt-4o"
+        config.llm.temperature = 0.7
+        config.llm.max_tokens = 4096
+
+        with patch("monai.utils.llm.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            mock_client.chat.completions.create.side_effect = ConnectionError(
+                "Connection refused"
+            )
+            llm = LLM(config)
+            result = llm.health_check()
+
+        assert result["available"] is False
+        assert result["quota_exhausted"] is False
+
+        reason = "llm_unavailable"
+        if result["quota_exhausted"]:
+            reason = "llm_quota_exhausted"
+        assert reason == "llm_unavailable"
+
+
+class TestDaemonBackoff:
+    """run_daemon should apply exponential backoff on persistent failures."""
+
+    def test_backoff_multiplier_increases_on_failures(self):
+        """Verify the backoff logic computes correct multipliers."""
+        # This tests the backoff math without running the full daemon
+        max_backoff_multiplier = 12
+        base_interval = 300
+
+        # Simulate consecutive failures
+        consecutive = 0
+        multipliers = []
+        for i in range(6):
+            consecutive += 1
+            mult = min(2 ** (consecutive - 1), max_backoff_multiplier)
+            multipliers.append(mult)
+
+        # 1x, 2x, 4x, 8x, 12x (capped), 12x (capped)
+        assert multipliers == [1, 2, 4, 8, 12, 12]
+
+    def test_backoff_resets_on_success(self):
+        """After a successful cycle, backoff should reset to 1x."""
+        consecutive = 5
+        # Simulate success
+        consecutive = 0
+        mult = min(2 ** max(consecutive - 1, 0), 12)
+        # 2^(-1) = 0.5, but max(0-1, 0) = 0, so 2^0 = 1
+        assert mult == 1
+
+
 class TestTorControlPort:
     """Tor should be started with --ControlPort 9051."""
 

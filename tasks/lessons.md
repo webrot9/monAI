@@ -1,9 +1,19 @@
 # Lessons Learned
 
+### 2026-03-16 - Tests that bypass __init__ break when new instance attributes are added
+- **Mistake**: Added `_script_target_failures` to `AutonomousExecutor.__init__` but didn't check for tests that bypass `__init__` via `__new__`. `test_think_includes_asset_context` broke because the attribute didn't exist.
+- **Root cause**: Tests using `patch.object(Class, '__init__', lambda...)` + `__new__` don't call the real `__init__`, so any new instance attribute is missing.
+- **Rule**: When adding new instance attributes to a class, grep for `__new__` and `__init__.*lambda` in test files to find tests that manually construct instances. Update them to include the new attribute. Never dismiss a failing test as "pre-existing" without verifying on main first.
+
+### 2026-03-16 - No LLM health check before expensive operations
+- **Mistake**: When OpenAI quota is exhausted (429), each cycle still launches browser, creates mail.tm email, starts Playwright, and provisions infrastructure — all before discovering the LLM is dead. Cycles 2-4 each wasted 5-10 seconds of browser+email work for zero value.
+- **Root cause**: (1) No LLM availability check before starting expensive infrastructure provisioning. (2) Daemon loop uses fixed 300s interval regardless of failure rate — no backoff on persistent errors.
+- **Rule**: Add `LLM.health_check()` — lightweight 1-token ping to verify quota/availability BEFORE `_execute_cycle()` starts browser/email work. If unavailable, return immediately with `llm_unavailable` or `llm_quota_exhausted` status. Daemon loop tracks consecutive failures and applies exponential backoff (1x → 2x → 4x → 8x → 12x cap) on the cycle interval. Resets to 1x on success.
+
 ### 2026-03-16 - Custom dropdowns (SearchableSelect) burn 10+ steps per task
 - **Mistake**: Stripe registration's country dropdown (SearchableSelect) caused the executor to waste 10-14 steps per cycle. `fill_form` partially succeeds (email+password) but fails on the custom dropdown. The executor then retries via `run_page_script` with slightly varied JS each time, dodging the stuck-loop detector since the code differs. 3 cycles × 14 steps = 42 wasted LLM calls on one dropdown.
 - **Root cause**: (1) Stripe playbook only had email/password mapped — no entry for the SearchableSelect. (2) Codegen fallback generates generic JS that doesn't reliably interact with custom React dropdown components. (3) Executor's stuck-loop watchdog only catches identical args, not semantically equivalent retries. (4) No specialized handling for custom dropdown components (click→type→select pattern).
-- **Rule**: Pre-seed known custom dropdown components with `__CUSTOM_DROPDOWN__` marker in platform playbooks. Add a `_fill_custom_dropdown` handler that uses targeted discovery + specialized prompt. Auto-detect dropdown-like selectors in `_codegen_fill_form` and route them through the specialized handler. Add semantic dedup in executor that detects repeated `run_page_script` failures targeting the same DOM elements.
+- **Rule**: Pre-seed known custom dropdown components with `__CUSTOM_DROPDOWN__` marker in platform playbooks. Add a `_fill_custom_dropdown` handler that uses targeted discovery + specialized prompt. Auto-detect dropdown-like selectors in `_codegen_fill_form` and route them through the specialized handler. Per-target failure tracking (`_script_target_failures`) counts failures by querySelector target; after MAX_SCRIPT_RETRIES_PER_TARGET (3) failures, inject HARD STOP into context AND auto-reject further run_page_script calls targeting the same elements BEFORE execution (pre-execution guard). Also track fill_form partial failures per-field.
 
 ### 2026-03-15 - Strategies don't learn from failures — they retry the same approach forever
 - **Mistake**: Strategy `run()` methods call step methods directly without tracking outcomes. If `_research_programs()` fails, next cycle calls it again identically. No failure tracking, no adaptation, no alternative approaches attempted.

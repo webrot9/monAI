@@ -72,6 +72,9 @@ class AutonomousExecutor:
     # (prevents LLM from gaming the breaker with read_page/screenshot between fails)
     MAX_FAILURE_RATIO = 0.7  # 70% of steps failing = abort
     MIN_STEPS_FOR_RATIO = 6  # don't apply ratio check before this many steps
+    # Max times a single DOM target can be retried via run_page_script
+    # before we force-skip it (prevents the 25-step loop seen in logs)
+    MAX_SCRIPT_RETRIES_PER_TARGET = 3
 
     # Class-level cancellation flag — set by the watchdog to stop all
     # in-flight executors when a cycle times out.
@@ -100,6 +103,9 @@ class AutonomousExecutor:
         self.http_client = self._anonymizer.create_http_client(timeout=30)
         self.action_history: list[dict] = []
         self._reflection_count = 0  # Cap reflections per task
+        # Per-target script failure counter: selector → count
+        # Prevents run_page_script from retrying the same DOM target 25 times
+        self._script_target_failures: dict[str, int] = {}
         self.memory = SharedMemory(db)
 
         # Dynamic tool registry — agents can create tools at runtime
@@ -134,6 +140,7 @@ class AutonomousExecutor:
         self._current_task = task
         self.action_history = []
         self._reflection_count = 0
+        self._script_target_failures = {}
         start_time = time.time()
         consecutive_failures = 0
         total_failures = 0
@@ -219,6 +226,36 @@ class AutonomousExecutor:
 
                 logger.info(f"Step {step + 1}: {tool}({json.dumps(args)[:200]})")
 
+                # Pre-execution guard: auto-reject run_page_script on burnt targets
+                if tool == "run_page_script":
+                    import re as _re
+                    script_code = args.get("script", "")
+                    script_targets = set()
+                    for m in _re.finditer(
+                        r"querySelector(?:All)?\(['\"]([^'\"]+)['\"]\)",
+                        script_code,
+                    ):
+                        script_targets.add(m.group(1))
+                    target_key = "|".join(sorted(script_targets)) if script_targets else "__unknown__"
+                    prior_fails = self._script_target_failures.get(target_key, 0)
+                    if prior_fails > self.MAX_SCRIPT_RETRIES_PER_TARGET:
+                        reject_msg = (
+                            f"AUTO-REJECTED: run_page_script targeting "
+                            f"{script_targets} blocked — already failed "
+                            f"{prior_fails} times on these elements. "
+                            f"Use a COMPLETELY different approach or call fail()."
+                        )
+                        logger.warning(reject_msg)
+                        self.action_history.append({
+                            "step": step + 1,
+                            "tool": tool,
+                            "args": args,
+                            "result": reject_msg,
+                        })
+                        consecutive_failures += 1
+                        total_failures += 1
+                        continue
+
                 # ACT: Execute the action
                 result = await self._act(tool, args)
                 result_str = str(result)
@@ -235,6 +272,36 @@ class AutonomousExecutor:
                     total_failures += 1
                 else:
                     consecutive_failures = 0
+
+                # Track fill_form partial failures: if the same fields keep
+                # failing across repeated fill_form calls, burn them so the
+                # LLM doesn't re-include them in future attempts.
+                if (tool == "fill_form"
+                        and "ERROR: Fill failed on:" in result_str):
+                    import re as _re
+                    failed_match = _re.search(
+                        r"ERROR: Fill failed on: (.+?)(?:\.|$)", result_str)
+                    if failed_match:
+                        failed_fields = [
+                            f.strip()
+                            for f in failed_match.group(1).split(",")
+                        ]
+                        for field in failed_fields:
+                            key = f"fill_form:{field}"
+                            self._script_target_failures[key] = (
+                                self._script_target_failures.get(key, 0) + 1
+                            )
+                            if self._script_target_failures[key] >= self.MAX_SCRIPT_RETRIES_PER_TARGET:
+                                burnt_msg = (
+                                    f"Field '{field}' has failed to fill "
+                                    f"{self._script_target_failures[key]} "
+                                    f"times. STOP including it in fill_form. "
+                                    f"Try run_page_script with custom JS for "
+                                    f"this specific field, or call fail() if "
+                                    f"the registration cannot proceed without it."
+                                )
+                                context = f"{context}\n\n{burnt_msg}"
+                                result_str += f"\n{burnt_msg}"
 
                 # OBSERVE: Record the result
                 self.action_history.append({
@@ -266,45 +333,43 @@ class AutonomousExecutor:
                             "history": self.action_history,
                         }
 
-                # Semantic dedup: detect when run_page_script keeps failing
-                # on the same DOM target even with varying code.
-                # The LLM often rewrites the same broken JS with minor
-                # variations, dodging the exact-match stuck loop above.
-                if (is_failure and tool == "run_page_script"
-                        and len(self.action_history) >= 3):
-                    recent_script_fails = [
-                        a for a in self.action_history[-6:]
-                        if a["tool"] == "run_page_script"
-                        and (a["result"].startswith("ERROR:")
-                             or "failed" in a["result"].lower()
-                             or "[]" in a["result"])
-                    ]
-                    if len(recent_script_fails) >= 3:
-                        # Extract target selectors from script code
-                        import re
-                        targets = set()
-                        for a in recent_script_fails:
-                            script_code = a["args"].get("script", "")
-                            # Find querySelector targets
-                            for m in re.finditer(
-                                r"querySelector\(['\"]([^'\"]+)['\"]\)",
-                                script_code
-                            ):
-                                targets.add(m.group(1))
-                        # If all scripts target the same selector(s),
-                        # the LLM is stuck retrying the same approach
-                        if len(targets) <= 2 and targets:
-                            reason = (
-                                f"Semantic dedup: run_page_script failed "
-                                f"{len(recent_script_fails)} times targeting "
-                                f"same element(s) {targets} — this approach "
-                                f"won't work, try a fundamentally different "
-                                f"strategy or skip this element"
-                            )
-                            logger.warning(reason)
-                            # Don't abort — inject as feedback so LLM
-                            # changes strategy instead of retrying
-                            self.action_history[-1]["result"] = reason
+                # Semantic dedup: track per-target script failures.
+                # When the limit is hit, inject a HARD STOP into context
+                # so the LLM knows to change strategy.  The pre-execution
+                # guard above auto-rejects any further attempts.
+                if tool == "run_page_script":
+                    import re as _re
+                    script_code = args.get("script", "")
+                    script_targets = set()
+                    for m in _re.finditer(
+                        r"querySelector(?:All)?\(['\"]([^'\"]+)['\"]\)",
+                        script_code,
+                    ):
+                        script_targets.add(m.group(1))
+                    target_key = "|".join(sorted(script_targets)) if script_targets else "__unknown__"
+
+                    if is_failure:
+                        self._script_target_failures[target_key] = (
+                            self._script_target_failures.get(target_key, 0) + 1
+                        )
+
+                    fail_count = self._script_target_failures.get(target_key, 0)
+                    if fail_count >= self.MAX_SCRIPT_RETRIES_PER_TARGET:
+                        burnt_msg = (
+                            f"HARD STOP: run_page_script has failed "
+                            f"{fail_count} times on target(s) "
+                            f"{script_targets or 'unknown'}. These elements "
+                            f"are BURNT — do NOT attempt run_page_script on "
+                            f"them again.  Either: (1) call fill_form with "
+                            f"different selectors, (2) use write_code to "
+                            f"build a Python/API solution, (3) call fail() "
+                            f"if this sub-task is impossible.  Any further "
+                            f"run_page_script targeting the same elements "
+                            f"will be auto-rejected."
+                        )
+                        logger.warning(burnt_msg)
+                        self.action_history[-1]["result"] = burnt_msg
+                        context = f"{context}\n\n{burnt_msg}"
 
                 # Check if task is done — but verify claims first
                 if tool == "done":
@@ -457,12 +522,28 @@ class AutonomousExecutor:
                     "A PROPER SOLUTION. You are a coder — act like one.\n\n"
                 )
 
+        # Burnt targets warning — tell the LLM which elements to avoid
+        burnt_targets_text = ""
+        if self._script_target_failures:
+            burnt = [
+                k for k, v in self._script_target_failures.items()
+                if v >= self.MAX_SCRIPT_RETRIES_PER_TARGET
+            ]
+            if burnt:
+                burnt_targets_text = (
+                    "\n🔥 BURNT TARGETS (do NOT retry these):\n"
+                    + "\n".join(f"  - {t} ({self._script_target_failures[t]} failures)"
+                               for t in burnt)
+                    + "\nAny run_page_script targeting these will be AUTO-REJECTED.\n\n"
+                )
+
         prompt = (
             f"TASK: {task}\n\n"
             f"CONTEXT: {context}\n\n"
             f"STEP: {step + 1}/{self.max_steps}\n\n"
             f"PREVIOUS ACTIONS:\n{history_summary or 'None yet'}\n\n"
             f"{code_nudge}"
+            f"{burnt_targets_text}"
             f"{learned_context}"
             f"{asset_context}"
             f"{custom_rules_text}"

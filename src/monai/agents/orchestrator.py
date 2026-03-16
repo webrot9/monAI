@@ -368,6 +368,21 @@ class Orchestrator(BaseAgent):
                         f"Cycle limits: €{max_cycle_cost:.2f} cost, "
                         f"{self.config.budget.max_cycle_calls} calls")
 
+        # Phase 0: LLM health check — don't waste browser/email resources
+        # if the LLM is unavailable (e.g. quota exhausted)
+        llm_health = self.llm.health_check()
+        if not llm_health["available"]:
+            reason = "llm_unavailable"
+            if llm_health["quota_exhausted"]:
+                reason = "llm_quota_exhausted"
+            self.log_action("LLM_UNAVAILABLE",
+                            f"{reason}: {llm_health.get('error', 'unknown')[:200]}")
+            self.audit.log("orchestrator", "system", reason,
+                           details=llm_health, success=False, risk_level="high")
+            cycle_result["status"] = reason
+            cycle_result["llm_error"] = llm_health.get("error", "")[:200]
+            return cycle_result
+
         try:
             return self._execute_cycle(cycle_result, budget)
         except BudgetExceededError as exc:
