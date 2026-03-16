@@ -272,7 +272,13 @@ class APIProvisioner(BaseAgent):
             f"Fill in all required fields and submit the registration form.\n"
             f"If a CAPTCHA appears, solve it.\n"
             f"Do NOT click any 'skip' buttons for business verification — complete what is required.\n"
-            f"Return status and any confirmation details via done().",
+            f"Return status and any confirmation details via done().\n\n"
+            f"CRITICAL: After navigating to the registration URL, CHECK THE PAGE URL.\n"
+            f"If you are redirected to a DASHBOARD or LOGIN page instead of the\n"
+            f"registration form, call fail() immediately with the reason\n"
+            f"'existing_session_detected' — do NOT try to fill registration\n"
+            f"fields that don't exist on a dashboard page. The browser may have\n"
+            f"stale cookies from a previous session.",
             context=f"Brand: {brand}\nIdentity: {json.dumps(identity, default=str)}",
         )
 

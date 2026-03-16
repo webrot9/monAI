@@ -677,7 +677,14 @@ class AutonomousExecutor:
                         failure = result.get("failure", "unknown")
                         error = result.get("error", "")
                         return f"ERROR: Navigation failed ({failure}): {error}"
-                    return result.get("page_info", await self.browser.get_page_info())
+                    page_info = result.get("page_info", await self.browser.get_page_info())
+                    # Surface redirect warnings so the LLM knows it landed
+                    # on a different page (e.g. dashboard instead of registration)
+                    redirect_warning = page_info.get("redirect_warning", "")
+                    if redirect_warning:
+                        page_info["__redirect_alert"] = redirect_warning
+                        logger.warning("Redirect mismatch: %s", redirect_warning)
+                    return page_info
                 else:
                     await self.browser.navigate(args.get("url", ""))
                     return await self.browser.get_page_info()

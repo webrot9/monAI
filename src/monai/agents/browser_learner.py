@@ -164,7 +164,7 @@ class BrowserLearner:
     # ── Smart Actions (with learning) ─────────────────────────────
 
     async def navigate(self, url: str, **kwargs: Any) -> dict[str, Any]:
-        """Navigate to URL with failure detection and retry."""
+        """Navigate to URL with failure detection, redirect detection, and retry."""
         domain = urlparse(url).netloc
         start = time.time()
 
@@ -185,6 +185,16 @@ class BrowserLearner:
                 result = await self._apply_countermeasure(failure_type, domain, url)
                 return {"success": not failure_type, "failure": failure_type,
                         "countermeasure_result": result, "page_info": page_info}
+
+            # Detect unexpected redirects (e.g. /register → /dashboard)
+            redirect_warning = self._detect_redirect_mismatch(url, page_info)
+            if redirect_warning:
+                page_info["redirect_warning"] = redirect_warning
+                logger.warning(
+                    "Navigation redirect detected: requested %s but "
+                    "landed on %s — %s",
+                    url, page_info.get("url", "unknown"), redirect_warning,
+                )
 
             self._log_action(domain, "navigate", None, url, True, duration=duration)
             return {"success": True, "page_info": page_info}
@@ -475,6 +485,67 @@ class BrowserLearner:
         return result
 
     # ── Failure Detection ─────────────────────────────────────────
+
+    # URL path keywords that signal a registration/signup page
+    _REGISTRATION_PATH_KEYWORDS = {"register", "signup", "sign-up", "join", "create-account"}
+    # URL path keywords that signal the user is already logged in (dashboard)
+    _DASHBOARD_PATH_KEYWORDS = {"dashboard", "home", "overview", "account", "settings", "app"}
+
+    def _detect_redirect_mismatch(self, requested_url: str,
+                                  page_info: dict[str, Any]) -> str | None:
+        """Detect when navigation landed on a different page than expected.
+
+        Common case: requesting /register but landing on /dashboard because
+        the browser has stale session cookies from a previous account.
+        Returns a human-readable warning string, or None if no mismatch.
+        """
+        actual_url = page_info.get("url", "")
+        if not actual_url:
+            return None
+
+        requested_path = urlparse(requested_url).path.lower().rstrip("/")
+        actual_path = urlparse(actual_url).path.lower().rstrip("/")
+
+        # No mismatch if paths are the same
+        if requested_path == actual_path:
+            return None
+
+        # Detect: requested registration page, but landed on dashboard/login
+        requested_is_registration = any(
+            kw in requested_path for kw in self._REGISTRATION_PATH_KEYWORDS
+        )
+        actual_is_dashboard = any(
+            kw in actual_path for kw in self._DASHBOARD_PATH_KEYWORDS
+        )
+        actual_is_login = "login" in actual_path or "signin" in actual_path
+
+        if requested_is_registration and actual_is_dashboard:
+            return (
+                f"REDIRECT: Requested {requested_path} but landed on "
+                f"{actual_path}. This looks like a dashboard — you may "
+                f"already be logged into an existing account. The "
+                f"registration form will NOT be present. Either clear "
+                f"cookies/use incognito, or call fail() explaining "
+                f"that an existing session was detected."
+            )
+
+        if requested_is_registration and actual_is_login:
+            return (
+                f"REDIRECT: Requested {requested_path} but landed on "
+                f"{actual_path}. The site redirected to a login page. "
+                f"Look for a 'Create account' or 'Sign up' link on "
+                f"this page, or the registration form may be embedded."
+            )
+
+        # Generic path mismatch — just warn
+        if requested_path and actual_path and requested_path != actual_path:
+            return (
+                f"URL changed: requested {requested_path}, landed on "
+                f"{actual_path}. The page content may differ from what "
+                f"you expected."
+            )
+
+        return None
 
     def _detect_failure(self, page_info: dict[str, Any]) -> str | None:
         """Analyze page content to detect blocks/CAPTCHAs/bot detection."""
