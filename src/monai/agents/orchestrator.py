@@ -2171,11 +2171,31 @@ class Orchestrator(BaseAgent):
 
         max_retries = 2  # Retry transient failures up to 2 times
 
+        # Minimum calls needed to run a strategy meaningfully.
+        # If fewer calls remain, skip remaining strategies to avoid waste.
+        MIN_CALLS_PER_STRATEGY = 15
+        budget_exhausted = False
+
         for name, agent in self._strategy_agents.items():
             if name in active_names:
                 # Skip quarantined agents
                 if self.ethics_tester.is_quarantined(name):
                     results[name] = {"status": "quarantined", "reason": "ethics_failure"}
+                    continue
+
+                # Pre-flight budget check: skip strategy if not enough calls remain
+                tracker = get_cost_tracker()
+                remaining = tracker.calls_remaining()
+                if budget_exhausted or remaining < MIN_CALLS_PER_STRATEGY:
+                    logger.warning(
+                        "Skipping strategy '%s': only %d calls remaining "
+                        "(need %d minimum)",
+                        name, remaining, MIN_CALLS_PER_STRATEGY,
+                    )
+                    results[name] = {
+                        "status": "skipped",
+                        "reason": f"budget_low: {remaining} calls remaining",
+                    }
                     continue
 
                 last_error = None
@@ -2211,6 +2231,19 @@ class Orchestrator(BaseAgent):
                             name, "strategy_execution", False, duration_ms,
                         )
                         break  # Timeouts are not retryable
+                    except BudgetExceededError as e:
+                        # Budget exhausted — stop ALL remaining strategies immediately
+                        duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+                        logger.warning(
+                            "Strategy '%s' hit budget limit: %s — "
+                            "skipping all remaining strategies", name, e,
+                        )
+                        results[name] = {"status": "budget_exceeded", "error": str(e)}
+                        self.task_router.update_performance(
+                            name, "strategy_execution", False, duration_ms,
+                        )
+                        budget_exhausted = True
+                        break  # Budget errors are NEVER retryable
                     except Exception as e:
                         duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
                         last_error = e

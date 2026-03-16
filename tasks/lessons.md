@@ -1,5 +1,15 @@
 # Lessons Learned
 
+### 2026-03-16 - API call budget consistently exceeded (200→251+ calls/cycle)
+- **Mistake**: Cycles regularly exceeded the 200-call limit (hitting 201, 205, 251+), causing cascading `BudgetExceededError` across all strategy workflow steps. The system logged alerts but kept trying to run more strategies.
+- **Root cause**: (1) Budget check in `CostTracker.record()` happens AFTER recording the call — so call 201 goes through before raising. (2) `_run_strategies()` caught `BudgetExceededError` as a generic `Exception` and could retry it as "transient". (3) No pre-flight budget check before starting each strategy — strategies with no chance of completing still burned 1-5 calls before dying. (4) No mechanism to skip remaining strategies once budget is hit.
+- **Rule**: Add `CostTracker.check_budget()` as a pre-flight guard called BEFORE every LLM API request (in `LLM.chat()`). Add explicit `BudgetExceededError` catch in `_run_strategies()` that sets `budget_exhausted=True` and skips ALL remaining strategies. Add per-strategy pre-flight check: skip if `calls_remaining() < MIN_CALLS_PER_STRATEGY` (15 calls minimum).
+
+### 2026-03-16 - Stripe registration burns 30 steps on wrong page (dashboard instead of registration)
+- **Mistake**: Executor hit max_steps (30) trying to register on Stripe. The browser had stale session cookies, so `/register` redirected to `/dashboard` (logged into "Cactus Practice" account). The agent spent all 30 steps trying to interact with `#register-email-input` and `.SearchableSelect-element` selectors that don't exist on a dashboard page.
+- **Root cause**: (1) Browser learner's `navigate()` didn't detect URL mismatches (requested `/register`, landed on `/dashboard`). (2) Executor had no awareness that it was on the wrong page. (3) API provisioner's task prompt didn't warn about this scenario. (4) No "already logged in" detection in `_detect_failure()`.
+- **Rule**: Add `_detect_redirect_mismatch()` to browser learner that compares requested URL path against actual URL path after navigation. When registration URLs redirect to dashboard/login paths, inject a prominent warning into the page_info. Update Stripe provisioning prompt to tell executor to call `fail('existing_session_detected')` immediately if redirected. Surface `redirect_warning` in executor's browse results so LLM context includes the mismatch.
+
 ### 2026-03-16 - Tests that bypass __init__ break when new instance attributes are added
 - **Mistake**: Added `_script_target_failures` to `AutonomousExecutor.__init__` but didn't check for tests that bypass `__init__` via `__new__`. `test_think_includes_asset_context` broke because the attribute didn't exist.
 - **Root cause**: Tests using `patch.object(Class, '__init__', lambda...)` + `__new__` don't call the real `__init__`, so any new instance attribute is missing.

@@ -121,6 +121,23 @@ class CostTracker:
         with self._lock:
             return max(0, self.max_cycle_calls - self.cycle_calls)
 
+    def check_budget(self) -> None:
+        """Pre-flight check — raise BudgetExceededError if cycle limits are already hit.
+
+        Call this BEFORE making an API request to avoid wasting money on a call
+        that will be rejected post-hoc.  The post-hoc check in record() is kept
+        as a safety net for race conditions.
+        """
+        with self._lock:
+            if self.cycle_calls >= self.max_cycle_calls:
+                raise BudgetExceededError(
+                    f"Cycle call limit reached: {self.cycle_calls} >= {self.max_cycle_calls}"
+                )
+            if self.cycle_cost >= self.max_cycle_cost:
+                raise BudgetExceededError(
+                    f"Cycle cost limit reached: €{self.cycle_cost:.4f} >= €{self.max_cycle_cost:.2f}"
+                )
+
     def set_cycle_limits(self, max_cost: float, max_calls: int) -> None:
         """Update per-cycle budget limits."""
         with self._lock:
@@ -318,6 +335,9 @@ class LLM:
         json_mode: bool = False,
     ) -> str:
         used_model = model or self.config.llm.model
+        # Pre-flight budget check — reject BEFORE spending money
+        self.tracker.check_budget()
+
         kwargs: dict[str, Any] = {
             "model": used_model,
             "messages": messages,
