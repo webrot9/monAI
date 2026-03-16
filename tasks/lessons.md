@@ -1,5 +1,10 @@
 # Lessons Learned
 
+### 2026-03-16 - Executor fail() treated as success by content_marketer
+- **Mistake**: Executor correctly called `fail("Unable to access LinkedIn due to authentication")` returning `{"status": "failed"}`. But content_marketer only checked `status != "error"`, so `"failed"` passed the check and content was marked "published" in DB despite never being published.
+- **Root cause**: (1) Status check in `content_marketer.py` line 141 only rejected `"error"`, not `"failed"/"cancelled"/"timeout"`. (2) `ensure_platform_account` in base.py trusted any DB account entry without validating credentials exist, causing "Already have LinkedIn account" hallucination for stale/empty entries.
+- **Rule**: Always check for ALL failure statuses from executor results (`"error"`, `"failed"`, `"cancelled"`, `"timeout"`). Never trust account existence without validating credentials are non-empty. When adding new status values, grep for all status checks to ensure consistency.
+
 ### 2026-03-16 - API call budget consistently exceeded (200→251+ calls/cycle)
 - **Mistake**: Cycles regularly exceeded the 200-call limit (hitting 201, 205, 251+), causing cascading `BudgetExceededError` across all strategy workflow steps. The system logged alerts but kept trying to run more strategies.
 - **Root cause**: (1) Budget check in `CostTracker.record()` happens AFTER recording the call — so call 201 goes through before raising. (2) `_run_strategies()` caught `BudgetExceededError` as a generic `Exception` and could retry it as "transient". (3) No pre-flight budget check before starting each strategy — strategies with no chance of completing still burned 1-5 calls before dying. (4) No mechanism to skip remaining strategies once budget is hit.
