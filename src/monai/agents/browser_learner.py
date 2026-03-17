@@ -133,6 +133,11 @@ class BrowserLearner:
             "last-name": 'input[name="last-name"]',
             "email-address": "#email-address",
             "password": "#password",
+            # LinkedIn login form (homepage / login page)
+            "input[name='session_key']": "#session_key",
+            "input[name='session_password']": "#session_password",
+            "session_key": "#session_key",
+            "session_password": "#session_password",
         },
     }
 

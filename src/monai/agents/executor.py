@@ -566,6 +566,8 @@ class AutonomousExecutor:
             "- Be efficient. Change strategy when things aren't working.\n"
             "- NEVER post to example.com or made-up/placeholder URLs — they don't exist\n"
             "- NEVER create accounts on platforms NOT mentioned in the task\n"
+            "- For web searches: use https://html.duckduckgo.com/html/?q=QUERY (works over Tor).\n"
+            "  Do NOT use Google (429 blocks) or Bing (CAPTCHA/empty results over Tor).\n"
             "\n"
             "CODE-FIRST STRATEGY — YOU ARE A CODER, NOT JUST A TOOL-CALLER:\n"
             "- When standard tools (click, type, fill_form) fail 2+ times: STOP retrying.\n"

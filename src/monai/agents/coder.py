@@ -105,6 +105,7 @@ class Coder:
         self._log("tests_written", str(test_path))
 
         # Step 3: Run tests and fix
+        prev_error: str = ""
         for attempt in range(3):
             test_output = self._run_tests(test_path, target_dir)
 
@@ -120,6 +121,25 @@ class Coder:
 
             # Tests failed — fix the code
             self._log("tests_failed", f"Attempt {attempt + 1}: {test_output['output'][:500]}")
+
+            # Bail early on infrastructure errors (identical output means the
+            # error is environmental, not in the code — e.g. bwrap can't find
+            # python, missing system deps). LLM fixes won't help.
+            current_error = test_output["output"].strip()
+            if attempt > 0 and current_error == prev_error:
+                self._log("generation_failed",
+                          f"Identical test failure on attempts {attempt} and "
+                          f"{attempt + 1} — infrastructure error, bailing early")
+                return {
+                    "status": "failed",
+                    "code_path": str(code_path),
+                    "test_path": str(test_path),
+                    "attempts": attempt + 1,
+                    "last_error": current_error,
+                    "reason": "infrastructure_error",
+                }
+            prev_error = current_error
+
             fix = self._fix_code(code, test_code, test_output["output"], spec, language)
 
             if fix.get("fix_code"):
