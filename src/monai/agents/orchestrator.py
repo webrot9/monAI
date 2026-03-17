@@ -172,15 +172,9 @@ class Orchestrator(BaseAgent):
         # Give strategy access to payment infrastructure
         agent.payment_manager = self.payment_manager
         self.workflow_engine.register_agent(agent.name, agent)
-        # Only register brand for social presence if strategy is actually active
-        # (has the assets to execute).  Phantom brand entries from past sessions
-        # are cleaned up by validate_strategies().
-        rows = self.db.execute(
-            "SELECT status FROM strategies WHERE name = ? LIMIT 1",
-            (agent.name,),
-        )
-        if rows and rows[0]["status"] == "active":
-            self.social_presence.register_brand(agent.name)
+        # Brand registration is handled by validate_strategies() via _sync_brands(),
+        # which runs after all strategies are registered. This ensures brands are
+        # only created for strategies that pass asset validation.
         self.log_action("register_strategy", f"Registered: {agent.name}")
 
     def _get_strategy_failure_context(self) -> list[str]:

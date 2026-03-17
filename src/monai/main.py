@@ -190,10 +190,11 @@ def create_orchestrator(config: Config) -> tuple[Orchestrator, Database]:
     validation = orchestrator.strategy_lifecycle.validate_strategies()
     active = validation.get("activated", []) + validation.get("already_active", [])
     paused = [p["name"] if isinstance(p, dict) else p for p in validation.get("paused", [])]
+    brands_reg, brands_rm = validation.get("brands_registered", 0), validation.get("brands_removed", 0)
     logger.info(
         f"Strategy validation complete: "
         f"{len(active)} active, {len(paused)} paused, "
-        f"{validation.get('phantom_brands_cleaned', 0)} phantom brands cleaned"
+        f"{brands_reg} brands registered, {brands_rm} brands removed"
     )
 
     return orchestrator, db

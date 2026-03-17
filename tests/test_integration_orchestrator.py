@@ -322,6 +322,157 @@ class TestStrategyLifecycle:
         assert lifecycle.is_runnable(paused_id) is False
 
 
+class TestBrandSync:
+    """Test that validate_strategies correctly syncs brand_social_accounts."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_tables(self, db):
+        """Ensure brand_social_accounts and identities tables exist."""
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS brand_social_accounts ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  brand TEXT NOT NULL,"
+            "  platform TEXT NOT NULL,"
+            "  brand_voice TEXT DEFAULT '',"
+            "  UNIQUE(brand, platform)"
+            ")"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS identities ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  type TEXT NOT NULL,"
+            "  platform TEXT NOT NULL,"
+            "  identifier TEXT NOT NULL,"
+            "  credentials TEXT,"
+            "  status TEXT DEFAULT 'active',"
+            "  metadata TEXT,"
+            "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+            "  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
+
+    def test_brands_registered_on_activation(self, db):
+        """When validate_strategies activates a strategy, its brands must be created."""
+        from monai.business.strategy_lifecycle import StrategyLifecycle
+
+        lifecycle = StrategyLifecycle(db)
+
+        # Create a pending strategy with email asset
+        db.execute_insert(
+            "INSERT INTO strategies (name, category, description, status) "
+            "VALUES ('freelance_writing', 'services', 'test', 'pending')"
+        )
+        db.execute_insert(
+            "INSERT INTO identities (type, platform, status, identifier) "
+            "VALUES ('email', 'email', 'active', 'test@example.com')"
+        )
+
+        result = lifecycle.validate_strategies()
+
+        assert "freelance_writing" in result["activated"]
+        assert result["brands_registered"] >= 1
+
+        # Check that brand_social_accounts were actually created
+        rows = db.execute(
+            "SELECT * FROM brand_social_accounts WHERE brand = 'freelance_writing'"
+        )
+        assert len(rows) > 0
+        platforms = {r["platform"] for r in rows}
+        assert "twitter" in platforms
+        assert "linkedin" in platforms
+
+    def test_brands_removed_on_pause(self, db):
+        """When a strategy is paused, its brands must be removed."""
+        from monai.business.strategy_lifecycle import StrategyLifecycle
+
+        lifecycle = StrategyLifecycle(db)
+
+        # Create an active strategy that requires payment (which we won't provide)
+        db.execute_insert(
+            "INSERT INTO strategies (name, category, description, status) "
+            "VALUES ('digital_products', 'products', 'test', 'active')"
+        )
+        # Insert a brand that was registered when it was active
+        db.execute_insert(
+            "INSERT INTO brand_social_accounts (brand, platform) "
+            "VALUES ('digital_products', 'twitter')"
+        )
+        # Provide email but NOT payment — strategy requires both
+        db.execute_insert(
+            "INSERT INTO identities (type, platform, status, identifier) "
+            "VALUES ('email', 'email', 'active', 'test@example.com')"
+        )
+
+        result = lifecycle.validate_strategies()
+
+        paused_names = [p["name"] for p in result["paused"]]
+        assert "digital_products" in paused_names
+        assert result["brands_removed"] >= 1
+
+        # Brand should be gone
+        rows = db.execute(
+            "SELECT * FROM brand_social_accounts WHERE brand = 'digital_products'"
+        )
+        assert len(rows) == 0
+
+    def test_active_brands_not_removed(self, db):
+        """Brands for active strategies must not be touched."""
+        from monai.business.strategy_lifecycle import StrategyLifecycle
+
+        lifecycle = StrategyLifecycle(db)
+
+        db.execute_insert(
+            "INSERT INTO strategies (name, category, description, status) "
+            "VALUES ('freelance_writing', 'services', 'test', 'active')"
+        )
+        db.execute_insert(
+            "INSERT INTO brand_social_accounts (brand, platform) "
+            "VALUES ('freelance_writing', 'twitter')"
+        )
+        db.execute_insert(
+            "INSERT INTO identities (type, platform, status, identifier) "
+            "VALUES ('email', 'email', 'active', 'test@example.com')"
+        )
+
+        result = lifecycle.validate_strategies()
+
+        assert "freelance_writing" in result["already_active"]
+        assert result["brands_removed"] == 0
+
+        rows = db.execute(
+            "SELECT * FROM brand_social_accounts WHERE brand = 'freelance_writing'"
+        )
+        assert len(rows) == 1
+
+    def test_stale_brands_cleaned_from_previous_session(self, db):
+        """Brands from a previous session for now-pending strategies get cleaned."""
+        from monai.business.strategy_lifecycle import StrategyLifecycle
+
+        lifecycle = StrategyLifecycle(db)
+
+        # Strategy is pending (no email), but has stale brand from previous session
+        db.execute_insert(
+            "INSERT INTO strategies (name, category, description, status) "
+            "VALUES ('micro_saas', 'products', 'test', 'pending')"
+        )
+        db.execute_insert(
+            "INSERT INTO brand_social_accounts (brand, platform) "
+            "VALUES ('micro_saas', 'twitter')"
+        )
+        db.execute_insert(
+            "INSERT INTO brand_social_accounts (brand, platform) "
+            "VALUES ('micro_saas', 'reddit')"
+        )
+
+        result = lifecycle.validate_strategies()
+
+        assert result["brands_removed"] >= 1
+        rows = db.execute(
+            "SELECT * FROM brand_social_accounts WHERE brand = 'micro_saas'"
+        )
+        assert len(rows) == 0
+
+
 class TestPlatformIntegration:
     """Test the platform integration base class."""
 

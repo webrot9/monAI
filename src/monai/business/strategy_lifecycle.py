@@ -20,6 +20,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from monai.agents.social_presence import BRAND_PLATFORMS
 from monai.db.database import Database
 
 logger = logging.getLogger(__name__)
@@ -219,20 +220,24 @@ class StrategyLifecycle:
                         f"Strategy '{name}' stays pending — missing: {missing}"
                     )
 
-        # Clean up phantom brand_social_accounts for non-active strategies
-        cleaned = self._cleanup_phantom_brands()
+        # Sync brand_social_accounts with actual strategy states:
+        # - Register brands for newly activated strategies
+        # - Remove brands for paused/pending strategies
+        brands_registered, brands_removed = self._sync_brands(activated, paused)
 
         summary = {
             "activated": activated,
             "paused": paused,
             "already_active": already_ok,
-            "phantom_brands_cleaned": cleaned,
+            "brands_registered": brands_registered,
+            "brands_removed": brands_removed,
         }
-        if activated or paused:
+        if activated or paused or brands_removed:
             logger.info(
                 f"Strategy validation: activated={activated}, "
                 f"paused={[p['name'] for p in paused]}, "
-                f"phantom brands cleaned={cleaned}"
+                f"brands registered={brands_registered}, "
+                f"brands removed={brands_removed}"
             )
         return summary
 
@@ -302,51 +307,56 @@ class StrategyLifecycle:
                     missing.append(req)
         return missing
 
-    def _cleanup_phantom_brands(self) -> int:
-        """Remove brand_social_accounts entries for strategies that aren't active.
+    def _sync_brands(
+        self,
+        activated: list[str],
+        paused: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        """Sync brand_social_accounts to match active strategy set.
 
-        These phantom entries accumulate when register_brand() is called
-        unconditionally for every strategy, even ones that can't execute.
+        - Inserts default brand entries for newly activated strategies.
+        - Deletes brand entries for strategies that are no longer active
+          (paused, pending, or otherwise non-active).
+
+        Returns (registered_count, removed_count).
         """
+        registered = 0
+        removed = 0
+
+        # 1. Register brands for newly activated strategies
+        for name in activated:
+            platforms = BRAND_PLATFORMS.get(name, ["twitter"])
+            for platform in platforms:
+                self.db.execute_insert(
+                    "INSERT OR IGNORE INTO brand_social_accounts "
+                    "(brand, platform, brand_voice) VALUES (?, ?, ?)",
+                    (name, platform, ""),
+                )
+            registered += 1
+            logger.info(f"Registered brand '{name}' (platforms={platforms})")
+
+        # 2. Remove brands for ALL non-active strategies
         try:
-            # Get active strategy names
             active_rows = self.db.execute(
                 "SELECT name FROM strategies WHERE status = 'active'"
             )
             active_names = {r["name"] for r in active_rows}
 
-            if not active_names:
-                # Delete all brand_social_accounts — nothing is active
-                result = self.db.execute(
-                    "SELECT COUNT(*) as cnt FROM brand_social_accounts"
-                )
-                count = result[0]["cnt"] if result else 0
-                if count:
-                    self.db.execute("DELETE FROM brand_social_accounts")
-                    logger.info(f"Cleaned all {count} phantom brand_social_accounts (no active strategies)")
-                return count
-
-            # Get all brands in brand_social_accounts
             brand_rows = self.db.execute(
                 "SELECT DISTINCT brand FROM brand_social_accounts"
             )
-            phantom_brands = [
-                r["brand"] for r in brand_rows if r["brand"] not in active_names
-            ]
-
-            cleaned = 0
-            for brand in phantom_brands:
-                self.db.execute(
-                    "DELETE FROM brand_social_accounts WHERE brand = ?",
-                    (brand,),
-                )
-                cleaned += 1
-                logger.info(f"Cleaned phantom brand_social_accounts for '{brand}'")
-
-            return cleaned
+            for r in brand_rows:
+                if r["brand"] not in active_names:
+                    self.db.execute(
+                        "DELETE FROM brand_social_accounts WHERE brand = ?",
+                        (r["brand"],),
+                    )
+                    removed += 1
+                    logger.info(f"Removed brand '{r['brand']}' (strategy not active)")
         except Exception as e:
-            logger.debug(f"Could not clean phantom brands: {e}")
-            return 0
+            logger.warning(f"Brand cleanup failed: {e}")
+
+        return registered, removed
 
     def demote_active_without_agent(self, registered_agents: set[str]) -> list[str]:
         """Pause active strategies that have no registered agent in memory.
