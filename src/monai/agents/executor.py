@@ -142,6 +142,7 @@ class AutonomousExecutor:
         self._reflection_count = 0
         self._script_target_failures = {}
         self._failed_domains: set[str] = set()  # Domains blocked/failed this task
+        self._visited_urls: set[str] = set()  # URLs already browsed (prevent re-visits)
         start_time = time.time()
         consecutive_failures = 0
         total_failures = 0
@@ -227,13 +228,32 @@ class AutonomousExecutor:
 
                 logger.info(f"Step {step + 1}: {tool}({json.dumps(args)[:200]})")
 
+                # Pre-execution guard: auto-reject browse to exact URL already visited
+                if tool == "browse":
+                    req_url = args.get("url", "")
+                    if req_url and req_url in self._visited_urls:
+                        reject_msg = (
+                            f"AUTO-REJECTED: Already browsed this exact URL. "
+                            f"Use a DIFFERENT URL, or extract data from previous "
+                            f"results, or call done()/fail()."
+                        )
+                        logger.info(reject_msg)
+                        self.action_history.append({
+                            "step": step + 1,
+                            "tool": tool,
+                            "args": args,
+                            "result": reject_msg,
+                        })
+                        total_failures += 1
+                        continue
+
                 # Pre-execution guard: auto-reject browse/http to domains already failed
-                if tool in ("browse", "http_get", "http_post") and self._failed_domains:
+                if tool in ("browse", "http_get", "http_post"):
                     req_url = args.get("url", "")
                     if req_url:
                         from urllib.parse import urlparse as _urlparse
                         req_domain = _urlparse(req_url).netloc
-                        if req_domain in self._failed_domains:
+                        if req_domain and req_domain in self._failed_domains:
                             reject_msg = (
                                 f"AUTO-REJECTED: {req_domain} already failed/blocked "
                                 f"earlier in this task. Try a DIFFERENT domain or "
@@ -304,6 +324,11 @@ class AutonomousExecutor:
                                 self._failed_domains.add(fail_domain)
                 else:
                     consecutive_failures = 0
+                    # Track successfully visited URLs for dedup
+                    if tool == "browse":
+                        browse_url = args.get("url", "")
+                        if browse_url:
+                            self._visited_urls.add(browse_url)
 
                 # Track fill_form partial failures: if the same fields keep
                 # failing across repeated fill_form calls, burn them so the

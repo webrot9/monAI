@@ -266,6 +266,12 @@ class FreeProxyPool:
             )
         except Exception as e:
             logger.error(f"Free proxy pool refresh failed: {e}")
+            # Still mark as initialized to prevent infinite re-trigger loop.
+            # Without this, a failed refresh leaves _initialized=False,
+            # so every get_proxy() call triggers another (doomed) refresh.
+            with self._lock:
+                self._initialized = True
+                self._last_refresh = time.time()
         finally:
             self._refreshing = False
 

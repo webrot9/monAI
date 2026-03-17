@@ -476,6 +476,28 @@ class Provisioner(BaseAgent):
         """
         from monai.utils.telegram import TelegramBot
 
+        # Pre-flight: check if we have the prerequisites to acquire a phone number.
+        # Without a configured SMS verification service (API key + funds),
+        # the executor will burn 15+ LLM steps searching for free phone numbers
+        # and then fail anyway.
+        sms_api_key = getattr(self.config, 'sms_api_key', '') or ''
+        has_payment = bool(self.db.execute(
+            "SELECT 1 FROM identities WHERE type = 'payment_method' AND status = 'active' LIMIT 1"
+        ))
+        if not sms_api_key and not has_payment:
+            logger.warning(
+                "Skipping Telegram bot provisioning: no SMS verification service "
+                "configured and no payment method to acquire one"
+            )
+            return {
+                "status": "failed",
+                "reason": (
+                    "Cannot create Telegram bot: no SMS verification service configured "
+                    "and no payment method to acquire one. Need either sms_api_key in config "
+                    "or a payment method to buy a virtual phone number."
+                ),
+            }
+
         # Get provisioning task from TelegramBot utility
         telegram = TelegramBot(self.config, self.db)
         if telegram.has_token:
