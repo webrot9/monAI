@@ -396,37 +396,53 @@ class FreeProxyPool:
     ) -> list[dict[str, Any]]:
         """Validate proxies by testing connectivity.  Returns working ones."""
         validated = []
-        # Test in parallel using threads (but limit concurrency)
         import concurrent.futures
 
+        # Multiple validation endpoints — httpbin.org gets rate-limited
+        _VALIDATE_URLS = [
+            "https://httpbin.org/ip",
+            "https://api.ipify.org?format=json",
+            "https://ifconfig.me/ip",
+        ]
+
         def _test(proxy: dict) -> dict | None:
-            try:
-                client = httpx.Client(
-                    proxy=proxy["url"],
-                    timeout=VALIDATE_TIMEOUT,
-                    follow_redirects=True,
-                )
+            for check_url in _VALIDATE_URLS:
                 try:
-                    resp = client.get("https://httpbin.org/ip")
-                    if resp.status_code == 200:
-                        return proxy
-                finally:
-                    client.close()
-            except Exception:
-                pass
+                    with httpx.Client(
+                        proxy=proxy["url"],
+                        timeout=VALIDATE_TIMEOUT,
+                        follow_redirects=True,
+                    ) as client:
+                        resp = client.get(check_url)
+                        if resp.status_code == 200:
+                            return proxy
+                except Exception:
+                    continue
             return None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
             futures = {pool.submit(_test, p): p for p in candidates}
-            for future in concurrent.futures.as_completed(futures, timeout=30):
-                try:
-                    result = future.result(timeout=VALIDATE_TIMEOUT + 2)
-                    if result:
-                        validated.append(result)
-                        if len(validated) >= MAX_POOL_SIZE:
-                            break
-                except Exception:
-                    pass
+            try:
+                for future in concurrent.futures.as_completed(futures, timeout=45):
+                    try:
+                        result = future.result(timeout=2)
+                        if result:
+                            validated.append(result)
+                            if len(validated) >= MAX_POOL_SIZE:
+                                break
+                    except Exception:
+                        pass
+            except concurrent.futures.TimeoutError:
+                # Some futures didn't finish — that's OK, we have what we have
+                unfinished = sum(1 for f in futures if not f.done())
+                logger.debug(
+                    f"Proxy validation: {unfinished} of {len(futures)} "
+                    f"still pending after timeout"
+                )
+            finally:
+                # Cancel any still-running futures
+                for f in futures:
+                    f.cancel()
 
         return validated
 
