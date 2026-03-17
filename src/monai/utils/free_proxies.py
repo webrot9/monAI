@@ -405,8 +405,17 @@ class FreeProxyPool:
             "https://ifconfig.me/ip",
         ]
 
+        # Check shutdown flag to abort quickly during graceful shutdown
+        try:
+            from monai.utils.llm import _shutdown_flag
+        except ImportError:
+            _shutdown_flag = None
+
         def _test(proxy: dict) -> dict | None:
             for check_url in _VALIDATE_URLS:
+                # Abort validation if shutdown requested
+                if _shutdown_flag and _shutdown_flag.is_set():
+                    return None
                 try:
                     with httpx.Client(
                         proxy=proxy["url"],
@@ -424,6 +433,10 @@ class FreeProxyPool:
             futures = {pool.submit(_test, p): p for p in candidates}
             try:
                 for future in concurrent.futures.as_completed(futures, timeout=45):
+                    # Abort if shutdown requested
+                    if _shutdown_flag and _shutdown_flag.is_set():
+                        logger.info("Proxy validation aborted: shutdown in progress")
+                        break
                     try:
                         result = future.result(timeout=2)
                         if result:
