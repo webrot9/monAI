@@ -616,6 +616,8 @@ class TestExecutorAssetAwareness:
             executor.memory = MagicMock()
             executor.memory.get_lessons.return_value = []
             executor._script_target_failures = {}
+            executor._failed_domains = set()
+            executor._visited_urls = set()
 
         # Mock AssetManager to return known inventory
         mock_inventory = AssetInventory(assets=[

@@ -1,5 +1,14 @@
 # Lessons Learned
 
+### 2026-03-17 - Three compounding bugs: inflated assets, wrong email detection, wasted LLM calls
+- **Mistake 1**: `verify_stored_assets()` in identity.py had 3 overlapping SQL queries for email accounts. Query #3 had no `type` filter, acting as a superset of queries #1 and #2. Result: 72 "verified" assets when only 2 exist.
+- **Fix**: Consolidated to 2 queries — one for `platform_account` type, one for all other types with `platform='email'`. Eliminates overlap.
+- **Mistake 2**: `_get_asset_inventory()` in strategy_lifecycle.py checked `r["type"] == "email"` to detect emails, but email rows use `type='platform_account'` with `platform='email'`. Emails were never detected → all strategies incorrectly paused for "missing assets: email".
+- **Fix**: Changed check to `r["platform"] == "email"` — matches how email rows are actually stored.
+- **Mistake 3**: Growth hacker launched browser sessions for LinkedIn experiments without checking if LinkedIn credentials exist. 4 experiments × 1 browser each = 4 wasted browser sessions + ~20 LLM calls, all failing at login.
+- **Fix**: Added `_detect_platform()` and credential pre-flight check in `_implement_experiment()`. Now skips experiments targeting platforms with missing/incomplete credentials before spawning a browser.
+- **Rule**: Always validate credentials exist BEFORE launching expensive resources (browsers, LLM loops). Check field names match actual DB schema, not assumed names. Test overlapping queries for duplicates.
+
 ### 2026-03-17 - Phantom strategies: DB entries persist across sessions without asset validation
 - **Mistake**: `init_strategies()` inserts 14 strategies with `status='active'` unconditionally if the table is empty. These persist across daemon restarts. The system then "believes" it has strategies like domain_flipping, saas, print_on_demand even though it has no domains, payment methods, or platform accounts. `register_strategy()` unconditionally calls `social_presence.register_brand()` for every strategy, creating phantom brand_social_accounts entries. Risk manager's `get_active_strategy_count()` counts all DB rows WHERE status='active', inflating the health check. User asked to fix this **multiple times** across sessions.
 - **Root cause**: No asset validation gate between DB strategy registration and activation. `init_strategies()` defaults to 'active'. No cleanup mechanism exists — `strategy_lifecycle.py` has pause/stop but no validation or pruning. `register_brand()` called for every strategy regardless of capability. Across restarts, DB retains stale state from previous sessions.

@@ -252,7 +252,7 @@ class StrategyLifecycle:
                 "SELECT type, platform, status FROM identities WHERE status = 'active'"
             )
             for r in rows:
-                if r["type"] == "email":
+                if r["platform"] == "email":
                     inventory["has_email"] = True
                 elif r["type"] == "platform_account":
                     inventory["platforms"].add(r["platform"])
@@ -317,8 +317,14 @@ class StrategyLifecycle:
 
             if not active_names:
                 # Delete all brand_social_accounts — nothing is active
-                self.db.execute("DELETE FROM brand_social_accounts")
-                return -1  # Signal: all cleaned
+                result = self.db.execute(
+                    "SELECT COUNT(*) as cnt FROM brand_social_accounts"
+                )
+                count = result[0]["cnt"] if result else 0
+                if count:
+                    self.db.execute("DELETE FROM brand_social_accounts")
+                    logger.info(f"Cleaned all {count} phantom brand_social_accounts (no active strategies)")
+                return count
 
             # Get all brands in brand_social_accounts
             brand_rows = self.db.execute(

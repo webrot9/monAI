@@ -106,6 +106,8 @@ class AutonomousExecutor:
         # Per-target script failure counter: selector → count
         # Prevents run_page_script from retrying the same DOM target 25 times
         self._script_target_failures: dict[str, int] = {}
+        self._failed_domains: set[str] = set()
+        self._visited_urls: set[str] = set()
         self.memory = SharedMemory(db)
 
         # Dynamic tool registry — agents can create tools at runtime

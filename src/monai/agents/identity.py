@@ -297,19 +297,14 @@ class IdentityManager:
             "FROM identities WHERE type = 'platform_account' "
             "AND platform = 'email' AND status = 'active'"
         )
-        # Also check the primary email
-        primary_rows = self.db.execute(
+        # Also check agent_identity emails and any other type with platform='email'
+        other_email_rows = self.db.execute(
             "SELECT id, platform, identifier, credentials, metadata "
-            "FROM identities WHERE type = 'agent_identity' "
-            "AND status = 'active' AND platform = 'email'"
-        )
-        # And explicit email type
-        email_type_rows = self.db.execute(
-            "SELECT id, platform, identifier, credentials, metadata "
-            "FROM identities WHERE platform = 'email' AND status = 'active'"
+            "FROM identities WHERE type != 'platform_account' "
+            "AND platform = 'email' AND status = 'active'"
         )
 
-        all_email_rows = {r["id"]: r for r in [*email_rows, *primary_rows, *email_type_rows]}
+        all_email_rows = {r["id"]: r for r in [*email_rows, *other_email_rows]}
         for row in all_email_rows.values():
             row = dict(row)
             try:

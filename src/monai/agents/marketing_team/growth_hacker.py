@@ -305,11 +305,57 @@ class GrowthHacker(BaseAgent):
 
         return stats
 
+    # Platforms that require login credentials to implement experiments.
+    _PLATFORM_KEYWORDS = {
+        "linkedin": "linkedin",
+        "twitter": "twitter",
+        "reddit": "reddit",
+        "facebook": "facebook",
+        "instagram": "instagram",
+        "tiktok": "tiktok",
+    }
+
+    def _detect_platform(self, experiment: dict) -> str | None:
+        """Detect which platform an experiment targets from its text fields."""
+        text = " ".join([
+            experiment.get("name", ""),
+            experiment.get("implementation", ""),
+            experiment.get("variant_a", ""),
+            experiment.get("variant_b", ""),
+        ]).lower()
+        for keyword, platform in self._PLATFORM_KEYWORDS.items():
+            if keyword in text:
+                return platform
+        return None
+
     def _implement_experiment(self, experiment: dict, strategy: str) -> dict[str, Any]:
         """Implement an experiment via real platform action."""
         impl = experiment.get("implementation", "")
         if not impl:
             return {"status": "skipped", "reason": "No implementation specified"}
+
+        # Pre-flight: check if experiment requires a platform with login credentials
+        platform = self._detect_platform(experiment)
+        if platform:
+            account = self.identity.get_account(platform)
+            if not account or not account.get("credentials"):
+                logger.info(
+                    f"Skipping experiment '{experiment.get('name', '')}' — "
+                    f"no {platform} credentials available"
+                )
+                return {"status": "error", "reason": f"No {platform} credentials available"}
+
+            from monai.social.api import get_required_credential_fields
+            required = get_required_credential_fields(platform)
+            if required:
+                creds = account["credentials"]
+                missing = [f for f in required if not creds.get(f)]
+                if missing:
+                    logger.info(
+                        f"Skipping experiment '{experiment.get('name', '')}' — "
+                        f"{platform} missing required fields: {missing}"
+                    )
+                    return {"status": "error", "reason": f"{platform} missing: {missing}"}
 
         try:
             return self.execute_task(
