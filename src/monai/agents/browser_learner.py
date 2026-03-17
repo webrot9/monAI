@@ -133,6 +133,11 @@ class BrowserLearner:
             "last-name": 'input[name="last-name"]',
             "email-address": "#email-address",
             "password": "#password",
+            # LinkedIn login form (homepage / login page)
+            "input[name='session_key']": "#session_key",
+            "input[name='session_password']": "#session_password",
+            "session_key": "#session_key",
+            "session_password": "#session_password",
         },
     }
 
@@ -215,7 +220,13 @@ class BrowserLearner:
         start = time.time()
 
         # 1. Check if we already learned a better selector
-        effective = self._get_known_selector(domain, selector) or selector
+        known = self._get_known_selector(domain, selector)
+        if known == "__MISSING__":
+            logger.info(
+                f"Click skipped: '{selector}' known missing on {domain}")
+            return {"success": False, "skipped": True,
+                    "error": f"Field '{selector}' known missing on {domain}"}
+        effective = known or selector
 
         try:
             await self._human_delay(short=True)
@@ -273,7 +284,13 @@ class BrowserLearner:
         start = time.time()
 
         # Check if we already learned a better selector
-        effective = self._get_known_selector(domain, selector) or selector
+        known = self._get_known_selector(domain, selector)
+        if known == "__MISSING__":
+            logger.info(
+                f"Type skipped: '{selector}' known missing on {domain}")
+            return {"success": False, "skipped": True,
+                    "error": f"Field '{selector}' known missing on {domain}"}
+        effective = known or selector
 
         try:
             if human_like:

@@ -43,10 +43,9 @@ _SAFE_ENV_KEYS = {
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "LC_CTYPE",
     "TERM", "SHELL", "TMPDIR", "TZ",
     "PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED",
-    "VIRTUAL_ENV",  # Needed so bwrap can bind-mount the venv
+    "VIRTUAL_ENV",  # needed so bwrap bind-mounts the venv directory
     "NODE_PATH", "NODE_ENV",
     "PIP_NO_WARN_SCRIPT_LOCATION",
-    "VIRTUAL_ENV",
     "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
 }

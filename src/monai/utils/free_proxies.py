@@ -32,8 +32,26 @@ logger = logging.getLogger(__name__)
 FREE_PROXY_SOURCES = [
     {
         "name": "geonode",
-        "url": "https://proxylist.geonode.com/api/proxy-list?limit=50&page=1&sort_by=lastChecked&sort_type=desc&protocols=socks5%2Csocks4&anonymityLevel=elite%2Canonymous",
+        # Include HTTP/HTTPS too — SOCKS-only filter often returns empty
+        "url": "https://proxylist.geonode.com/api/proxy-list?limit=50&page=1&sort_by=lastChecked&sort_type=desc&anonymityLevel=elite%2Canonymous",
         "parser": "geonode_json",
+    },
+    {
+        # proxyscrape provides a plain-text API — no JS rendering needed
+        "name": "proxyscrape-socks5",
+        "url": "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all&ssl=all&anonymity=all",
+        "parser": "plain_text_socks5",
+    },
+    {
+        "name": "proxyscrape-http",
+        "url": "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=yes&anonymity=elite",
+        "parser": "plain_text_http",
+    },
+    {
+        # proxifly GitHub maintains auto-updated proxy lists
+        "name": "proxifly-socks5",
+        "url": "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+        "parser": "plain_text_socks5",
     },
     {
         "name": "free-proxy-list",
@@ -255,6 +273,10 @@ class FreeProxyPool:
                 return self._parse_geonode(resp.json())
             elif source["parser"] == "html_table":
                 return self._parse_html_table(resp.text)
+            elif source["parser"] == "plain_text_socks5":
+                return self._parse_plain_text(resp.text, "socks5")
+            elif source["parser"] == "plain_text_http":
+                return self._parse_plain_text(resp.text, "http")
             return []
         finally:
             client.close()
@@ -291,9 +313,14 @@ class FreeProxyPool:
 
     @staticmethod
     def _parse_html_table(html: str) -> list[dict[str, Any]]:
-        """Parse free-proxy-list.net style HTML tables."""
+        """Parse free-proxy-list.net style HTML tables.
+
+        Tries two patterns: the classic 7-column format, and a more
+        relaxed pattern that just extracts IP:Port from table rows
+        (handles JS-rendered or restructured tables).
+        """
         proxies = []
-        # Match rows: IP, Port, Country, ..., Https
+        # Pattern 1: Classic 7-column format
         rows = re.findall(
             r"<tr><td>(\d+\.\d+\.\d+\.\d+)</td><td>(\d+)</td>"
             r"<td>(\w+)</td><td>(\w+)</td>"
@@ -306,12 +333,43 @@ class FreeProxyPool:
             ip, port = row[0], row[1]
             country = row[2]
             https = row[6].lower() == "yes"
-            # Only take HTTPS-capable proxies
             if https:
                 proxies.append({
                     "url": f"http://{ip}:{port}",
                     "protocol": "https",
                     "country": country,
+                })
+
+        # Pattern 2: Relaxed fallback — extract any IP:Port from <td> tags
+        if not proxies:
+            rows = re.findall(
+                r"<td[^>]*>(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})</td>"
+                r"\s*<td[^>]*>(\d{2,5})</td>",
+                html,
+            )
+            for ip, port in rows:
+                proxies.append({
+                    "url": f"http://{ip}:{port}",
+                    "protocol": "http",
+                    "country": "",
+                })
+        return proxies
+
+    @staticmethod
+    def _parse_plain_text(text: str, protocol: str) -> list[dict[str, Any]]:
+        """Parse plain-text proxy lists (IP:Port per line)."""
+        proxies = []
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            match = re.match(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{2,5})", line)
+            if match:
+                ip, port = match.group(1), match.group(2)
+                proxies.append({
+                    "url": f"{protocol}://{ip}:{port}",
+                    "protocol": protocol,
+                    "country": "",
                 })
         return proxies
 
