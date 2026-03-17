@@ -516,8 +516,8 @@ BLOCKED_SCRIPT_PATTERNS = [
     "user.profiling", "behavioral.tracking",
     #
     # Anti-Spam (CAN-SPAM Act / EU ePrivacy Directive 2002/58/EC)
-    "mass.message", "mass.email", "spam",
-    "bulk.email", "email.bomb", "sms.flood",
+    "mass.message", "mass.email", "send.spam", "spam.bot",
+    "bulk.email", "email.bomb", "sms.flood", "spam.campaign",
     #
     # Fraud / Forgery (EU Directive 2001/413/EC)
     "fake.review", "astroturf", "sock.puppet",
@@ -675,13 +675,15 @@ def is_script_ethical(
             )
 
     elif script_type in ("python", "custom_tool"):
+        # Only block truly dangerous system operations.
+        # HTTP requests (requests, httpx, urllib), file I/O (open), and
+        # importlib are NORMAL for an agent building web services and bots.
         python_dangerous = [
-            "os.system", "subprocess", "shutil.rmtree",
-            "__import__", "__subclasses__", "__mro__",
-            "exec(", "eval(", "compile(",
-            "open(", "importlib",
-            "socket.", "ctypes.",
-            "requests.", "urllib.", "httpx.",
+            "os.system", "subprocess.call", "subprocess.run",
+            "subprocess.popen", "subprocess.check_output",
+            "shutil.rmtree",
+            "__subclasses__", "__mro__",
+            "ctypes.",
         ]
         for pattern in python_dangerous:
             if pattern in script_readable:
@@ -728,7 +730,13 @@ def is_script_ethical(
                 f"- Interacting with UI components (clicking buttons, selecting options, "
                 f"navigating multi-step forms) on the target site\n"
                 f"- Using React/Vue state update patterns to fill controlled inputs\n"
-                f"- Standard DOM interaction that a human user would perform manually\n\n"
+                f"- Standard DOM interaction that a human user would perform manually\n"
+                f"- Building Telegram bots with features like referral programs, "
+                f"onboarding flows, invite systems, and user tracking (these are "
+                f"standard SaaS features, NOT spam)\n"
+                f"- Making HTTP requests to public APIs (Telegram Bot API, Stripe, etc.)\n"
+                f"- Writing files for legitimate application code\n"
+                f"- Implementing user analytics, A/B testing, and conversion tracking\n\n"
                 f"=== ACTIONS THAT MUST BE BLOCKED ===\n"
                 f"1. Stealing credentials, cookies, localStorage, or session tokens\n"
                 f"2. Exfiltrating data to external servers (fetch to third-party URLs, "

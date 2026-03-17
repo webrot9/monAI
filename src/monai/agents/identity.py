@@ -355,7 +355,55 @@ class IdentityManager:
                     f"email:{identifier} — no inbox_id, suspended as unverifiable")
                 logger.warning(f"Email suspended (no inbox_id, not temp): {identifier}")
 
-        # 2. Verify Mailslurp API key itself
+        # 2. Verify platform account credentials (catch phantoms)
+        # Platforms requiring OAuth tokens should have them — password-only
+        # accounts are unusable phantoms that mislead the LLM.
+        try:
+            from monai.social.api import get_required_credential_fields
+        except ImportError:
+            get_required_credential_fields = None
+
+        if get_required_credential_fields:
+            acct_rows = self.db.execute(
+                "SELECT id, platform, identifier, credentials, metadata "
+                "FROM identities WHERE type = 'platform_account' "
+                "AND platform != 'email' AND status = 'active'"
+            )
+            for row in acct_rows:
+                row = dict(row)
+                platform = row.get("platform", "")
+                identifier = row.get("identifier", "?")
+                required = get_required_credential_fields(platform)
+                if not required:
+                    results["verified"].append(f"account:{platform}:{identifier}")
+                    continue
+
+                creds = self._decrypt_credentials(row.get("credentials"))
+                if not creds:
+                    creds = {}
+                missing = [f for f in required if not creds.get(f)]
+                if missing:
+                    # Mark as incomplete in metadata so summary() can filter
+                    try:
+                        meta = json.loads(row.get("metadata") or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        meta = {}
+                    meta["credential_status"] = "incomplete"
+                    meta["missing_fields"] = missing
+                    self.db.execute(
+                        "UPDATE identities SET metadata = ? WHERE id = ?",
+                        (json.dumps(meta), row["id"]),
+                    )
+                    results["errors"].append(
+                        f"account:{platform}:{identifier} — "
+                        f"missing required fields: {missing}")
+                    logger.warning(
+                        f"Platform account {platform} ({identifier}) "
+                        f"missing required fields {missing} — marked incomplete")
+                else:
+                    results["verified"].append(f"account:{platform}:{identifier}")
+
+        # 3. Verify Mailslurp API key itself
         if email_verifier:
             ms_key = email_verifier._mailslurp_key() if hasattr(
                 email_verifier, '_mailslurp_key') else ""
