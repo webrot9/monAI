@@ -296,11 +296,11 @@ class Coder:
 
     def _run_tests(self, test_path: Path, work_dir: Path) -> dict[str, Any]:
         from monai.utils.sandbox import sandbox_run
-        # Use "python3" from PATH instead of sys.executable — the absolute
-        # path may not exist inside the bwrap sandbox if venv layout differs
-        python = sys.executable if os.path.isfile(sys.executable) else "python3"
+        # Always use "python3" from PATH — sys.executable may point to a
+        # different venv than VIRTUAL_ENV, and bwrap only bind-mounts the
+        # latter. PATH already includes $VIRTUAL_ENV/bin.
         result = sandbox_run(
-            [python, "-m", "pytest", str(test_path), "-v", "--tb=short"],
+            ["python3", "-m", "pytest", str(test_path), "-v", "--tb=short"],
             cwd=work_dir,
             timeout=60,
             allowed_paths=[work_dir],
@@ -314,7 +314,7 @@ class Coder:
     def _run_script(self, script_path: Path) -> dict[str, Any]:
         from monai.utils.sandbox import sandbox_run
         return sandbox_run(
-            [sys.executable, str(script_path)],
+            ["python3", str(script_path)],
             cwd=script_path.parent,
             timeout=60,
             allowed_paths=[script_path.parent],

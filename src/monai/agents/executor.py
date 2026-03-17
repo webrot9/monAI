@@ -309,20 +309,28 @@ class AutonomousExecutor:
                     "tool": tool,
                     "args": args,
                     "result": result_str[:1000],
+                    "is_failure": is_failure,
                 })
 
-                # Watchdog: detect stuck loops (same non-failing tool+args+result 4+ times)
-                # Only fires when the LLM keeps doing the exact same thing with same outcome
-                if len(self.action_history) >= 4 and not is_failure:
-                    last4 = self.action_history[-4:]
-                    sigs = [
+                # Watchdog: detect stuck loops
+                # Layer 1: same tool+args+result 3+ times (exact repeat)
+                # Layer 2: same tool+args 3+ times AND none were failures
+                #          (e.g. browse keeps hitting same URL with slightly different page)
+                if len(self.action_history) >= 3 and not is_failure:
+                    last3 = self.action_history[-3:]
+                    full_sigs = [
                         (a["tool"], json.dumps(a["args"], sort_keys=True), a["result"][:200])
-                        for a in last4
+                        for a in last3
                     ]
-                    if len(set(sigs)) == 1:
+                    args_sigs = [
+                        (a["tool"], json.dumps(a["args"], sort_keys=True))
+                        for a in last3
+                    ]
+                    all_non_failure = not any(a.get("is_failure") for a in last3)
+                    if len(set(full_sigs)) == 1 or (len(set(args_sigs)) == 1 and all_non_failure):
                         reason = (
-                            f"Stuck loop: {tool} called 4 times with identical "
-                            f"args and result — aborting to prevent waste"
+                            f"Stuck loop: {tool} called 3 times with identical "
+                            f"args — aborting to prevent waste"
                         )
                         logger.warning(reason)
                         self._log_task(task, "stuck_loop", reason)
