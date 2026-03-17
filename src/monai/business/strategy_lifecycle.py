@@ -128,3 +128,241 @@ class StrategyLifecycle:
             "SELECT status, COUNT(*) as count FROM strategies GROUP BY status"
         )
         return {r["status"]: r["count"] for r in rows}
+
+    # ── Asset-gated strategy validation ──────────────────────────
+
+    # Minimum assets each strategy needs before it can be activated.
+    # Keys: email, platform:<name>, domain, payment, api_key:<name>
+    # "email" is the baseline — almost every strategy needs it.
+    STRATEGY_REQUIREMENTS: dict[str, list[str]] = {
+        # Can start with just email (outreach-based)
+        "freelance_writing": ["email"],
+        "cold_outreach": ["email"],
+        "lead_gen": ["email"],
+
+        # Need email + platform accounts
+        "social_media": ["email", "platform:linkedin"],
+        "content_sites": ["email", "domain"],
+        "newsletter": ["email"],
+        "affiliate": ["email"],
+
+        # Need payment infrastructure
+        "digital_products": ["email", "payment"],
+        "micro_saas": ["email", "payment"],
+        "telegram_bots": ["email"],
+        "course_creation": ["email", "payment"],
+
+        # Need significant infrastructure
+        "domain_flipping": ["email", "payment", "domain"],
+        "print_on_demand": ["email", "payment"],
+        "saas": ["email", "payment", "domain"],
+    }
+
+    def validate_strategies(self) -> dict[str, Any]:
+        """Check all strategies against actual assets and activate/deactivate accordingly.
+
+        - pending strategies with all requirements met → activate
+        - active strategies missing requirements → pause
+        - Cleans up brand_social_accounts for non-active strategies
+
+        Returns summary of changes made.
+        """
+        # Build asset inventory from DB
+        assets = self._get_asset_inventory()
+
+        all_strategies = self.db.execute(
+            "SELECT id, name, status FROM strategies WHERE status != 'stopped'"
+        )
+
+        activated = []
+        paused = []
+        already_ok = []
+
+        for row in all_strategies:
+            sid = row["id"]
+            name = row["name"]
+            status = row["status"]
+            requirements = self.STRATEGY_REQUIREMENTS.get(name, ["email"])
+            missing = self._check_requirements(requirements, assets)
+
+            if not missing:
+                # Requirements met
+                if status == "pending":
+                    try:
+                        self.activate(sid, reason="asset requirements met")
+                        activated.append(name)
+                    except InvalidTransitionError:
+                        pass
+                elif status == "active":
+                    already_ok.append(name)
+                elif status == "paused":
+                    # Check if it was paused due to missing assets (not manual pause)
+                    # Re-activate only if previously paused by validation
+                    try:
+                        self.activate(sid, reason="asset requirements now met")
+                        activated.append(name)
+                    except InvalidTransitionError:
+                        pass
+            else:
+                # Requirements NOT met
+                if status == "active":
+                    try:
+                        self.pause(
+                            sid,
+                            reason=f"missing assets: {', '.join(missing)}",
+                        )
+                        paused.append({"name": name, "missing": missing})
+                    except InvalidTransitionError:
+                        pass
+                elif status == "pending":
+                    logger.debug(
+                        f"Strategy '{name}' stays pending — missing: {missing}"
+                    )
+
+        # Clean up phantom brand_social_accounts for non-active strategies
+        cleaned = self._cleanup_phantom_brands()
+
+        summary = {
+            "activated": activated,
+            "paused": paused,
+            "already_active": already_ok,
+            "phantom_brands_cleaned": cleaned,
+        }
+        if activated or paused:
+            logger.info(
+                f"Strategy validation: activated={activated}, "
+                f"paused={[p['name'] for p in paused]}, "
+                f"phantom brands cleaned={cleaned}"
+            )
+        return summary
+
+    def _get_asset_inventory(self) -> dict[str, Any]:
+        """Query DB for actual assets the system owns."""
+        inventory: dict[str, Any] = {
+            "has_email": False,
+            "platforms": set(),
+            "has_domain": False,
+            "has_payment": False,
+            "api_keys": set(),
+        }
+
+        # Check identities table for email, platform accounts
+        try:
+            rows = self.db.execute(
+                "SELECT type, platform, status FROM identities WHERE status = 'active'"
+            )
+            for r in rows:
+                if r["type"] == "email":
+                    inventory["has_email"] = True
+                elif r["type"] == "platform_account":
+                    inventory["platforms"].add(r["platform"])
+                elif r["type"] == "domain":
+                    inventory["has_domain"] = True
+                elif r["type"] in ("payment_method", "payment"):
+                    inventory["has_payment"] = True
+                elif r["type"] == "api_key":
+                    inventory["api_keys"].add(r["platform"])
+        except Exception as e:
+            logger.debug(f"Could not query identities: {e}")
+
+        # Also check payment_accounts table if it exists
+        try:
+            rows = self.db.execute(
+                "SELECT 1 FROM payment_accounts WHERE status = 'active' LIMIT 1"
+            )
+            if rows:
+                inventory["has_payment"] = True
+        except Exception:
+            pass
+
+        return inventory
+
+    def _check_requirements(
+        self, requirements: list[str], assets: dict[str, Any]
+    ) -> list[str]:
+        """Return list of unmet requirements (empty = all met)."""
+        missing = []
+        for req in requirements:
+            if req == "email":
+                if not assets["has_email"]:
+                    missing.append("email")
+            elif req.startswith("platform:"):
+                platform = req.split(":", 1)[1]
+                if platform not in assets["platforms"]:
+                    missing.append(req)
+            elif req == "domain":
+                if not assets["has_domain"]:
+                    missing.append("domain")
+            elif req == "payment":
+                if not assets["has_payment"]:
+                    missing.append("payment")
+            elif req.startswith("api_key:"):
+                provider = req.split(":", 1)[1]
+                if provider not in assets["api_keys"]:
+                    missing.append(req)
+        return missing
+
+    def _cleanup_phantom_brands(self) -> int:
+        """Remove brand_social_accounts entries for strategies that aren't active.
+
+        These phantom entries accumulate when register_brand() is called
+        unconditionally for every strategy, even ones that can't execute.
+        """
+        try:
+            # Get active strategy names
+            active_rows = self.db.execute(
+                "SELECT name FROM strategies WHERE status = 'active'"
+            )
+            active_names = {r["name"] for r in active_rows}
+
+            if not active_names:
+                # Delete all brand_social_accounts — nothing is active
+                self.db.execute("DELETE FROM brand_social_accounts")
+                return -1  # Signal: all cleaned
+
+            # Get all brands in brand_social_accounts
+            brand_rows = self.db.execute(
+                "SELECT DISTINCT brand FROM brand_social_accounts"
+            )
+            phantom_brands = [
+                r["brand"] for r in brand_rows if r["brand"] not in active_names
+            ]
+
+            cleaned = 0
+            for brand in phantom_brands:
+                self.db.execute(
+                    "DELETE FROM brand_social_accounts WHERE brand = ?",
+                    (brand,),
+                )
+                cleaned += 1
+                logger.info(f"Cleaned phantom brand_social_accounts for '{brand}'")
+
+            return cleaned
+        except Exception as e:
+            logger.debug(f"Could not clean phantom brands: {e}")
+            return 0
+
+    def demote_active_without_agent(self, registered_agents: set[str]) -> list[str]:
+        """Pause active strategies that have no registered agent in memory.
+
+        This catches the case where DB says a strategy is 'active' but
+        no Python agent object was registered for it (e.g. from a
+        previous session that registered different strategies).
+        """
+        active = self.db.execute(
+            "SELECT id, name FROM strategies WHERE status = 'active'"
+        )
+        demoted = []
+        for row in active:
+            if row["name"] not in registered_agents:
+                try:
+                    self.pause(
+                        row["id"],
+                        reason="no agent registered in current session",
+                    )
+                    demoted.append(row["name"])
+                except InvalidTransitionError:
+                    pass
+        if demoted:
+            logger.info(f"Demoted strategies without agents: {demoted}")
+        return demoted

@@ -71,7 +71,14 @@ signal.signal(signal.SIGTERM, _handle_signal)
 
 
 def init_strategies(db: Database):
-    """Seed initial strategies if none exist."""
+    """Seed initial strategies if none exist.
+
+    Strategies start as 'pending' — they are only activated by
+    validate_strategies() after checking that the required assets
+    (email, platform accounts, payment methods, domains, etc.)
+    actually exist.  This prevents phantom strategies that the
+    system is "convinced" it has but can't actually execute.
+    """
     existing = db.execute("SELECT COUNT(*) as count FROM strategies")
     if existing[0]["count"] > 0:
         return
@@ -94,11 +101,11 @@ def init_strategies(db: Database):
     ]
     for name, category, description, budget in strategies:
         db.execute_insert(
-            "INSERT INTO strategies (name, category, description, allocated_budget) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO strategies (name, category, description, allocated_budget, status) "
+            "VALUES (?, ?, ?, ?, 'pending')",
             (name, category, description, budget),
         )
-    logger.info(f"Initialized {len(strategies)} default strategies")
+    logger.info(f"Initialized {len(strategies)} strategies as 'pending' (will activate after asset validation)")
 
 
 def create_orchestrator(config: Config) -> tuple[Orchestrator, Database]:
@@ -169,6 +176,25 @@ def create_orchestrator(config: Config) -> tuple[Orchestrator, Database]:
     saas_llm = LLM(config, caller="saas")
     saas_llm.set_db(db)
     orchestrator.register_strategy(SaaSAgent(config, db, saas_llm))
+
+    # ── Startup strategy validation ──────────────────────────────
+    # 1. Demote any 'active' strategies that have no registered agent
+    #    (phantom entries from previous sessions)
+    registered_names = set(orchestrator._strategy_agents.keys())
+    demoted = orchestrator.strategy_lifecycle.demote_active_without_agent(registered_names)
+    if demoted:
+        logger.warning(f"Demoted phantom strategies without agents: {demoted}")
+
+    # 2. Validate all strategies against actual asset inventory —
+    #    only activate strategies whose requirements are met
+    validation = orchestrator.strategy_lifecycle.validate_strategies()
+    active = validation.get("activated", []) + validation.get("already_active", [])
+    paused = [p["name"] if isinstance(p, dict) else p for p in validation.get("paused", [])]
+    logger.info(
+        f"Strategy validation complete: "
+        f"{len(active)} active, {len(paused)} paused, "
+        f"{validation.get('phantom_brands_cleaned', 0)} phantom brands cleaned"
+    )
 
     return orchestrator, db
 
