@@ -256,11 +256,24 @@ class Orchestrator(BaseAgent):
         # Gather recent failure lessons so the LLM doesn't repeat mistakes
         failure_lessons = self._get_strategy_failure_context()
 
+        # Build asset inventory so the LLM knows what's actually available
+        account_list = [{"platform": a["platform"], "type": a["type"]} for a in accounts]
+        platforms_available = list({a["platform"] for a in accounts})
+        has_domains = any(a["type"] == "domain" for a in accounts)
+        has_payment = any(a["type"] in ("payment", "stripe", "paypal", "crypto") for a in accounts)
+        has_email = any(a["type"] == "email" or a["platform"] == "email" for a in accounts)
+
         context = json.dumps({
             "portfolio_health": health,
             "identity": identity,
             "accounts_count": len(accounts),
-            "accounts": [{"platform": a["platform"], "type": a["type"]} for a in accounts],
+            "accounts": account_list,
+            "asset_summary": {
+                "platforms": platforms_available,
+                "has_domain": has_domains,
+                "has_payment_method": has_payment,
+                "has_email": has_email,
+            },
             "monthly_resource_costs": resource_costs,
             "client_pipeline": pipeline,
             "total_revenue": self.finance.get_total_revenue(),
@@ -277,6 +290,11 @@ class Orchestrator(BaseAgent):
             "- Each action MUST be specific and actionable, not vague. "
             "BAD: 'explore new revenue streams'. "
             "GOOD: 'bid on 3 copywriting gigs on Upwork'.\n"
+            "- ONLY plan actions you can ACTUALLY EXECUTE with your current assets. "
+            "Check the asset_summary in the context:\n"
+            "  * No domain? Do NOT plan SEO content, blog posts, or website work.\n"
+            "  * No payment method? Do NOT plan paid ads or campaigns requiring payment.\n"
+            "  * Only have email + LinkedIn? Focus on outreach, freelancing, LinkedIn content.\n"
             "- Each sub-agent task MUST include ALL details needed to execute "
             "(platform names, URLs, credentials to use, exact deliverables).\n"
             "- Do NOT delegate research-only tasks to sub-agents — they have "
@@ -284,7 +302,7 @@ class Orchestrator(BaseAgent):
             "- Max 5 actions per cycle to stay within LLM budget.\n\n"
             "Consider:\n"
             "1. CLIENT WORK: Who needs follow-up? What work needs delivering?\n"
-            "2. MARKETING: Should I do outreach, post content, bid on jobs?\n"
+            "2. MARKETING: Only via channels you actually have accounts on.\n"
             "3. OPTIMIZATION: Which strategies are working? Scale winners, cut losers.\n\n"
             "Return: {\"actions\": [{\"action\": str, \"priority\": int (1=highest), "
             "\"reason\": str, \"delegate_to_subagent\": bool}]}",

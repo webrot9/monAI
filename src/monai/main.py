@@ -57,7 +57,8 @@ def _handle_signal(signum, frame):
     if _shutdown:
         # Second signal — force exit immediately
         logger.warning("Force shutdown (second signal). Exiting now.")
-        sys.exit(1)
+        import os
+        os._exit(1)
     logger.info("Shutdown signal received. Finishing current cycle...")
     _shutdown = True
     # Signal LLM layer to abort in-flight calls immediately
@@ -193,7 +194,7 @@ def _start_webhook_server(orchestrator, webhook_port: int = 8420):
     def _run():
         asyncio.set_event_loop(loop)
         loop.run_until_complete(webhook_server.start())
-        loop.run_until_complete(webhook_server._server.serve_forever())
+        loop.run_forever()
 
     thread = threading.Thread(target=_run, daemon=True, name="webhook-server")
     thread.start()
@@ -313,10 +314,13 @@ def run_daemon(config: Config, cycle_interval: int = 300):
     # Shut down webhook server cleanly
     if webhook_server and webhook_loop:
         try:
-            webhook_loop.call_soon_threadsafe(webhook_loop.stop)
-            logger.info("Webhook server stopped")
+            # Stop the server first (closes listening socket), then stop the loop
+            future = asyncio.run_coroutine_threadsafe(webhook_server.stop(), webhook_loop)
+            future.result(timeout=5)
         except Exception as e:
             logger.warning(f"Error stopping webhook server: {e}")
+        finally:
+            webhook_loop.call_soon_threadsafe(webhook_loop.stop)
 
     logger.info("monAI shut down gracefully.")
 
