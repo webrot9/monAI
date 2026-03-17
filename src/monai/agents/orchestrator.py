@@ -992,6 +992,10 @@ class Orchestrator(BaseAgent):
         "domain_flipping": [],  # Paid via marketplace (Sedo, etc.)
     }
 
+    # Payment providers that require direct internet access (block Tor/proxies).
+    # These will be skipped when operating behind Tor or anonymous proxies.
+    TOR_BLOCKED_PROVIDERS: set[str] = {"stripe", "gumroad", "lemonsqueezy"}
+
     # Self-healing configuration for strategy proxy failures.
     # Instead of a static blocklist, strategies are allowed to try and
     # auto-pause only after real failures.  They periodically retry with
@@ -1019,6 +1023,10 @@ class Orchestrator(BaseAgent):
             if not active_strategies:
                 return
 
+            # Skip payment provider registration entirely when behind Tor/proxy —
+            # Stripe, Gumroad, etc. block anonymous access and will always fail.
+            is_proxied = self.config.privacy.proxy_type != "none"
+
             provisioned = []
             failed_providers: set[str] = set()  # Track providers that failed this cycle
             for row in active_strategies:
@@ -1028,6 +1036,15 @@ class Orchestrator(BaseAgent):
                     continue
                 needed_providers = self.STRATEGY_PAYMENT_PROVIDERS.get(strategy_name, [])
                 for provider in needed_providers:
+                    # Skip Tor-blocked providers when behind proxy
+                    if is_proxied and provider in self.TOR_BLOCKED_PROVIDERS:
+                        self.log_action(
+                            "auto_provision_payment",
+                            f"Strategy '{strategy_name}' needs {provider} — "
+                            f"skipping (blocks Tor/proxy, need direct connection)",
+                        )
+                        continue
+
                     # Skip providers that already failed this cycle
                     if provider in failed_providers:
                         self.log_action(
@@ -1344,6 +1361,13 @@ class Orchestrator(BaseAgent):
         """
         if not force and self._cycle > 1 and self._cycle % 5 != 1:
             return {"status": "skipped", "reason": "not_provisioning_cycle"}
+
+        # All payment providers (Stripe, Gumroad, LemonSqueezy) block Tor.
+        # Skip entirely when behind proxy to avoid wasting LLM calls and
+        # burning temp emails on registrations that will always fail.
+        if self.config.privacy.proxy_type != "none":
+            return {"status": "skipped",
+                    "reason": "payment_providers_block_tor"}
 
         try:
             plan = self.api_provisioner.plan()

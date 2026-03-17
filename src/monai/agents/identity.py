@@ -322,8 +322,11 @@ class IdentityManager:
                 inbox_id = creds.get("inbox_id")
             identifier = row.get("identifier", "?")
 
+            # Determine email type from metadata
+            email_type = meta.get("type", "")
+
             if inbox_id and email_verifier:
-                # Verify the inbox still exists
+                # Mailslurp email — verify the inbox still exists
                 if email_verifier.verify_mailslurp_inbox(inbox_id):
                     results["verified"].append(f"email:{identifier}")
                     logger.info(f"Email verified: {identifier}")
@@ -336,10 +339,21 @@ class IdentityManager:
                     )
                     results["suspended"].append(f"email:{identifier}")
                     logger.warning(f"Email DEAD, suspended: {identifier}")
-            else:
-                # No inbox_id — can't verify, leave as-is but warn
-                results["errors"].append(
-                    f"email:{identifier} — no inbox_id, can't verify")
+            elif email_type == "temp":
+                # Temp emails (mail.tm) are disposable — no persistent
+                # inbox to verify. Mark as verified if still active.
+                results["verified"].append(f"email:{identifier} (temp)")
+            elif not inbox_id:
+                # No inbox_id and not a temp email — likely stale/orphaned.
+                # Suspend instead of leaving as unverifiable clutter.
+                self.db.execute(
+                    "UPDATE identities SET status = 'suspended', "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (row["id"],),
+                )
+                results["suspended"].append(
+                    f"email:{identifier} — no inbox_id, suspended as unverifiable")
+                logger.warning(f"Email suspended (no inbox_id, not temp): {identifier}")
 
         # 2. Verify Mailslurp API key itself
         if email_verifier:
