@@ -147,7 +147,7 @@ class MarketingTeam(BaseAgent):
         return results
 
     def _plan_campaigns(self, target_strategy: str | None) -> list[dict[str, Any]]:
-        """Plan marketing campaigns based on strategy needs."""
+        """Plan marketing campaigns based on strategy needs and available assets."""
         # Get active strategies from knowledge base
         strategies_knowledge = self.ask_knowledge(category="opportunity")
 
@@ -159,9 +159,30 @@ class MarketingTeam(BaseAgent):
 
         focus = f"Focus on strategy: {target_strategy}" if target_strategy else ""
 
+        # Build asset inventory so the LLM only plans feasible campaigns
+        from monai.agents.identity import IdentityManager
+        identity_mgr = IdentityManager(self.config, self.db, self.llm)
+        accounts = identity_mgr.get_all_accounts()
+        platforms = list({a["platform"] for a in accounts})
+        has_domain = any(a["type"] == "domain" for a in accounts)
+        has_email = any(
+            a["type"] == "email" or a["platform"] == "email" for a in accounts
+        )
+
+        asset_info = (
+            f"\nAVAILABLE ASSETS (only plan campaigns using these):\n"
+            f"- Platform accounts: {', '.join(platforms) if platforms else 'NONE'}\n"
+            f"- Has domain/website: {has_domain}\n"
+            f"- Has email: {has_email}\n"
+            f"CRITICAL: Do NOT plan SEO/blog/website campaigns without a domain. "
+            f"Do NOT plan email campaigns without an email account. "
+            f"Only plan campaigns executable with available assets.\n"
+        )
+
         plan = self.think_json(
             f"Plan marketing campaigns for our active strategies.\n"
             f"{focus}\n\n"
+            f"{asset_info}\n"
             f"Available intelligence:\n{context}\n\n"
             "For each campaign, choose the best channel and type. "
             "Return JSON: {{\"campaigns\": [{{\"name\": str, "

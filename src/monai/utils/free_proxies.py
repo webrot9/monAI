@@ -114,11 +114,15 @@ class FreeProxyPool:
         except Exception as e:
             logger.debug(f"Failed to init free_proxies table: {e}")
 
-    def get_proxy(self) -> str | None:
+    def get_proxy(self, wait: bool = False) -> str | None:
         """Get a working free proxy URL.  Returns None if pool is empty.
 
         Prefers proxies with better success rates.  Triggers background
         refresh if pool is running low.
+
+        Args:
+            wait: If True and pool is empty, block up to 30s for the
+                  background refresh to finish before giving up.
         """
         with self._lock:
             if not self._initialized or (
@@ -126,6 +130,20 @@ class FreeProxyPool:
             ):
                 self._trigger_refresh()
 
+            if not self._proxies:
+                if not wait:
+                    return None
+                # Release lock and wait for background refresh below
+
+        if wait:
+            # Wait up to 30s for pool to populate
+            for _ in range(30):
+                time.sleep(1)
+                with self._lock:
+                    if self._proxies:
+                        break
+
+        with self._lock:
             if not self._proxies:
                 return None
 

@@ -205,8 +205,12 @@ class ProxyFallbackChain:
             return self._get_free_proxy()
         return None  # PROXY_DIRECT — never returned
 
-    def _get_free_proxy(self) -> str | None:
-        """Get a proxy from the free proxy pool (lazy init)."""
+    def _get_free_proxy(self, wait: bool = False) -> str | None:
+        """Get a proxy from the free proxy pool (lazy init).
+
+        Args:
+            wait: If True, block up to 30s for pool to populate.
+        """
         if self._free_proxy_pool is None:
             try:
                 from monai.utils.free_proxies import FreeProxyPool
@@ -214,7 +218,7 @@ class ProxyFallbackChain:
             except Exception as e:
                 logger.warning(f"Failed to init free proxy pool: {e}")
                 return None
-        return self._free_proxy_pool.get_proxy()
+        return self._free_proxy_pool.get_proxy(wait=wait)
 
     def report_free_proxy_result(self, proxy_url: str, success: bool) -> None:
         """Report success/failure for a free proxy so the pool can adapt."""
@@ -229,7 +233,12 @@ class ProxyFallbackChain:
         """Return proxy types that are actually configured."""
         available = []
         for ptype in PROXY_CHAIN_ORDER:
-            if self._proxy_url_for_type(ptype):
+            if ptype == PROXY_FREE:
+                # FREE is always available as a fallback tier — the pool
+                # refreshes on demand, so an empty pool at check time doesn't
+                # mean the tier is unconfigured.
+                available.append(ptype)
+            elif self._proxy_url_for_type(ptype):
                 available.append(ptype)
         return available
 
@@ -264,7 +273,11 @@ class ProxyFallbackChain:
             # Walk the chain
             for ptype in self._available_chain():
                 if ptype not in blocked:
-                    url = self._proxy_url_for_type(ptype)
+                    if ptype == PROXY_FREE:
+                        # FREE is a fallback — wait for pool to populate if needed
+                        url = self._get_free_proxy(wait=True)
+                    else:
+                        url = self._proxy_url_for_type(ptype)
                     if url:
                         return (ptype, url)
 
