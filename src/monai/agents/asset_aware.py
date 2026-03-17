@@ -93,7 +93,19 @@ class AssetInventory:
 
         accts = self.platform_accounts
         if accts:
-            parts.append(f"Platform accounts: {', '.join(a.platform for a in accts)}")
+            # Filter out phantom accounts (status=stale or missing creds marker)
+            usable = [a for a in accts if a.status == "active"
+                       and not a.metadata.get("credential_status") == "incomplete"]
+            phantom = [a for a in accts if a not in usable]
+            if usable:
+                parts.append(f"Platform accounts: {', '.join(a.platform for a in usable)}")
+            else:
+                parts.append("Platform accounts: NONE")
+            if phantom:
+                parts.append(
+                    f"Phantom accounts (unusable, missing API credentials): "
+                    f"{', '.join(a.platform for a in phantom)}"
+                )
         else:
             parts.append("Platform accounts: NONE")
 

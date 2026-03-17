@@ -57,11 +57,14 @@ class Coder:
 
         self._log("generate_start", f"Generating module: {spec[:100]}")
 
-        # Step 0: Ethics/legal review of the spec — catch bad intent early
+        # Step 0: Ethics/legal review of the spec — catch bad intent early.
+        # Use script_type="spec" so pattern checks are applied to intent
+        # (not code syntax). Python patterns like 'requests.' or 'open('
+        # must NOT trigger on natural language descriptions.
         from monai.agents.ethics import is_script_ethical
         is_ok, reason = is_script_ethical(
             spec, context=f"Code generation spec: {spec[:200]}",
-            script_type="python", llm=self.llm,
+            script_type="spec", llm=self.llm,
         )
         if not is_ok:
             self._log("ethics_blocked", f"Spec blocked: {reason}")

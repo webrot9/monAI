@@ -919,9 +919,13 @@ class APIProvisioner(BaseAgent):
         or creating an alias from the base domain.
         """
         # Check if brand already has an email
+        # Match both platform='email' (from store_account) and type='email'
+        # (legacy entries) plus common email providers (gmail, outlook, etc.)
         brand_accounts = self.db.execute(
             "SELECT identifier FROM identities "
-            "WHERE type = 'email' AND metadata LIKE ? AND status = 'active' LIMIT 1",
+            "WHERE (platform IN ('email','gmail','outlook','protonmail','proton','hotmail','yahoo') "
+            "   OR type = 'email') "
+            "AND metadata LIKE ? AND status = 'active' LIMIT 1",
             (f'%{brand}%',),
         )
         if brand_accounts:
@@ -967,9 +971,11 @@ class APIProvisioner(BaseAgent):
         # through mail.tm rate limits (creating N emails for N brands).
         # Cross-brand email reuse is acceptable for temp emails since they're
         # disposable and used only for initial signup verification.
+        # Match both platform='email' (store_account) and type='email' (legacy)
         any_temp = self.db.execute(
             "SELECT identifier, credentials FROM identities "
-            "WHERE type = 'email' AND metadata LIKE '%temp%' AND status = 'active' "
+            "WHERE (platform = 'email' OR type = 'email') "
+            "AND metadata LIKE '%temp%' AND status = 'active' "
             "ORDER BY created_at DESC LIMIT 1",
         )
         if any_temp:
@@ -1025,7 +1031,8 @@ class APIProvisioner(BaseAgent):
         if not inbox_id:
             brand_emails = self.db.execute(
                 "SELECT metadata FROM identities "
-                "WHERE type = 'email' AND identifier = ? AND status = 'active'",
+                "WHERE (platform = 'email' OR type = 'email') "
+                "AND identifier = ? AND status = 'active'",
                 (email,),
             )
             if brand_emails:

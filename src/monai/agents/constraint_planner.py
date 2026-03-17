@@ -305,6 +305,14 @@ _STANDARD_RULES: list[dict[str, Any]] = [
         "platform": "legal",
         "estimated_cost": 100.0,
     },
+    {
+        "action": "telegram_bot_creation",
+        "requires": ["email_creation"],
+        "description": "Create Telegram bot via BotFather",
+        "priority": 25,
+        "platform": "telegram",
+        "estimated_cost": 0.0,
+    },
 ]
 
 
@@ -330,8 +338,8 @@ _GOAL_TO_ACTIONS: dict[str, list[str]] = {
     "email": ["email_creation"],
     "create_email": ["email_creation"],
     # Specific infrastructure goals — minimal deps, no LLM expansion
-    "telegram_bot": ["email_creation"],
-    "telegram": ["email_creation"],
+    "telegram_bot": ["email_creation", "telegram_bot_creation"],
+    "telegram": ["email_creation", "telegram_bot_creation"],
     "identity": [],
 }
 
@@ -519,6 +527,10 @@ class ConstraintPlanner:
             return any(a.type == "llc" and a.status == "active" for a in inventory.assets)
         if action == "payment_processing_setup":
             return bool(platform) and inventory.has_account(platform)
+        if action == "telegram_bot_creation":
+            # Never skip — orchestrator already gates this by checking has_token.
+            # If we're here, the orchestrator determined we need a new bot.
+            return False
         return False
 
     def _llm_dependency_chain(

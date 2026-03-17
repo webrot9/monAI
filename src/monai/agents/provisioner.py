@@ -468,6 +468,42 @@ class Provisioner(BaseAgent):
         logger.info(f"Email provisioned via Mailslurp (verified): {result['address']}")
         return {"status": "completed", "email": result["address"]}
 
+    def _provision_telegram_bot(self) -> dict[str, Any]:
+        """Create a Telegram bot via BotFather using the executor.
+
+        Requires a Telegram account (virtual phone number needed).
+        On success, stores the bot token in TelegramBot state.
+        """
+        from monai.utils.telegram import TelegramBot
+
+        # Get provisioning task from TelegramBot utility
+        telegram = TelegramBot(self.config, self.db)
+        if telegram.has_token:
+            return {"status": "already_exists"}
+
+        task_info = telegram.get_provisioning_task()
+        identity = self.identity.get_identity()
+
+        result = self.execute_task(
+            task_info["task"],
+            context=json.dumps(identity, default=str),
+        )
+
+        if result.get("status") == "completed":
+            # Extract bot token from result
+            token = result.get("bot_token") or result.get("token", "")
+            if token and ":" in token:
+                telegram.set_bot_token(token)
+                self.log_action("provision_telegram_bot", "Bot token acquired and stored")
+                return {"status": "completed", "bot_created": True}
+            else:
+                self.log_action("provision_telegram_bot",
+                                "Task completed but no valid token extracted")
+                return {"status": "failed",
+                        "reason": "No valid bot token in executor result"}
+
+        return {"status": "failed", "reason": result.get("error", "Executor failed")}
+
     async def _provision_mailslurp_key(self) -> dict[str, Any]:
         """Self-provision a Mailslurp API key autonomously.
 
@@ -714,6 +750,8 @@ class Provisioner(BaseAgent):
                 return {"status": "failed", "reason": "No viable domain name found after validation"}
 
             return self._run_async(self.register_domain(domain_name))
+        elif "telegram_bot" in action.lower():
+            return self._provision_telegram_bot()
         elif "api" in action.lower():
             return self._run_async(self.acquire_api_key(action))
         else:
