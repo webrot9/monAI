@@ -172,8 +172,15 @@ class Orchestrator(BaseAgent):
         # Give strategy access to payment infrastructure
         agent.payment_manager = self.payment_manager
         self.workflow_engine.register_agent(agent.name, agent)
-        # Auto-register brand for social presence and web presence
-        self.social_presence.register_brand(agent.name)
+        # Only register brand for social presence if strategy is actually active
+        # (has the assets to execute).  Phantom brand entries from past sessions
+        # are cleaned up by validate_strategies().
+        rows = self.db.execute(
+            "SELECT status FROM strategies WHERE name = ? LIMIT 1",
+            (agent.name,),
+        )
+        if rows and rows[0]["status"] == "active":
+            self.social_presence.register_brand(agent.name)
         self.log_action("register_strategy", f"Registered: {agent.name}")
 
     def _get_strategy_failure_context(self) -> list[str]:
@@ -450,6 +457,9 @@ class Orchestrator(BaseAgent):
 
         # Phase 0.9: Asset verification — check that stored assets actually work
         cycle_result["asset_verification"] = self._verify_stored_assets()
+
+        # Phase 0.95: Strategy validation — activate/deactivate based on actual assets
+        cycle_result["strategy_validation"] = self.strategy_lifecycle.validate_strategies()
 
         # Phase 1: Self-check — do I have what I need?
         cycle_result["provisioning"] = self._ensure_infrastructure()

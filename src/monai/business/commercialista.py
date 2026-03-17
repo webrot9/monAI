@@ -208,10 +208,14 @@ class Commercialista:
         return rows[0]["total"]
 
     def _get_daily_burn_rate(self) -> float:
-        """Average daily expense over last 30 days."""
+        """Average daily expense over last 30 days.
+
+        Reads from the transactions table (where LLM._persist_cost writes),
+        NOT from cost_log (which is never written to by the LLM layer).
+        """
         rows = self.db.execute(
-            "SELECT COALESCE(SUM(cost_eur), 0) as total FROM cost_log "
-            "WHERE created_at >= ?",
+            "SELECT COALESCE(SUM(amount), 0) as total FROM transactions "
+            "WHERE type = 'expense' AND created_at >= ?",
             ((datetime.now() - timedelta(days=30)).isoformat(),),
         )
         total = rows[0]["total"]

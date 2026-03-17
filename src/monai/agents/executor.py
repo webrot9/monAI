@@ -141,6 +141,8 @@ class AutonomousExecutor:
         self.action_history = []
         self._reflection_count = 0
         self._script_target_failures = {}
+        self._failed_domains: set[str] = set()  # Domains blocked/failed this task
+        self._visited_urls: set[str] = set()  # URLs already browsed (prevent re-visits)
         start_time = time.time()
         consecutive_failures = 0
         total_failures = 0
@@ -226,6 +228,48 @@ class AutonomousExecutor:
 
                 logger.info(f"Step {step + 1}: {tool}({json.dumps(args)[:200]})")
 
+                # Pre-execution guard: auto-reject browse to exact URL already visited
+                if tool == "browse":
+                    req_url = args.get("url", "")
+                    if req_url and req_url in self._visited_urls:
+                        reject_msg = (
+                            f"AUTO-REJECTED: Already browsed this exact URL. "
+                            f"Use a DIFFERENT URL, or extract data from previous "
+                            f"results, or call done()/fail()."
+                        )
+                        logger.info(reject_msg)
+                        self.action_history.append({
+                            "step": step + 1,
+                            "tool": tool,
+                            "args": args,
+                            "result": reject_msg,
+                        })
+                        total_failures += 1
+                        continue
+
+                # Pre-execution guard: auto-reject browse/http to domains already failed
+                if tool in ("browse", "http_get", "http_post"):
+                    req_url = args.get("url", "")
+                    if req_url:
+                        from urllib.parse import urlparse as _urlparse
+                        req_domain = _urlparse(req_url).netloc
+                        if req_domain and req_domain in self._failed_domains:
+                            reject_msg = (
+                                f"AUTO-REJECTED: {req_domain} already failed/blocked "
+                                f"earlier in this task. Try a DIFFERENT domain or "
+                                f"call fail() if no alternatives exist."
+                            )
+                            logger.info(reject_msg)
+                            self.action_history.append({
+                                "step": step + 1,
+                                "tool": tool,
+                                "args": args,
+                                "result": reject_msg,
+                            })
+                            consecutive_failures += 1
+                            total_failures += 1
+                            continue
+
                 # Pre-execution guard: auto-reject run_page_script on burnt targets
                 if tool == "run_page_script":
                     import re as _re
@@ -270,8 +314,21 @@ class AutonomousExecutor:
                 if is_failure:
                     consecutive_failures += 1
                     total_failures += 1
+                    # Track failed domains so we don't retry them
+                    if tool in ("browse", "http_get", "http_post"):
+                        fail_url = args.get("url", "")
+                        if fail_url:
+                            from urllib.parse import urlparse
+                            fail_domain = urlparse(fail_url).netloc
+                            if fail_domain:
+                                self._failed_domains.add(fail_domain)
                 else:
                     consecutive_failures = 0
+                    # Track successfully visited URLs for dedup
+                    if tool == "browse":
+                        browse_url = args.get("url", "")
+                        if browse_url:
+                            self._visited_urls.add(browse_url)
 
                 # Track fill_form partial failures: if the same fields keep
                 # failing across repeated fill_form calls, burn them so the
@@ -530,6 +587,15 @@ class AutonomousExecutor:
                     "A PROPER SOLUTION. You are a coder — act like one.\n\n"
                 )
 
+        # Failed domains warning — tell the LLM which domains are blocked
+        failed_domains_text = ""
+        if self._failed_domains:
+            failed_domains_text = (
+                "\n🚫 BLOCKED DOMAINS (do NOT browse/request these — they will be auto-rejected):\n"
+                + "\n".join(f"  - {d}" for d in sorted(self._failed_domains))
+                + "\nUse a DIFFERENT domain or approach. If no alternatives, call fail().\n\n"
+            )
+
         # Burnt targets warning — tell the LLM which elements to avoid
         burnt_targets_text = ""
         if self._script_target_failures:
@@ -551,6 +617,7 @@ class AutonomousExecutor:
             f"STEP: {step + 1}/{self.max_steps}\n\n"
             f"PREVIOUS ACTIONS:\n{history_summary or 'None yet'}\n\n"
             f"{code_nudge}"
+            f"{failed_domains_text}"
             f"{burnt_targets_text}"
             f"{learned_context}"
             f"{asset_context}"
@@ -567,11 +634,13 @@ class AutonomousExecutor:
             "- NEVER post to example.com or made-up/placeholder URLs — they don't exist\n"
             "- NEVER create accounts on platforms NOT mentioned in the task\n"
             "- For web searches, try these engines IN ORDER (stop at first that works):\n"
-            "  1. https://lite.duckduckgo.com/lite/?q=QUERY (lightest, most Tor-friendly)\n"
-            "  2. https://html.duckduckgo.com/html/?q=QUERY\n"
-            "  3. https://search.sapti.me/search?q=QUERY (SearXNG, meta-search)\n"
+            "  1. https://search.sapti.me/search?q=QUERY (SearXNG, best over Tor)\n"
+            "  2. https://searx.be/search?q=QUERY (SearXNG backup)\n"
+            "  3. https://opnxng.com/search?q=QUERY (SearXNG backup)\n"
+            "  4. https://lite.duckduckgo.com/lite/?q=QUERY (sometimes 403 over Tor)\n"
+            "  5. https://html.duckduckgo.com/html/?q=QUERY (sometimes 403 over Tor)\n"
             "  Do NOT use Google (429 blocks) or Bing (CAPTCHA over Tor).\n"
-            "  If a search engine returns 403, immediately try the next one.\n"
+            "  If a search engine returns 403 or redirects to homepage, immediately try the next one.\n"
             "\n"
             "CODE-FIRST STRATEGY — YOU ARE A CODER, NOT JUST A TOOL-CALLER:\n"
             "- When standard tools (click, type, fill_form) fail 2+ times: STOP retrying.\n"
@@ -880,29 +949,37 @@ class AutonomousExecutor:
             elif tool == "read_page":
                 return await self.browser.get_text()
 
-            elif tool == "http_get":
+            elif tool in ("http_get", "http_post"):
                 url = args.get("url", "")
                 if not url.startswith(("http://", "https://")):
                     return "BLOCKED: only http/https URLs allowed"
+                # Detect placeholder/hallucinated credentials
+                headers = args.get("headers", {})
+                _placeholder_patterns = (
+                    "YOUR_API_KEY", "YOUR_KEY", "YOUR_TOKEN",
+                    "API_KEY_HERE", "REPLACE_ME", "INSERT_KEY",
+                    "sk-xxxx", "pk_test_", "Bearer test",
+                    "your-api-key", "your_api_key",
+                )
+                for _hdr_val in headers.values():
+                    if any(p in str(_hdr_val) for p in _placeholder_patterns):
+                        return (
+                            "BLOCKED: Detected placeholder/hallucinated credentials "
+                            f"in headers. Do NOT invent API keys. If you need "
+                            f"credentials that aren't in the task context, call "
+                            f"fail() explaining what's missing."
+                        )
                 try:
                     self._anonymizer.maybe_rotate()
-                    resp = self.http_client.get(
-                        url, headers=args.get("headers", {}), timeout=30,
-                    )
-                    return {"status": resp.status_code, "body": resp.text[:2000]}
-                except Exception as e:
-                    return {"status": 0, "error": str(e)[:200]}
-
-            elif tool == "http_post":
-                url = args.get("url", "")
-                if not url.startswith(("http://", "https://")):
-                    return "BLOCKED: only http/https URLs allowed"
-                try:
-                    self._anonymizer.maybe_rotate()
-                    resp = self.http_client.post(
-                        url, json=args.get("data", {}),
-                        headers=args.get("headers", {}), timeout=30,
-                    )
+                    if tool == "http_get":
+                        resp = self.http_client.get(
+                            url, headers=headers, timeout=30,
+                        )
+                    else:
+                        resp = self.http_client.post(
+                            url, json=args.get("data", {}),
+                            headers=headers, timeout=30,
+                        )
                     return {"status": resp.status_code, "body": resp.text[:2000]}
                 except Exception as e:
                     return {"status": 0, "error": str(e)[:200]}

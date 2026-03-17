@@ -57,7 +57,15 @@ class ContentMarketer(BaseAgent):
             return {"pieces_created": 0}
 
         # ── Layer 1: Real SEO keyword research ─────────────────────
-        niche = campaign.get("key_message", strategy)
+        # Use strategy_name or target_audience as the search niche — NOT key_message
+        # (key_message is marketing copy like "Discover how X can elevate your brand",
+        # which makes a terrible search query)
+        niche = (
+            campaign.get("strategy_name")
+            or campaign.get("target_audience")
+            or strategy
+            or "digital marketing"
+        )
         keyword_data = self._research_keywords(niche)
 
         # ── Layer 2: Real SERP analysis ────────────────────────────
