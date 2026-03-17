@@ -122,6 +122,15 @@ class NewsletterAgent(BaseAgent):
         if statuses.get("monetizing", 0) > 0:
             return ["find_sponsors"]
 
+        # Check for pending sales
+        pending_sales = self.db.execute(
+            "SELECT COUNT(*) as c FROM checkout_links "
+            "WHERE strategy_name = ? AND status = 'pending'",
+            (self.name,),
+        )
+        if pending_sales and pending_sales[0]["c"] > 0:
+            return ["check_sales"]
+
         # All newsletters at final stage — start new one
         return ["research_niches"]
 
@@ -139,6 +148,7 @@ class NewsletterAgent(BaseAgent):
             "publish_issue": self._publish_issue,
             "find_sponsors": self._find_sponsors,
             "grow_subscribers": self._grow_subscribers,
+            "check_sales": self._check_sales,
         }
 
         for step in steps:
@@ -800,3 +810,7 @@ class NewsletterAgent(BaseAgent):
 
         self.log_action("growth_complete", f"Executed {len(actions_taken)} growth actions")
         return {"actions_taken": actions_taken, "newsletter": nl["name"]}
+
+    def _check_sales(self) -> dict[str, Any]:
+        """Check pending sponsor checkout links for completed payments."""
+        return self.check_pending_sales()

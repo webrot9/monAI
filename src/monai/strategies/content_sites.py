@@ -43,6 +43,14 @@ class ContentSiteAgent(BaseAgent):
     def plan(self) -> list[str]:
         statuses = self._get_content_statuses()
 
+        # Always check for pending sales first
+        pending_sales = self.db.execute(
+            "SELECT COUNT(*) as c FROM checkout_links "
+            "WHERE strategy_name = ? AND status = 'pending'",
+            (self.name,),
+        )
+        has_pending = pending_sales and pending_sales[0]["c"] > 0
+
         # Deterministic progression
         if not statuses:
             return ["research_keywords"]
@@ -52,7 +60,11 @@ class ContentSiteAgent(BaseAgent):
             return ["review_content"]
         if statuses.get("reviewed", 0) > 0:
             return ["publish_article"]
-        if statuses.get("published", 0) > 0 and statuses.get("reviewed", 0) == 0:
+        if statuses.get("published", 0) > 0 and statuses.get("monetized", 0) == 0:
+            return ["monetize_article"]
+        if has_pending:
+            return ["check_sales"]
+        if statuses.get("monetized", 0) > 0 and statuses.get("reviewed", 0) == 0:
             return ["find_affiliate_programs"]
 
         # All content published — research more keywords
@@ -68,6 +80,8 @@ class ContentSiteAgent(BaseAgent):
             "create_article": self._create_article,
             "review_content": self._review_content,
             "publish_article": self._publish_article,
+            "monetize_article": self._monetize_article,
+            "check_sales": self._check_sales,
             "find_affiliate_programs": self._find_affiliate_programs,
             "plan_new_site": self._plan_new_site,
         }
@@ -81,57 +95,52 @@ class ContentSiteAgent(BaseAgent):
         return results
 
     def _research_keywords(self) -> dict[str, Any]:
-        """Find low-competition long-tail keywords using REAL web data."""
-        self.log_action("keyword_research", "Fetching real keyword data from the web")
+        """Find low-competition long-tail keywords using web data.
 
-        # Pull trending topics from Google Trends
-        trends_data = self.browse_and_extract(
-            "https://trends.google.com/trending?geo=US",
-            "Extract all trending search topics and queries visible on this page. "
-            "For each, include the topic name/query and any category or volume "
-            "indicators shown. Only include REAL data visible on the page. "
-            "Do NOT make up any information. "
-            "Return as JSON: {\"trends\": [{\"query\": str, \"category\": str, "
-            "\"volume_indicator\": str}]}"
-        )
+        Uses a single focused search to minimize LLM calls — previous approach
+        burned 3 separate browser sessions (Google Trends, keyword search,
+        Ubersuggest) that mostly failed via Tor, wasting 15-30 LLM calls.
+        """
+        self.log_action("keyword_research", "Searching for keyword opportunities")
 
-        # Search for low-competition keyword opportunities via free SEO tools
+        # Single focused search — works via Tor on DuckDuckGo/Bing
         keyword_data = self.search_web(
-            "low competition long tail keywords with buying intent 2026",
-            "Extract any keyword ideas, search volume estimates, and competition "
-            "levels mentioned. Only include REAL data visible on the page. "
-            "Do NOT make up any information. "
+            "low competition long tail keywords buying intent profitable niches 2026",
+            "Extract any keyword ideas, search volume estimates, competition "
+            "levels, and monetization opportunities mentioned. Only include REAL "
+            "data visible on the page. Do NOT make up any information. "
             "Return as JSON: {\"keyword_ideas\": [{\"keyword\": str, "
             "\"volume_estimate\": str, \"competition\": str, \"source\": str}]}"
         )
 
-        # Try Ubersuggest for additional keyword data
-        ubersuggest_data = self.browse_and_extract(
-            "https://neilpatel.com/ubersuggest/",
-            "Extract any keyword suggestions, search volume data, SEO difficulty "
-            "scores, and content ideas shown on this page. Only include REAL data "
-            "visible on the page. Do NOT make up any information. "
-            "Return as JSON: {\"suggestions\": [{\"keyword\": str, "
-            "\"volume\": str, \"seo_difficulty\": str}]}"
+        # Check if we got real data
+        has_real_data = (
+            isinstance(keyword_data, dict)
+            and keyword_data.get("keyword_ideas")
+            and keyword_data.get("status") != "error"
         )
 
-        # Now use LLM to PLAN which keywords to target based on the real data
-        raw_data = {
-            "trends": trends_data,
-            "keyword_ideas": keyword_data,
-            "ubersuggest": ubersuggest_data,
-        }
+        if not has_real_data:
+            self.log_action("research_failed", "No real keyword data from web search")
+            path = self.sites_dir / "keywords_researched.json"
+            path.write_text(json.dumps({
+                "status": "researched",
+                "keywords": [],
+                "note": "Web search failed — will retry next cycle",
+            }, indent=2))
+            return {"keywords": [], "status": "no_data"}
+
         keywords = self.think_json(
             "Based on the following REAL keyword research data from the web, "
             "select the 10 best low-competition long-tail keywords to target.\n\n"
-            f"Raw research data:\n{json.dumps(raw_data, default=str)[:3000]}\n\n"
+            f"Raw research data:\n{json.dumps(keyword_data, default=str)[:3000]}\n\n"
             "Focus on:\n"
             "- 'How to' queries with buying intent\n"
             "- 'Best X for Y' comparison queries\n"
             "- Problems people search for solutions to\n"
             "- Niches where affiliate programs exist\n\n"
-            "IMPORTANT: Only recommend keywords that are supported by the real "
-            "data above. Do not invent keywords.\n\n"
+            "IMPORTANT: Only recommend keywords supported by the real data above. "
+            "If no real data was found, return an empty list.\n\n"
             "Return: {\"keywords\": [{\"keyword\": str, \"source\": str, "
             "\"search_volume_estimate\": str, \"competition\": \"low\"|\"medium\", "
             "\"monetization\": str, \"article_angle\": str}]}"
@@ -302,33 +311,71 @@ class ContentSiteAgent(BaseAgent):
 
         return {"published": published}
 
+    def _monetize_article(self) -> dict[str, Any]:
+        """Create checkout links for published articles.
+
+        For each published article, create a Ko-fi checkout for a premium
+        resource (detailed guide, template, or toolkit) related to the article topic.
+        """
+        monetized = 0
+
+        for path in self.sites_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("status") != "published":
+                continue
+
+            keyword = data.get("target", {}).get("keyword",
+                      data.get("target", {}).get("title", path.stem))
+            published_url = data.get("published_url", "")
+
+            checkout = self.create_checkout_link(
+                amount=7.99,
+                product=f"Complete Guide: {keyword}",
+                provider="kofi",
+                metadata={
+                    "content_file": str(path.name),
+                    "published_url": published_url,
+                    "keyword": keyword,
+                },
+            )
+
+            if checkout.get("status") == "created":
+                data["status"] = "monetized"
+                data["checkout_url"] = checkout.get("checkout_url", "")
+                data["payment_ref"] = checkout.get("payment_ref", "")
+                path.write_text(json.dumps(data, indent=2))
+                monetized += 1
+                self.log_action(
+                    "article_monetized",
+                    f"{keyword}: {checkout.get('checkout_url', '')}",
+                )
+            else:
+                data["status"] = "monetized"
+                path.write_text(json.dumps(data, indent=2))
+                self.log_action(
+                    "monetize_skipped",
+                    f"{keyword}: no payment provider available",
+                )
+
+        return {"monetized": monetized}
+
+    def _check_sales(self) -> dict[str, Any]:
+        """Check pending checkout links for completed payments."""
+        return self.check_pending_sales()
+
     def _find_affiliate_programs(self) -> dict[str, Any]:
-        """Research affiliate programs using REAL data from affiliate networks."""
-        self.log_action("affiliate_research", "Browsing real affiliate networks")
+        """Research affiliate programs using a single focused web search.
 
-        # Browse ShareASale for real programs
-        shareasale_data = self.browse_and_extract(
-            "https://www.shareasale.com/info/",
-            "Extract any affiliate program listings, merchant names, commission "
-            "rates, categories, and program details shown on this page. "
-            "Only include REAL data visible on the page. Do NOT make up any "
-            "information. Return as JSON: {\"programs\": [{\"name\": str, "
-            "\"commission_rate\": str, \"category\": str, \"details\": str}]}"
-        )
+        Previous approach burned 3 browser sessions (ShareASale, CJ, web search)
+        that mostly failed via Tor. Now uses 1 search.
+        """
+        self.log_action("affiliate_research", "Searching for affiliate programs")
 
-        # Browse CJ Affiliate for real programs
-        cj_data = self.browse_and_extract(
-            "https://www.cj.com/",
-            "Extract any affiliate program listings, advertiser names, commission "
-            "structures, and categories shown on this page. Only include REAL data "
-            "visible on the page. Do NOT make up any information. "
-            "Return as JSON: {\"programs\": [{\"name\": str, "
-            "\"commission_rate\": str, \"category\": str, \"details\": str}]}"
-        )
-
-        # Search for high-commission affiliate programs
         search_data = self.search_web(
-            "best high commission affiliate programs 2026 content sites",
+            "best high commission affiliate programs 2026 content sites recurring",
             "Extract affiliate program names, commission rates, cookie durations, "
             "niches, and signup URLs mentioned. Only include REAL data visible on "
             "the page. Do NOT make up any information. "
@@ -337,23 +384,27 @@ class ContentSiteAgent(BaseAgent):
             "\"signup_url\": str}]}"
         )
 
-        # Use LLM to select the best programs from real data
-        raw_data = {
-            "shareasale": shareasale_data,
-            "cj": cj_data,
-            "web_search": search_data,
-        }
+        has_real_data = (
+            isinstance(search_data, dict)
+            and search_data.get("programs")
+            and search_data.get("status") != "error"
+        )
+
+        if not has_real_data:
+            self.log_action("affiliate_research_failed", "No real program data")
+            return {"programs": [], "status": "no_data"}
+
         programs = self.think_json(
             "Based on the following REAL affiliate program data from the web, "
             "select the 5 best programs for a content site.\n\n"
-            f"Raw research data:\n{json.dumps(raw_data, default=str)[:3000]}\n\n"
+            f"Raw research data:\n{json.dumps(search_data, default=str)[:3000]}\n\n"
             "Focus on programs with:\n"
             "- Good commission rates (>5%)\n"
             "- Cookie duration >30 days\n"
             "- Reputable brands\n"
             "- Products people actually buy\n\n"
-            "IMPORTANT: Only include programs that appeared in the real data above. "
-            "Do not invent programs.\n\n"
+            "IMPORTANT: Only include programs from the real data above. "
+            "If no real data was found, return an empty list.\n\n"
             "Return: {\"programs\": [{\"name\": str, \"commission_rate\": str, "
             "\"cookie_days\": int, \"niche\": str, \"signup_url\": str, "
             "\"avg_order_value\": str, \"source\": str}]}"

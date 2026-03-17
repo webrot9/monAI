@@ -116,6 +116,14 @@ class LeadGenAgent(BaseAgent):
         )
         lead_stats = {r["status"]: r["c"] for r in lead_stats_rows} if lead_stats_rows else {}
 
+        # Check for pending sales that need payment verification
+        pending_sales = self.db.execute(
+            "SELECT COUNT(*) as c FROM checkout_links "
+            "WHERE strategy_name = ? AND status = 'pending'",
+            (self.name,),
+        )
+        has_pending = pending_sales and pending_sales[0]["c"] > 0
+
         # Deterministic progression — each step advances the pipeline
         if not stats:
             return ["research_niches"]
@@ -129,6 +137,8 @@ class LeadGenAgent(BaseAgent):
             return ["finalize_list"]
         if stats.get("ready", 0) > 0:
             return ["sell_leads"]
+        if has_pending:
+            return ["check_sales"]
 
         # All lists sold — research new niches
         return ["research_niches"]
@@ -145,6 +155,7 @@ class LeadGenAgent(BaseAgent):
             "qualify_leads": self._qualify_leads,
             "finalize_list": self._finalize_list,
             "sell_leads": self._sell_leads,
+            "check_sales": self._check_sales,
         }
 
         for step in steps:
@@ -718,3 +729,30 @@ class LeadGenAgent(BaseAgent):
             self.log_action("list_listed", f"{name}: listed on marketplace + outreach sent")
 
         return {"lists_listed": sold}
+
+    def _check_sales(self) -> dict[str, Any]:
+        """Check pending checkout links for completed lead list payments.
+
+        When a payment is confirmed, marks the corresponding lead list as 'sold'.
+        """
+        result = self.check_pending_sales()
+
+        # Also mark lead lists as sold when their checkout is paid
+        paid_links = self.db.execute(
+            "SELECT metadata FROM checkout_links "
+            "WHERE strategy_name = ? AND status = 'paid'",
+            (self.name,),
+        )
+        for row in paid_links:
+            try:
+                meta = json.loads(dict(row)["metadata"])
+                list_id = meta.get("list_id")
+                if list_id:
+                    self.db.execute(
+                        "UPDATE lead_lists SET status = 'sold' WHERE id = ? AND status = 'listed'",
+                        (list_id,),
+                    )
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+        return result

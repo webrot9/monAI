@@ -203,6 +203,14 @@ class BaseAgent(ABC):
                 )
 
             if result.success:
+                # Store mapping so webhooks can route payments back to this strategy
+                self.db.execute_insert(
+                    "INSERT INTO checkout_links "
+                    "(payment_ref, strategy_name, product, amount, currency, provider, checkout_url, metadata) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (result.payment_ref, self.name, product, amount, currency,
+                     provider, result.checkout_url, json.dumps(metadata or {})),
+                )
                 self.log_action(
                     "checkout_created",
                     f"{product}: {result.checkout_url[:80]}",
@@ -625,6 +633,66 @@ class BaseAgent(ABC):
             "VALUES (?, ?, 'revenue', ?, ?, ?)",
             (strategy_id, project_id, category, amount, description),
         )
+
+    def check_pending_sales(self) -> dict:
+        """Poll-check pending checkout links for this strategy and record revenue.
+
+        Checks each pending checkout_link via the payment provider's verify_payment.
+        When a payment is confirmed, records revenue and updates the checkout status.
+        Returns summary of newly confirmed payments.
+        """
+        pending = self.db.execute(
+            "SELECT * FROM checkout_links WHERE strategy_name = ? AND status = 'pending'",
+            (self.name,),
+        )
+        if not pending:
+            return {"checked": 0, "paid": 0}
+
+        paid = 0
+        for row in pending:
+            link = dict(row)
+            if not self._payment_manager:
+                break
+
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        result = pool.submit(
+                            asyncio.run,
+                            self._payment_manager.verify_payment(
+                                link["provider"], link["payment_ref"]
+                            ),
+                        ).result(timeout=15)
+                else:
+                    result = asyncio.run(
+                        self._payment_manager.verify_payment(
+                            link["provider"], link["payment_ref"]
+                        )
+                    )
+
+                if result.success and result.amount > 0:
+                    self.db.execute(
+                        "UPDATE checkout_links SET status = 'paid', paid_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ?", (link["id"],),
+                    )
+                    self.record_revenue(
+                        amount=result.amount,
+                        category=self.name,
+                        description=f"Sale: {link['product']}",
+                    )
+                    self.log_action(
+                        "sale_confirmed",
+                        f"{link['product']}: {result.amount} {result.currency}",
+                    )
+                    paid += 1
+
+            except Exception as e:
+                self.log_action("payment_check_error", f"{link['payment_ref']}: {e}")
+
+        return {"checked": len(pending), "paid": paid}
 
     # ── Thinking (LLM-powered reasoning) ───────────────────────
 

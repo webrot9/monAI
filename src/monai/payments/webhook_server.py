@@ -339,3 +339,44 @@ class WebhookServer:
         )
         writer.write(response.encode("utf-8"))
         await writer.drain()
+
+
+def make_checkout_revenue_handler(db):
+    """Create a webhook event handler that records revenue via checkout_links.
+
+    When a payment webhook fires, looks up the payment_ref in checkout_links
+    to find which strategy created it, then records revenue in transactions.
+
+    Usage:
+        server.on_event(make_checkout_revenue_handler(db))
+    """
+    async def _handler(event: WebhookEvent) -> None:
+        if event.event_type.value not in ("payment_completed", "payment"):
+            return
+
+        rows = db.execute(
+            "SELECT * FROM checkout_links WHERE payment_ref = ? AND status = 'pending'",
+            (event.payment_ref,),
+        )
+        if not rows:
+            return
+
+        link = dict(rows[0])
+        amount = event.amount if event.amount > 0 else link["amount"]
+
+        db.execute(
+            "UPDATE checkout_links SET status = 'paid', paid_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?", (link["id"],),
+        )
+        db.execute_insert(
+            "INSERT INTO transactions (type, category, amount, description) "
+            "VALUES ('revenue', ?, ?, ?)",
+            (link["strategy_name"], amount,
+             f"Sale via {link['provider']}: {link['product']}"),
+        )
+        logger.info(
+            f"Revenue recorded: {link['strategy_name']} — "
+            f"{amount} {event.currency} for {link['product']}"
+        )
+
+    return _handler

@@ -64,6 +64,15 @@ class TelegramBotAgent(BaseAgent):
         if statuses.get("deploy_failed", 0) > 0:
             return ["deploy_bot"]  # Retry failed deployments
 
+        # Check for pending premium subscription payments
+        pending_sales = self.db.execute(
+            "SELECT COUNT(*) as c FROM checkout_links "
+            "WHERE strategy_name = ? AND status = 'pending'",
+            (self.name,),
+        )
+        if pending_sales and pending_sales[0]["c"] > 0:
+            return ["check_sales"]
+
         # All bots promoted — start a new product cycle
         return ["research_bot_niches"]
 
@@ -79,6 +88,7 @@ class TelegramBotAgent(BaseAgent):
             "review_product": self._review_product,
             "deploy_bot": self._deploy_bot,
             "promote_bot": self._promote_bot,
+            "check_sales": self._check_sales,
         }
 
         for step in steps:
@@ -627,3 +637,7 @@ class TelegramBotAgent(BaseAgent):
             self.product_iterator.mark_applied(improvement["id"])
 
         return {"applied": applied, "total_pending": len(pending)}
+
+    def _check_sales(self) -> dict[str, Any]:
+        """Check pending premium subscription checkout links for completed payments."""
+        return self.check_pending_sales()
