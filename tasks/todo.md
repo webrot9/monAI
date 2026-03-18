@@ -36,7 +36,7 @@
 ## Phase 5: Make Digital Products Work E2E
 - [x] Verify Gumroad integration is complete and real
 - [x] Wire digital_products into slim orchestrator
-- [ ] Test full pipeline: research → create → review → list → sell → collect
+- [x] Test full pipeline: research → create → review → list → sell → collect
 - [ ] Prove it works with real Gumroad API calls
 
 ---
