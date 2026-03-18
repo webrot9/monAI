@@ -26,19 +26,7 @@ from monai.business.finance import Finance
 from monai.business.risk import RiskManager
 from monai.config import Config
 from monai.db.database import Database
-from monai.strategies.affiliate import AffiliateAgent
-from monai.strategies.content_sites import ContentSiteAgent
-from monai.strategies.course_creation import CourseCreationAgent
 from monai.strategies.digital_products import DigitalProductsAgent
-from monai.strategies.domain_flipping import DomainFlippingAgent
-from monai.strategies.freelance_writing import FreelanceWritingAgent
-from monai.strategies.lead_gen import LeadGenAgent
-from monai.strategies.micro_saas import MicroSaaSAgent
-from monai.strategies.newsletter import NewsletterAgent
-from monai.strategies.print_on_demand import PrintOnDemandAgent
-from monai.strategies.saas import SaaSAgent
-from monai.strategies.social_media import SocialMediaAgent
-from monai.strategies.telegram_bots import TelegramBotAgent
 from monai.utils.llm import LLM
 
 logging.basicConfig(
@@ -84,20 +72,7 @@ def init_strategies(db: Database):
         return
 
     strategies = [
-        ("freelance_writing", "services", "Freelance writing, blogging, copywriting", 10.0),
-        ("digital_products", "products", "Ebooks, templates, prompt packs, guides", 10.0),
-        ("cold_outreach", "services", "Cold email/LinkedIn outreach for B2B services", 10.0),
-        ("content_sites", "content", "SEO blogs, affiliate content sites", 10.0),
-        ("micro_saas", "products", "Small tools, API wrappers, micro-SaaS products", 10.0),
-        ("telegram_bots", "products", "Telegram bots as paid services", 5.0),
-        ("affiliate", "content", "Review and comparison content for affiliate commissions", 5.0),
-        ("newsletter", "content", "Email newsletters monetized via sponsors and premium tiers", 5.0),
-        ("lead_gen", "services", "B2B lead generation and list building", 10.0),
-        ("social_media", "services", "Social media management for SMBs", 10.0),
-        ("course_creation", "products", "Online courses on Udemy, Skillshare, Gumroad", 5.0),
-        ("domain_flipping", "trading", "Domain name acquisition and resale", 10.0),
-        ("print_on_demand", "products", "POD designs on Redbubble, TeeSpring", 5.0),
-        ("saas", "products", "Full SaaS products with market research and validation", 15.0),
+        ("digital_products", "products", "Ebooks, templates, prompt packs, guides on Gumroad", 50.0),
     ]
     for name, category, description, budget in strategies:
         db.execute_insert(
@@ -123,59 +98,10 @@ def create_orchestrator(config: Config) -> tuple[Orchestrator, Database]:
 
     orchestrator = Orchestrator(config, db, llm)
 
-    # Register built-in strategy agents — each with its own caller tag for cost tracking
-    fw_llm = LLM(config, caller="freelance_writing")
-    fw_llm.set_db(db)
-    orchestrator.register_strategy(FreelanceWritingAgent(config, db, fw_llm))
-
+    # Register the one strategy we're focusing on
     dp_llm = LLM(config, caller="digital_products")
     dp_llm.set_db(db)
     orchestrator.register_strategy(DigitalProductsAgent(config, db, dp_llm))
-
-    # New revenue channel agents — diversified income
-    cs_llm = LLM(config, caller="content_sites")
-    cs_llm.set_db(db)
-    orchestrator.register_strategy(ContentSiteAgent(config, db, cs_llm))
-
-    ms_llm = LLM(config, caller="micro_saas")
-    ms_llm.set_db(db)
-    orchestrator.register_strategy(MicroSaaSAgent(config, db, ms_llm))
-
-    tb_llm = LLM(config, caller="telegram_bots")
-    tb_llm.set_db(db)
-    orchestrator.register_strategy(TelegramBotAgent(config, db, tb_llm))
-
-    af_llm = LLM(config, caller="affiliate")
-    af_llm.set_db(db)
-    orchestrator.register_strategy(AffiliateAgent(config, db, af_llm))
-
-    nl_llm = LLM(config, caller="newsletter")
-    nl_llm.set_db(db)
-    orchestrator.register_strategy(NewsletterAgent(config, db, nl_llm))
-
-    lg_llm = LLM(config, caller="lead_gen")
-    lg_llm.set_db(db)
-    orchestrator.register_strategy(LeadGenAgent(config, db, lg_llm))
-
-    sm_llm = LLM(config, caller="social_media")
-    sm_llm.set_db(db)
-    orchestrator.register_strategy(SocialMediaAgent(config, db, sm_llm))
-
-    cc_llm = LLM(config, caller="course_creation")
-    cc_llm.set_db(db)
-    orchestrator.register_strategy(CourseCreationAgent(config, db, cc_llm))
-
-    df_llm = LLM(config, caller="domain_flipping")
-    df_llm.set_db(db)
-    orchestrator.register_strategy(DomainFlippingAgent(config, db, df_llm))
-
-    pod_llm = LLM(config, caller="print_on_demand")
-    pod_llm.set_db(db)
-    orchestrator.register_strategy(PrintOnDemandAgent(config, db, pod_llm))
-
-    saas_llm = LLM(config, caller="saas")
-    saas_llm.set_db(db)
-    orchestrator.register_strategy(SaaSAgent(config, db, saas_llm))
 
     # ── Startup strategy validation ──────────────────────────────
     # 1. Demote any 'active' strategies that have no registered agent

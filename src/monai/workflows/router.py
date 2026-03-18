@@ -49,20 +49,7 @@ CREATE TABLE IF NOT EXISTS agent_capabilities (
 
 # Default agent → capability mapping
 DEFAULT_CAPABILITIES: dict[str, list[str]] = {
-    "freelance_writing": ["content", "copywriting", "blogging", "seo_content", "proposals"],
     "digital_products": ["ebooks", "templates", "guides", "digital_assets"],
-    "content_sites": ["seo", "keywords", "articles", "affiliate_content"],
-    "micro_saas": ["code", "api", "tools", "automation", "saas_mvp"],
-    "telegram_bots": ["code", "bots", "telegram", "automation"],
-    "affiliate": ["reviews", "comparisons", "affiliate_content", "product_research"],
-    "newsletter": ["email", "content_curation", "subscriber_growth", "sponsorship"],
-    "lead_gen": ["research", "data", "leads", "prospecting", "enrichment"],
-    "social_media": ["social_posts", "engagement", "brand_management", "scheduling"],
-    "course_creation": ["education", "curriculum", "lessons", "online_courses"],
-    "domain_flipping": ["domains", "valuation", "marketplace", "trading"],
-    "print_on_demand": ["design", "merchandise", "creative", "ecommerce"],
-    "saas": ["code", "product_design", "market_research", "saas_full", "architecture"],
-    "cold_outreach": ["sales", "outreach", "b2b", "lead_nurturing"],
     "finance_expert": ["finance", "investment", "roi_analysis", "forecasting", "budgeting"],
     "research_team": ["market_research", "trend_analysis", "competitor_analysis", "niche_discovery"],
     "marketing_team": ["marketing", "campaigns", "growth", "content_marketing", "outreach"],
@@ -72,14 +59,9 @@ DEFAULT_CAPABILITIES: dict[str, list[str]] = {
 
 # Task type → capabilities needed
 TASK_TYPE_CAPABILITIES: dict[str, list[str]] = {
-    "content": ["content", "copywriting", "blogging", "seo_content", "articles"],
-    "code": ["code", "api", "tools", "automation", "saas_mvp", "saas_full"],
-    "marketing": ["social_posts", "outreach", "engagement", "affiliate_content"],
-    "research": ["research", "market_research", "keywords", "product_research"],
-    "sales": ["sales", "outreach", "proposals", "lead_nurturing", "prospecting"],
-    "design": ["design", "creative", "templates", "digital_assets"],
-    "data": ["data", "leads", "enrichment", "research"],
-    "education": ["education", "curriculum", "lessons"],
+    "marketing": ["social_posts", "outreach", "engagement", "content_marketing"],
+    "research": ["market_research", "trend_analysis", "competitor_analysis", "niche_discovery"],
+    "design": ["templates", "digital_assets", "guides", "ebooks"],
     "finance": ["finance", "investment", "roi_analysis", "forecasting", "budgeting"],
 }
 
@@ -176,14 +158,10 @@ class TaskRouter:
         # Fast keyword matching
         keyword_scores: dict[str, int] = {}
         keywords = {
-            "content": ["write", "article", "blog", "copy", "content", "text", "post"],
-            "code": ["build", "code", "api", "deploy", "bug", "feature", "app", "software"],
             "marketing": ["promote", "market", "campaign", "advertise", "social", "brand"],
-            "research": ["research", "analyze", "find", "discover", "investigate", "trend"],
-            "sales": ["sell", "pitch", "proposal", "client", "deal", "close", "outreach"],
-            "design": ["design", "logo", "visual", "creative", "graphic", "template"],
-            "data": ["data", "scrape", "enrich", "leads", "list", "database"],
-            "education": ["course", "teach", "lesson", "tutorial", "curriculum"],
+            "research": ["research", "analyze", "find", "discover", "investigate", "trend", "market"],
+            "design": ["design", "template", "ebook", "guide", "product", "digital"],
+            "finance": ["finance", "budget", "roi", "investment", "cost", "revenue"],
         }
 
         for task_type, words in keywords.items():

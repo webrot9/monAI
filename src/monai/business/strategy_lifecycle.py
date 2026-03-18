@@ -136,27 +136,7 @@ class StrategyLifecycle:
     # Keys: email, platform:<name>, domain, payment, api_key:<name>
     # "email" is the baseline — almost every strategy needs it.
     STRATEGY_REQUIREMENTS: dict[str, list[str]] = {
-        # Can start with just email (outreach-based)
-        "freelance_writing": ["email"],
-        "cold_outreach": ["email"],
-        "lead_gen": ["email"],
-
-        # Need email + platform accounts
-        "social_media": ["email", "platform:linkedin"],
-        "content_sites": ["email", "domain"],
-        "newsletter": ["email"],
-        "affiliate": ["email"],
-
-        # Need payment infrastructure
         "digital_products": ["email", "payment"],
-        "micro_saas": ["email", "payment"],
-        "telegram_bots": ["email"],
-        "course_creation": ["email", "payment"],
-
-        # Need significant infrastructure
-        "domain_flipping": ["email", "payment", "domain"],
-        "print_on_demand": ["email", "payment"],
-        "saas": ["email", "payment", "domain"],
     }
 
     def validate_strategies(self) -> dict[str, Any]:

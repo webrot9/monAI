@@ -252,7 +252,7 @@ class TestFullModel:
         assert total < 250, f"Monthly cost too high: €{total}"
 
     def test_channel_count_matches_agents(self):
-        assert len(CHANNEL_MODELS) == 14
+        assert len(CHANNEL_MODELS) == 1
 
     def test_summary_annual_profit_positive(self, db):
         proj = GrowthProjector(db, initial_capital=500)

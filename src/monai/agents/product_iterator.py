@@ -505,14 +505,6 @@ class ProductIterator(BaseAgent):
         """
         strategy_search_map = {
             "digital_products": f"best {product_name} alternatives Gumroad 2026",
-            "micro_saas": f"{product_name} competitors features pricing 2026",
-            "saas": f"{product_name} vs alternatives comparison 2026",
-            "course_creation": f"best online courses {product_name} topic Udemy 2026",
-            "telegram_bots": f"popular Telegram bots like {product_name} 2026",
-            "affiliate": f"best affiliate review sites {product_name} niche 2026",
-            "content_sites": f"top content sites {product_name} keyword 2026",
-            "newsletter": f"top newsletters {product_name} niche 2026",
-            "print_on_demand": f"trending {product_name} designs POD 2026",
         }
 
         query = strategy_search_map.get(

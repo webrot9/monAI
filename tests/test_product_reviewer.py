@@ -468,39 +468,6 @@ class TestRevisionAndFeedback:
 class TestStrategyPipelineIntegration:
     """Test that strategies correctly integrate the review step."""
 
-    def test_telegram_bots_pipeline_has_review(self):
-        """telegram_bots plan() should include review step after build."""
-        from monai.strategies.telegram_bots import TelegramBotAgent
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cfg = Config()
-            cfg.data_dir = Path(tmpdir)
-            fd, dbpath = tempfile.mkstemp(suffix=".db")
-            os.close(fd)
-            db = Database(Path(dbpath))
-            llm = MagicMock()
-
-            agent = TelegramBotAgent(cfg, db, llm)
-            # Write a "built" product
-            bot_dir = Path(tmpdir) / "telegram_bots"
-            bot_dir.mkdir(parents=True, exist_ok=True)
-            (bot_dir / "test_bot.json").write_text(json.dumps({
-                "design": {"name": "Test Bot"},
-                "status": "built",
-            }))
-
-            plan = agent.plan()
-            assert plan == ["review_product"]
-
-            # After review, status becomes "reviewed" → deploy
-            (bot_dir / "test_bot.json").write_text(json.dumps({
-                "design": {"name": "Test Bot"},
-                "status": "reviewed",
-            }))
-            plan = agent.plan()
-            assert plan == ["deploy_bot"]
-
-            os.unlink(dbpath)
-
     def test_digital_products_pipeline_has_review(self):
         """digital_products plan() should include review step after create."""
         from monai.strategies.digital_products import DigitalProductsAgent
@@ -532,36 +499,6 @@ class TestStrategyPipelineIntegration:
 
             os.unlink(dbpath)
 
-    def test_micro_saas_pipeline_has_review(self):
-        """micro_saas plan() should include review step after build."""
-        from monai.strategies.micro_saas import MicroSaaSAgent
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cfg = Config()
-            cfg.data_dir = Path(tmpdir)
-            fd, dbpath = tempfile.mkstemp(suffix=".db")
-            os.close(fd)
-            db = Database(Path(dbpath))
-            llm = MagicMock()
-
-            agent = MicroSaaSAgent(cfg, db, llm)
-            products_dir = Path(tmpdir) / "micro_saas"
-            products_dir.mkdir(parents=True, exist_ok=True)
-            (products_dir / "test.json").write_text(json.dumps({
-                "design": {"name": "Test SaaS"},
-                "status": "built",
-            }))
-
-            plan = agent.plan()
-            assert plan == ["review_product"]
-
-            (products_dir / "test.json").write_text(json.dumps({
-                "design": {"name": "Test SaaS"},
-                "status": "reviewed",
-            }))
-            plan = agent.plan()
-            assert plan == ["deploy"]
-
-            os.unlink(dbpath)
 
 
 class TestCustomerFeedback:

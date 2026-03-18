@@ -117,28 +117,32 @@ class TestSelfHealingRecording:
         tmpdir = tempfile.mkdtemp()
         db = Database(db_path=Path(tmpdir) / "test.db")
 
-        orch = MagicMock()
-        orch.db = db
-        orch.SELF_HEALING_CONFIG = {
+        from monai.agents.strategy_runner import StrategyRunner
+        from monai.config import Config
+
+        runner = StrategyRunner(Config(), db)
+        runner.SELF_HEALING_CONFIG = {
             "max_consecutive_failures": 3,
             "base_retry_interval": 60,  # Short for testing
             "max_retry_interval": 3600,
             "backoff_factor": 2,
         }
 
-        # Import the actual methods and bind them
+        # Build a duck-typed object that exposes the same API as Orchestrator
+        orch = MagicMock()
+        orch.db = db
+        orch.strategy_runner = runner
+        orch._init_strategy_health = runner._init_strategy_health
+        orch.record_strategy_proxy_failure = runner.record_strategy_proxy_failure
+        orch.record_strategy_success = runner.record_strategy_success
+        orch._check_strategy_retries = runner._check_strategy_retries
+
+        # These methods read directly from DB, bind from Orchestrator
         from monai.agents.orchestrator import Orchestrator
-        orch._init_strategy_health = lambda: Orchestrator._init_strategy_health(orch)
-        orch.record_strategy_proxy_failure = lambda name, reason: \
-            Orchestrator.record_strategy_proxy_failure(orch, name, reason)
-        orch.record_strategy_success = lambda name: \
-            Orchestrator.record_strategy_success(orch, name)
         orch._is_strategy_auto_paused = lambda name: \
             Orchestrator._is_strategy_auto_paused(orch, name)
         orch._get_strategy_pause_reason = lambda name: \
             Orchestrator._get_strategy_pause_reason(orch, name)
-        orch._check_strategy_retries = lambda results: \
-            Orchestrator._check_strategy_retries(orch, results)
 
         # Insert a test strategy
         db.execute_insert(

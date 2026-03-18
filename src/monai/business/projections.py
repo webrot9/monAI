@@ -33,82 +33,10 @@ class ChannelModel:
 
 # Realistic models based on each strategy's economics
 CHANNEL_MODELS: list[ChannelModel] = [
-    # ── Services ─────────────────────────────────────────────
-    ChannelModel(
-        name="freelance_writing", category="services",
-        monthly_cost=15.0, ramp_months=2, steady_monthly_revenue=800.0,
-        curve="linear",
-    ),
-    ChannelModel(
-        name="lead_gen", category="services",
-        monthly_cost=20.0, ramp_months=3, steady_monthly_revenue=600.0,
-        curve="linear",
-    ),
-    ChannelModel(
-        name="social_media", category="services",
-        monthly_cost=15.0, ramp_months=2, steady_monthly_revenue=1200.0,
-        curve="linear",
-    ),
-    ChannelModel(
-        name="cold_outreach", category="services",
-        monthly_cost=10.0, ramp_months=3, steady_monthly_revenue=500.0,
-        curve="linear",
-    ),
-
-    # ── Content ──────────────────────────────────────────────
-    ChannelModel(
-        name="content_sites", category="content",
-        monthly_cost=10.0, ramp_months=6, steady_monthly_revenue=400.0,
-        curve="s_curve",
-    ),
-    ChannelModel(
-        name="affiliate", category="content",
-        monthly_cost=8.0, ramp_months=5, steady_monthly_revenue=350.0,
-        curve="s_curve",
-    ),
-    ChannelModel(
-        name="newsletter", category="content",
-        monthly_cost=8.0, ramp_months=4, steady_monthly_revenue=300.0,
-        curve="s_curve",
-    ),
-
-    # ── Products ─────────────────────────────────────────────
     ChannelModel(
         name="digital_products", category="products",
         monthly_cost=5.0, ramp_months=2, steady_monthly_revenue=250.0,
         curve="step",
-    ),
-    ChannelModel(
-        name="course_creation", category="products",
-        monthly_cost=8.0, ramp_months=3, steady_monthly_revenue=400.0,
-        curve="step",
-    ),
-    ChannelModel(
-        name="micro_saas", category="products",
-        monthly_cost=12.0, ramp_months=3, steady_monthly_revenue=300.0,
-        curve="step",
-    ),
-    ChannelModel(
-        name="telegram_bots", category="products",
-        monthly_cost=5.0, ramp_months=2, steady_monthly_revenue=150.0,
-        curve="step",
-    ),
-    ChannelModel(
-        name="saas", category="products",
-        monthly_cost=25.0, ramp_months=4, steady_monthly_revenue=2000.0,
-        curve="step",
-    ),
-
-    # ── Trading ──────────────────────────────────────────────
-    ChannelModel(
-        name="domain_flipping", category="trading",
-        monthly_cost=15.0, ramp_months=2, steady_monthly_revenue=200.0,
-        curve="sporadic",
-    ),
-    ChannelModel(
-        name="print_on_demand", category="trading",
-        monthly_cost=5.0, ramp_months=2, steady_monthly_revenue=150.0,
-        curve="sporadic",
     ),
 ]
 

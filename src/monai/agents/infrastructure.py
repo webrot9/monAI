@@ -28,13 +28,6 @@ class InfrastructureManager:
     # Map strategy types to the payment providers they need
     STRATEGY_PAYMENT_PROVIDERS: dict[str, list[str]] = {
         "digital_products": ["gumroad"],
-        "telegram_bots": ["stripe"],
-        "micro_saas": ["stripe", "lemonsqueezy"],
-        "saas": ["stripe"],
-        "course_creation": ["gumroad", "stripe"],
-        "print_on_demand": ["stripe"],
-        "freelance_writing": [],
-        "domain_flipping": [],
     }
 
     TOR_BLOCKED_PROVIDERS: set[str] = {"stripe", "gumroad", "lemonsqueezy"}

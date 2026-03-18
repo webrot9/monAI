@@ -63,9 +63,9 @@ class TestInit:
 
 class TestBrandRegistration:
     def test_register_brand_default_platforms(self, agent, db):
-        accounts = agent.register_brand("micro_saas")
+        accounts = agent.register_brand("digital_products")
         platforms = {a["platform"] for a in accounts}
-        assert platforms == set(BRAND_PLATFORMS["micro_saas"])
+        assert platforms == set(BRAND_PLATFORMS["digital_products"])
 
     def test_register_brand_custom_platforms(self, agent, db):
         accounts = agent.register_brand("newsletter", platforms=["twitter"])
@@ -86,12 +86,12 @@ class TestBrandRegistration:
         assert accounts[0]["platform"] == "twitter"
 
     def test_register_brand_idempotent(self, agent, db):
-        agent.register_brand("micro_saas")
-        agent.register_brand("micro_saas")  # duplicate
+        agent.register_brand("digital_products")
+        agent.register_brand("digital_products")  # duplicate
         rows = db.execute(
-            "SELECT * FROM brand_social_accounts WHERE brand = 'micro_saas'"
+            "SELECT * FROM brand_social_accounts WHERE brand = 'digital_products'"
         )
-        assert len(rows) == len(BRAND_PLATFORMS["micro_saas"])
+        assert len(rows) == len(BRAND_PLATFORMS["digital_products"])
 
     def test_get_brands(self, agent):
         agent.register_brand("micro_saas")
@@ -111,10 +111,10 @@ class TestBrandRegistration:
 
 class TestAccountManagement:
     def test_get_brand_accounts(self, agent, db):
-        agent.register_brand("saas")
-        accounts = agent._get_brand_accounts("saas")
-        assert len(accounts) == len(BRAND_PLATFORMS["saas"])
-        assert all(a["brand"] == "saas" for a in accounts)
+        agent.register_brand("digital_products")
+        accounts = agent._get_brand_accounts("digital_products")
+        assert len(accounts) == len(BRAND_PLATFORMS["digital_products"])
+        assert all(a["brand"] == "digital_products" for a in accounts)
 
     def test_setup_account_with_valid_creds(self, agent, db):
         agent.register_brand("micro_saas")
@@ -136,9 +136,9 @@ class TestAccountManagement:
 
     def test_setup_account_rejects_missing_required_fields(self, agent, db):
         """Cannot activate LinkedIn without access_token + person_urn."""
-        agent.register_brand("newsletter")
+        agent.register_brand("brand_b", platforms=["linkedin"])
         result = agent.setup_account(
-            "newsletter", "linkedin", "newsletter_co",
+            "brand_b", "linkedin", "brand_b_co",
             credentials={"password": "hunter2"},
         )
         assert result["status"] == "rejected"
@@ -147,7 +147,7 @@ class TestAccountManagement:
         # Account should still be in 'planned' status, NOT 'active'
         rows = db.execute(
             "SELECT status FROM brand_social_accounts "
-            "WHERE brand = 'newsletter' AND platform = 'linkedin'"
+            "WHERE brand = 'brand_b' AND platform = 'linkedin'"
         )
         assert rows[0]["status"] == "planned"
 
@@ -867,12 +867,7 @@ class TestPlatformStrategies:
         assert len(PLATFORM_STRATEGIES["reddit"]["subreddits"]) > 5
 
     def test_all_strategies_have_platform_recommendations(self):
-        expected = [
-            "freelance_writing", "digital_products", "content_sites",
-            "micro_saas", "telegram_bots", "affiliate", "newsletter",
-            "lead_gen", "social_media", "course_creation", "domain_flipping",
-            "print_on_demand", "saas", "cold_outreach",
-        ]
+        expected = ["digital_products"]
         for strategy in expected:
             assert strategy in BRAND_PLATFORMS, f"Missing platform recs for {strategy}"
 

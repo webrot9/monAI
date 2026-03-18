@@ -152,20 +152,7 @@ PLATFORM_STRATEGIES = {
 
 # Brand-specific platform recommendations (which platforms suit which business)
 BRAND_PLATFORMS = {
-    "freelance_writing": ["twitter", "linkedin"],
     "digital_products": ["twitter", "indie_hackers", "reddit"],
-    "content_sites": ["twitter", "reddit"],
-    "micro_saas": ["twitter", "indie_hackers", "reddit", "linkedin"],
-    "telegram_bots": ["twitter", "reddit"],
-    "affiliate": ["twitter", "reddit"],
-    "newsletter": ["twitter", "linkedin", "indie_hackers"],
-    "lead_gen": ["linkedin", "twitter"],
-    "social_media": ["twitter", "linkedin"],
-    "course_creation": ["twitter", "linkedin", "reddit"],
-    "domain_flipping": ["twitter"],
-    "print_on_demand": ["twitter", "reddit"],
-    "saas": ["twitter", "linkedin", "indie_hackers", "reddit"],
-    "cold_outreach": ["linkedin", "twitter"],
 }
 
 

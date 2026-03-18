@@ -547,9 +547,9 @@ class TestPlatformIntegration:
 class TestPipelineFactCheck:
     """Test that fact_check steps are present in content pipelines."""
 
-    def test_content_pipeline_has_fact_check(self):
-        from monai.workflows.pipelines import content_pipeline
-        pipeline = content_pipeline()
+    def test_digital_products_pipeline_has_fact_check(self):
+        from monai.workflows.pipelines import digital_products_pipeline
+        pipeline = digital_products_pipeline()
         step_names = [s.name for s in pipeline.steps]
         assert "fact_check" in step_names
 
@@ -557,24 +557,6 @@ class TestPipelineFactCheck:
         fc_idx = step_names.index("fact_check")
         hum_idx = step_names.index("humanize")
         assert fc_idx < hum_idx
-
-    def test_affiliate_pipeline_has_fact_check(self):
-        from monai.workflows.pipelines import affiliate_content_pipeline
-        pipeline = affiliate_content_pipeline()
-        step_names = [s.name for s in pipeline.steps]
-        assert "fact_check_content" in step_names
-
-    def test_course_pipeline_has_fact_check(self):
-        from monai.workflows.pipelines import course_creation_pipeline
-        pipeline = course_creation_pipeline()
-        step_names = [s.name for s in pipeline.steps]
-        assert "fact_check_lessons" in step_names
-
-    def test_product_launch_pipeline_has_fact_check(self):
-        from monai.workflows.pipelines import product_launch_pipeline
-        pipeline = product_launch_pipeline()
-        step_names = [s.name for s in pipeline.steps]
-        assert "fact_check_landing" in step_names
 
 
 class TestOrchestratorAuditIntegration:

@@ -13,8 +13,7 @@ from monai.workflows.engine import (
 )
 from monai.workflows.router import TaskRouter, DEFAULT_CAPABILITIES, TASK_TYPE_CAPABILITIES
 from monai.workflows.pipelines import (
-    content_pipeline, product_launch_pipeline, client_acquisition_pipeline,
-    affiliate_content_pipeline, revenue_diversification_pipeline,
+    digital_products_pipeline,
     get_pipeline, list_pipelines, PIPELINE_REGISTRY,
 )
 
@@ -334,53 +333,48 @@ class TestTaskRouter:
         rows = db.execute("SELECT COUNT(*) as c FROM agent_capabilities")
         assert rows[0]["c"] > 0
 
-    def test_classify_content_task(self, config, db, mock_llm):
+    def test_classify_marketing_task(self, config, db, mock_llm):
         router = TaskRouter(config, db, mock_llm)
-        assert router._classify_task("Write a blog post about AI") == "content"
-
-    def test_classify_code_task(self, config, db, mock_llm):
-        router = TaskRouter(config, db, mock_llm)
-        assert router._classify_task("Build an API endpoint for users") == "code"
-
-    def test_classify_sales_task(self, config, db, mock_llm):
-        router = TaskRouter(config, db, mock_llm)
-        assert router._classify_task("Send a proposal to the client") == "sales"
+        assert router._classify_task("Promote our product on social media") == "marketing"
 
     def test_classify_research_task(self, config, db, mock_llm):
         router = TaskRouter(config, db, mock_llm)
-        assert router._classify_task("Research market trends for SaaS") == "research"
+        assert router._classify_task("Research market trends") == "research"
 
-    def test_route_content_task(self, config, db, mock_llm):
+    def test_classify_design_task(self, config, db, mock_llm):
         router = TaskRouter(config, db, mock_llm)
-        result = router.route("Write a blog post about Python", task_type="content")
-        assert result["routed_to"] is not None
-        assert result["task_type"] == "content"
+        assert router._classify_task("Design an ebook template") == "design"
 
-    def test_route_code_task(self, config, db, mock_llm):
+    def test_classify_finance_task(self, config, db, mock_llm):
         router = TaskRouter(config, db, mock_llm)
-        result = router.route("Build a REST API", task_type="code")
+        assert router._classify_task("Analyze budget and ROI") == "finance"
+
+    def test_route_research_task_to_agent(self, config, db, mock_llm):
+        router = TaskRouter(config, db, mock_llm)
+        result = router.route("Research market trends", task_type="research")
         assert result["routed_to"] is not None
+        assert result["task_type"] == "research"
 
     def test_route_auto_classify(self, config, db, mock_llm):
         router = TaskRouter(config, db, mock_llm)
-        result = router.route("Write an article about machine learning")
-        assert result["task_type"] == "content"
+        result = router.route("Research market trends for digital products")
+        assert result["task_type"] == "research"
         assert result["routed_to"] is not None
 
     def test_update_performance(self, config, db, mock_llm):
         router = TaskRouter(config, db, mock_llm)
         # Get initial state
         rows = db.execute(
-            "SELECT * FROM agent_capabilities WHERE agent_name = 'freelance_writing' "
-            "AND capability = 'content'"
+            "SELECT * FROM agent_capabilities WHERE agent_name = 'digital_products' "
+            "AND capability = 'ebooks'"
         )
         initial_tasks = rows[0]["tasks_completed"]
 
-        router.update_performance("freelance_writing", "content", True, 1000)
+        router.update_performance("digital_products", "ebooks", True, 1000)
 
         rows = db.execute(
-            "SELECT * FROM agent_capabilities WHERE agent_name = 'freelance_writing' "
-            "AND capability = 'content'"
+            "SELECT * FROM agent_capabilities WHERE agent_name = 'digital_products' "
+            "AND capability = 'ebooks'"
         )
         assert rows[0]["tasks_completed"] == initial_tasks + 1
 
@@ -392,10 +386,8 @@ class TestTaskRouter:
         router = TaskRouter(config, db, mock_llm)
         stats = router.get_agent_stats()
         assert len(stats) > 0
-        # All known agents should have stats
         agent_names = {s["agent_name"] for s in stats}
-        assert "freelance_writing" in agent_names
-        assert "saas" in agent_names
+        assert "digital_products" in agent_names
 
     def test_routing_stats_empty(self, config, db, mock_llm):
         router = TaskRouter(config, db, mock_llm)
@@ -414,38 +406,21 @@ class TestPipelineDefinitions:
             assert p.name
             assert len(p.steps) > 0
 
-    def test_content_pipeline(self):
-        p = content_pipeline()
-        assert p.name == "content_pipeline"
+    def test_digital_products_pipeline(self):
+        p = digital_products_pipeline()
+        assert p.name == "digital_products"
         step_names = [s.name for s in p.steps]
-        assert "research_keywords" in step_names
+        assert "research" in step_names
+        assert "create" in step_names
+        assert "review" in step_names
+        assert "fact_check" in step_names
         assert "humanize" in step_names
-        assert "distribute" in step_names
-
-    def test_product_launch_pipeline(self):
-        p = product_launch_pipeline()
-        assert p.name == "product_launch"
-        step_names = [s.name for s in p.steps]
-        assert "discover" in step_names
-        assert "validate" in step_names
-        assert "build_mvp" in step_names
-
-    def test_client_acquisition_pipeline(self):
-        p = client_acquisition_pipeline()
-        step_names = [s.name for s in p.steps]
-        assert "find_leads" in step_names
-        assert "qualify" in step_names
-
-    def test_revenue_diversification_pipeline(self):
-        p = revenue_diversification_pipeline()
-        # Should have parallel groups for all categories
-        parallel_steps = [s for s in p.steps if s.step_type == StepType.PARALLEL]
-        assert len(parallel_steps) >= 4  # services, products, content, trading
+        assert "list_product" in step_names
 
     def test_get_pipeline_existing(self):
-        p = get_pipeline("content")
+        p = get_pipeline("digital_products")
         assert p is not None
-        assert p.name == "content_pipeline"
+        assert p.name == "digital_products"
 
     def test_get_pipeline_nonexistent(self):
         assert get_pipeline("nonexistent") is None
@@ -454,8 +429,7 @@ class TestPipelineDefinitions:
         pipelines = list_pipelines()
         assert len(pipelines) == len(PIPELINE_REGISTRY)
         names = [p["name"] for p in pipelines]
-        assert "content" in names
-        assert "product_launch" in names
+        assert "digital_products" in names
 
     def test_execution_orders_valid(self):
         """All pipelines should produce valid execution orders."""
@@ -472,7 +446,7 @@ class TestPipelineDefinitions:
 
 class TestDefaultCapabilities:
     def test_all_agents_have_capabilities(self):
-        assert len(DEFAULT_CAPABILITIES) >= 14
+        assert len(DEFAULT_CAPABILITIES) >= 1
 
     def test_no_empty_capabilities(self):
         for agent, caps in DEFAULT_CAPABILITIES.items():
