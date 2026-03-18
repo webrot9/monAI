@@ -13,6 +13,55 @@ from monai.config import Config, LLMConfig, RiskConfig, CommsConfig, TelegramCon
 from monai.db.database import Database
 
 
+@pytest.fixture(autouse=True)
+def _no_network_in_tests(request):
+    """Prevent real network calls during tests.
+
+    Patches:
+    1. NameValidator.generate_and_validate — does DNS lookups, HTTP to Google
+       DNS API, GitHub/Twitter profile checks, Google web searches.
+    2. ProxyFallbackChain._get_free_proxy — scrapes free proxy lists and
+       waits up to 30s for results.
+
+    Tests marked with @pytest.mark.real_validator skip the validator patch.
+    """
+    from monai.agents.name_validator import NameValidator, FullValidation
+    from monai.utils.privacy import ProxyFallbackChain
+
+    def fake_generate_and_validate(self, **kwargs):
+        identity = {
+            "name": "TestCo Digital",
+            "tagline": "AI-powered digital services",
+            "description": "Test company for automated testing",
+            "preferred_username": "testco_digital",
+            "business_type": "digital_services",
+        }
+        validation = FullValidation(
+            name="TestCo Digital",
+            checks=[],
+            overall_viable=True,
+            blockers=[],
+            warnings=[],
+        )
+        return identity, validation
+
+    def _fast_get_free_proxy(self, wait: bool = False):
+        """Skip network scraping. If a mock pool was set, use it; else return None."""
+        if self._free_proxy_pool is not None:
+            return self._free_proxy_pool.get_proxy(wait=wait)
+        return None
+
+    patches = [patch.object(ProxyFallbackChain, "_get_free_proxy", _fast_get_free_proxy)]
+    if "real_validator" not in request.keywords:
+        patches.append(patch.object(NameValidator, "generate_and_validate", fake_generate_and_validate))
+
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        yield
+
+
 @pytest.fixture
 def tmp_dir(tmp_path):
     """Provide a temporary directory for test data."""

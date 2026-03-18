@@ -342,6 +342,7 @@ class TestNameValidator:
 
     # ── Generate and Validate Loop ────────────────────────────
 
+    @pytest.mark.real_validator
     def test_generate_and_validate_first_try_viable(self, validator, mock_llm):
         """First generated name passes all checks."""
         mock_llm.quick_json.side_effect = [
@@ -370,6 +371,7 @@ class TestNameValidator:
         assert identity["name"] == "ZetaNova"
         assert validation.overall_viable is True
 
+    @pytest.mark.real_validator
     def test_generate_and_validate_retries_on_failure(self, validator, mock_llm):
         """Retries with feedback when first name has blockers."""
         mock_llm.quick_json.side_effect = [
@@ -405,6 +407,7 @@ class TestNameValidator:
         assert "PREVIOUS ATTEMPTS" in second_call_prompt
         assert "BadName" in second_call_prompt
 
+    @pytest.mark.real_validator
     def test_generate_and_validate_returns_best_effort(self, validator, mock_llm):
         """After max attempts, returns the best (least blockers) attempt."""
         mock_llm.quick_json.side_effect = [

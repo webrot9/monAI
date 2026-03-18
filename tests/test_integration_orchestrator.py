@@ -36,8 +36,27 @@ def integration_config(tmp_path):
 
 @pytest.fixture
 def integration_db(tmp_path):
-    """Fresh database for integration tests."""
-    return Database(db_path=tmp_path / "integration.db")
+    """Fresh database for integration tests with pre-seeded identity."""
+    db = Database(db_path=tmp_path / "integration.db")
+    # Pre-seed identity to avoid DNS lookups during IdentityManager init
+    import json
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS identities ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  type TEXT NOT NULL, platform TEXT NOT NULL,"
+        "  identifier TEXT NOT NULL, credentials TEXT,"
+        "  status TEXT DEFAULT 'active', metadata TEXT,"
+        "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+        "  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
+    db.execute_insert(
+        "INSERT INTO identities (type, platform, identifier, metadata) "
+        "VALUES ('agent_identity', 'self', 'TestCo Digital', ?)",
+        (json.dumps({"name": "TestCo Digital", "tagline": "Test tagline",
+                     "description": "Test company", "style": "professional"}),),
+    )
+    return db
 
 
 @pytest.fixture
@@ -357,29 +376,33 @@ class TestBrandSync:
 
         lifecycle = StrategyLifecycle(db)
 
-        # Create a pending strategy with email asset
+        # Create a pending strategy with email + payment assets (digital_products requires both)
         db.execute_insert(
             "INSERT INTO strategies (name, category, description, status) "
-            "VALUES ('freelance_writing', 'services', 'test', 'pending')"
+            "VALUES ('digital_products', 'products', 'test', 'pending')"
         )
         db.execute_insert(
             "INSERT INTO identities (type, platform, status, identifier) "
             "VALUES ('email', 'email', 'active', 'test@example.com')"
         )
+        db.execute_insert(
+            "INSERT INTO identities (type, platform, status, identifier) "
+            "VALUES ('payment', 'gumroad', 'active', 'gumroad_account')"
+        )
 
         result = lifecycle.validate_strategies()
 
-        assert "freelance_writing" in result["activated"]
+        assert "digital_products" in result["activated"]
         assert result["brands_registered"] >= 1
 
         # Check that brand_social_accounts were actually created
         rows = db.execute(
-            "SELECT * FROM brand_social_accounts WHERE brand = 'freelance_writing'"
+            "SELECT * FROM brand_social_accounts WHERE brand = 'digital_products'"
         )
         assert len(rows) > 0
         platforms = {r["platform"] for r in rows}
         assert "twitter" in platforms
-        assert "linkedin" in platforms
+        assert "reddit" in platforms
 
     def test_brands_removed_on_pause(self, db):
         """When a strategy is paused, its brands must be removed."""
