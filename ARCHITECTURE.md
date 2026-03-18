@@ -20,32 +20,23 @@ The creator provides initial seed capital (via anonymous crowdfunding donation).
 
 6. **Creator Protection**: The creator must NEVER face legal issues, financial losses, or reputational damage. monAI absorbs all risk. Ethics are hardcoded and non-negotiable.
 
-## System Architecture
+## System Architecture (post-Opzione A refactor)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      ORCHESTRATOR                           │
-│  Master brain: strategy selection, opportunity discovery,   │
-│  agent coordination, infrastructure management              │
+│                   ORCHESTRATOR (thin coordinator)            │
+│  ~720 lines. Wires subsystems, runs cycle phases.           │
+├─────────────────────────────────────────────────────────────┤
+│  InfrastructureManager │ Provisioning, identity, LLC, API   │
+│  FinanceController     │ Ledger, reporting, payments, FX    │
+│  StrategyRunner        │ Registration, lifecycle, execution │
+│  OperationsManager     │ Audit, alerts, backup, ethics, TG  │
 └─────────┬───────────────────────────────────────────────────┘
           │
     ┌─────┴──────────────────────────────────────────┐
-    │              AGENT TEAMS                        │
-    ├─────────────────────────────────────────────────┤
-    │  Research Team    │ Market, trends, competitors │
-    │  Engineering Team │ Code, bugs, testing         │
-    │  Marketing Team   │ Content, growth, outreach   │
-    │  Specialist Agents│ Legal, ethics, humanizer,   │
-    │                   │ fact-checker, finance, etc.  │
-    └─────────────────────────────────────────────────┘
-          │
-    ┌─────┴──────────────────────────────────────────┐
-    │           13 STRATEGY AGENTS                    │
-    │  freelance_writing, digital_products,           │
-    │  content_sites, micro_saas, saas, affiliate,    │
-    │  newsletter, lead_gen, social_media,            │
-    │  course_creation, domain_flipping,              │
-    │  print_on_demand, telegram_bots                 │
+    │           STRATEGY AGENTS (MVP: 1)              │
+    │  digital_products (Gumroad)                     │
+    │  [12 others: paused/removed for MVP]            │
     └─────────────────────────────────────────────────┘
           │
     ┌─────┴──────────────────────────────────────────┐

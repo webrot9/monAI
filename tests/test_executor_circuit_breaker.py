@@ -73,7 +73,8 @@ class TestCircuitBreaker:
             call_count["n"] += 1
             if call_count["n"] == 8:
                 return {"tool": "done", "args": {"result": "finished"}}
-            return {"tool": "browse", "args": {"url": "https://example.com"}}
+            # Use unique URLs to avoid domain-rejection guard
+            return {"tool": "browse", "args": {"url": f"https://example{call_count['n']}.com"}}
 
         executor._think = fake_think
         executor.browser = AsyncMock()

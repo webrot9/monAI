@@ -31,6 +31,13 @@ def llm():
     mock = MagicMock()
     mock.quick.return_value = "Generated content here."
     mock.chat_json.return_value = {}
+    mock.quick_json.return_value = {
+        "name": "TestCorp",
+        "tagline": "Test",
+        "description": "Testing company",
+        "preferred_username": "testcorp123",
+        "business_type": "digital_services",
+    }
     return mock
 
 
