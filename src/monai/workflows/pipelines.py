@@ -30,7 +30,7 @@ def digital_products_pipeline() -> Pipeline:
               depends_on=["review"])
         .step("humanize", agent="humanizer", action="humanize",
               depends_on=["fact_check"])
-        .step("list_product", agent="digital_products", action="_list_on_gumroad",
+        .step("list_product", agent="digital_products", action="_list_product",
               depends_on=["humanize"])
     )
 
