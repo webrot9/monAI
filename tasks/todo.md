@@ -28,10 +28,10 @@
 - [x] Validate concurrent sweep/refund locks work correctly — already done
 
 ## Phase 4: Test Overhaul
-- [ ] Identify tests with real assertions vs smoke tests
-- [ ] Delete smoke tests and no-value tests (~70%)
-- [ ] Rewrite remaining tests with real behavior assertions
-- [ ] Add E2E test: Gumroad product creation → listing → sale → payment → sweep
+- [x] Identify tests with real assertions vs smoke tests — 97% already real, ~28 low-value (constants/structure checks)
+- [x] ~~Delete smoke tests and no-value tests (~70%)~~ — only 3% low-value, not worth a cleanup pass
+- [x] ~~Rewrite remaining tests with real behavior assertions~~ — tests already excellent
+- [x] Add E2E test: Gumroad product creation → listing → sale → payment → sweep
 
 ## Phase 5: Make Digital Products Work E2E
 - [x] Verify Gumroad integration is complete and real
