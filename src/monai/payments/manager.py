@@ -511,30 +511,36 @@ class UnifiedPaymentManager:
 
     async def _handle_refund_inner(self, event: WebhookEvent) -> None:
         """Refund logic — must be called under brand lock when brand is known."""
-        payments = self.db.execute(
-            "SELECT id, brand, amount, currency FROM brand_payments_received "
-            "WHERE payment_ref = ? LIMIT 1",
-            (event.payment_ref,),
-        )
-        if not payments:
-            logger.warning(f"Refund for unknown payment: {event.payment_ref}")
-            return
+        # Ensure deficit table exists before entering the atomic transaction
+        self._ensure_deficit_table()
 
-        payment = dict(payments[0])
-        self.brand_payments.refund_payment(payment["id"])
+        # ATOMIC: refund + deficit tracking in single transaction
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT id, brand, amount, currency FROM brand_payments_received "
+                "WHERE payment_ref = ? LIMIT 1",
+                (event.payment_ref,),
+            ).fetchall()
+            if not rows:
+                logger.warning(f"Refund for unknown payment: {event.payment_ref}")
+                return
 
-        # Check if this brand's funds were already swept to creator
-        swept = self.db.execute(
-            "SELECT id, status, tx_reference FROM brand_profit_sweeps "
-            "WHERE brand = ? AND status = 'completed' "
-            "ORDER BY completed_at DESC LIMIT 1",
-            (payment["brand"],),
-        )
-        if swept:
-            # Track the deficit so it can be recovered from future sweeps
-            try:
-                self._ensure_deficit_table()
-                self.db.execute_insert(
+            payment = dict(rows[0])
+            conn.execute(
+                "UPDATE brand_payments_received SET status = 'refunded' "
+                "WHERE id = ?",
+                (payment["id"],),
+            )
+
+            # Check if this brand's funds were already swept to creator
+            swept = conn.execute(
+                "SELECT id, status, tx_reference FROM brand_profit_sweeps "
+                "WHERE brand = ? AND status = 'completed' "
+                "ORDER BY completed_at DESC LIMIT 1",
+                (payment["brand"],),
+            ).fetchall()
+            if swept:
+                conn.execute(
                     "INSERT INTO sweep_deficits "
                     "(brand, payment_ref, amount, currency, sweep_id, status) "
                     "VALUES (?, ?, ?, ?, ?, 'outstanding')",
@@ -542,9 +548,9 @@ class UnifiedPaymentManager:
                      payment["amount"], payment["currency"],
                      swept[0]["id"]),
                 )
-            except Exception as e:
-                logger.error(f"Failed to record sweep deficit: {e}")
 
+        # Log outside transaction (non-critical)
+        if swept:
             logger.critical(
                 f"REFUND AFTER SWEEP: Payment {event.payment_ref} for "
                 f"{payment['amount']} {payment['currency']} was already swept. "
@@ -667,14 +673,14 @@ class UnifiedPaymentManager:
         except json.JSONDecodeError:
             return {"success": False, "error": "Corrupted raw_payload"}
 
-        # Remove idempotency lock so re-processing can proceed
+        # ATOMIC: remove idempotency lock + event in single transaction
         idem_id = f"{row['payment_ref']}:{row['event_type']}"
-        self.db.execute(
-            "DELETE FROM processed_webhooks WHERE provider = ? AND event_id = ?",
-            (row["provider"], idem_id),
-        )
-        # Remove original webhook_events entry (handler will re-insert)
-        self.db.execute("DELETE FROM webhook_events WHERE id = ?", (event_id,))
+        with self.db.transaction() as conn:
+            conn.execute(
+                "DELETE FROM processed_webhooks WHERE provider = ? AND event_id = ?",
+                (row["provider"], idem_id),
+            )
+            conn.execute("DELETE FROM webhook_events WHERE id = ?", (event_id,))
 
         # Reconstruct the WebhookEvent
         try:

@@ -364,16 +364,18 @@ def make_checkout_revenue_handler(db):
         link = dict(rows[0])
         amount = event.amount if event.amount > 0 else link["amount"]
 
-        db.execute(
-            "UPDATE checkout_links SET status = 'paid', paid_at = CURRENT_TIMESTAMP "
-            "WHERE id = ?", (link["id"],),
-        )
-        db.execute_insert(
-            "INSERT INTO transactions (type, category, amount, description) "
-            "VALUES ('revenue', ?, ?, ?)",
-            (link["strategy_name"], amount,
-             f"Sale via {link['provider']}: {link['product']}"),
-        )
+        # ATOMIC: checkout status + revenue record in single transaction
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE checkout_links SET status = 'paid', paid_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?", (link["id"],),
+            )
+            conn.execute(
+                "INSERT INTO transactions (type, category, amount, description) "
+                "VALUES ('revenue', ?, ?, ?)",
+                (link["strategy_name"], amount,
+                 f"Sale via {link['provider']}: {link['product']}"),
+            )
         logger.info(
             f"Revenue recorded: {link['strategy_name']} — "
             f"{amount} {event.currency} for {link['product']}"

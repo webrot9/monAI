@@ -206,10 +206,20 @@ class TestWebhookEventProcessing:
 
     @pytest.mark.asyncio
     async def test_payment_refunded_event(self, manager, mock_db):
-        mock_db.execute.return_value = [
+        # Set up transaction conn to return payment rows then empty swept rows
+        payment_cursor = MagicMock()
+        payment_cursor.fetchall.return_value = [
             {"id": 5, "brand": "test_brand", "amount": 50.0, "currency": "EUR"},
         ]
-        manager.brand_payments.refund_payment = MagicMock()
+        swept_cursor = MagicMock()
+        swept_cursor.fetchall.return_value = []
+        mock_tx_conn = MagicMock()
+        mock_tx_conn.execute = MagicMock(
+            side_effect=[payment_cursor, None, swept_cursor]
+        )
+        mock_db.transaction.return_value.__enter__ = MagicMock(
+            return_value=mock_tx_conn
+        )
 
         event = WebhookEvent(
             event_type=WebhookEventType.PAYMENT_REFUNDED,
@@ -217,8 +227,14 @@ class TestWebhookEventProcessing:
             payment_ref="cs_refunded",
         )
 
-        await manager._handle_webhook_event(event)
-        manager.brand_payments.refund_payment.assert_called_once_with(5)
+        # Test _handle_refund_inner directly to isolate from idempotency tx
+        await manager._handle_refund_inner(event)
+        # Verify atomic refund: SELECT + UPDATE + SELECT ran inside transaction
+        assert mock_tx_conn.execute.call_count == 3
+        # Second call is the UPDATE setting status='refunded'
+        update_call = mock_tx_conn.execute.call_args_list[1]
+        assert "SET status = 'refunded'" in update_call[0][0]
+        assert update_call[0][1] == (5,)
 
     @pytest.mark.asyncio
     async def test_payment_disputed_event(self, manager, mock_db):

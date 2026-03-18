@@ -24,7 +24,7 @@
   - All 6 payment providers (Stripe, BTCPay, Gumroad, LemonSqueezy, Monero, Ko-fi)
   - Sweep engine, brand_payments, integrations/gumroad
 - [x] Fix refund-after-sweep race condition (lock + deficit tracking) — already done
-- [ ] Add DB transaction wrapping for payment state changes
+- [x] Add DB transaction wrapping for payment state changes
 - [x] Validate concurrent sweep/refund locks work correctly — already done
 
 ## Phase 4: Test Overhaul
