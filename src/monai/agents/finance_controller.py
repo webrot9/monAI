@@ -178,20 +178,21 @@ class FinanceController:
                     reinvest_result["reinvest"], strat_perf,
                 )
 
-                from datetime import datetime
-                for alloc in allocations:
-                    if alloc.get("amount", 0) > 0:
-                        self.db.execute(
-                            "UPDATE strategies SET allocated_budget = allocated_budget + ? "
-                            "WHERE name = ?",
-                            (alloc["amount"], alloc["strategy"]),
-                        )
-                    elif alloc.get("action") == "reduce":
-                        self.db.execute(
-                            "UPDATE strategies SET allocated_budget = MAX(0, allocated_budget * 0.5) "
-                            "WHERE name = ?",
-                            (alloc["strategy"],),
-                        )
+                # Wrap all allocation updates + recording in a single transaction
+                with self.db.transaction() as conn:
+                    for alloc in allocations:
+                        if alloc.get("amount", 0) > 0:
+                            conn.execute(
+                                "UPDATE strategies SET allocated_budget = allocated_budget + ? "
+                                "WHERE name = ?",
+                                (alloc["amount"], alloc["strategy"]),
+                            )
+                        elif alloc.get("action") == "reduce":
+                            conn.execute(
+                                "UPDATE strategies SET allocated_budget = MAX(0, allocated_budget * 0.5) "
+                                "WHERE name = ?",
+                                (alloc["strategy"],),
+                            )
 
                 self.commercialista.record_reinvestment(
                     reinvest=reinvest_result["reinvest"],

@@ -307,44 +307,35 @@ class BrandPayments:
     def get_sweepable_balance(self, brand: str, currency: str | None = None) -> float:
         """Calculate how much can be swept from a brand's accounts.
 
+        Uses a single atomic query to avoid race conditions between
+        reading received payments and swept amounts.
+
         Args:
             brand: Brand name.
             currency: If provided, only count payments in this currency.
         """
         if currency:
             rows = self.db.execute(
-                "SELECT COALESCE(SUM(amount), 0) as received "
-                "FROM brand_payments_received "
-                "WHERE brand = ? AND status = 'completed' AND currency = ?",
-                (brand, currency),
+                "SELECT MAX(0, "
+                "  COALESCE((SELECT SUM(amount) FROM brand_payments_received "
+                "            WHERE brand = ? AND status = 'completed' AND currency = ?), 0) - "
+                "  COALESCE((SELECT SUM(amount) FROM brand_profit_sweeps "
+                "            WHERE brand = ? AND status IN ('completed', 'pending', 'mixing') "
+                "            AND currency = ?), 0)"
+                ") as balance",
+                (brand, currency, brand, currency),
             )
         else:
             rows = self.db.execute(
-                "SELECT COALESCE(SUM(amount), 0) as received "
-                "FROM brand_payments_received "
-                "WHERE brand = ? AND status = 'completed'",
-                (brand,),
+                "SELECT MAX(0, "
+                "  COALESCE((SELECT SUM(amount) FROM brand_payments_received "
+                "            WHERE brand = ? AND status = 'completed'), 0) - "
+                "  COALESCE((SELECT SUM(amount) FROM brand_profit_sweeps "
+                "            WHERE brand = ? AND status IN ('completed', 'pending', 'mixing')), 0)"
+                ") as balance",
+                (brand, brand),
             )
-        received = rows[0]["received"] if rows else 0
-
-        if currency:
-            rows = self.db.execute(
-                "SELECT COALESCE(SUM(amount), 0) as swept "
-                "FROM brand_profit_sweeps "
-                "WHERE brand = ? AND status IN ('completed', 'pending', 'mixing') "
-                "AND currency = ?",
-                (brand, currency),
-            )
-        else:
-            rows = self.db.execute(
-                "SELECT COALESCE(SUM(amount), 0) as swept "
-                "FROM brand_profit_sweeps "
-                "WHERE brand = ? AND status IN ('completed', 'pending', 'mixing')",
-                (brand,),
-            )
-        swept = rows[0]["swept"] if rows else 0
-
-        return max(0.0, received - swept)
+        return rows[0]["balance"] if rows else 0.0
 
     def get_sweepable_by_currency(self, brand: str) -> dict[str, float]:
         """Get sweepable balance per currency for a brand."""
