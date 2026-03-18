@@ -25,6 +25,7 @@ from monai.payments.types import (
     ProviderBalance,
     WebhookEvent,
     WebhookEventType,
+    _to_decimal,
 )
 
 logger = logging.getLogger(__name__)
@@ -109,9 +110,9 @@ class GumroadProvider(PaymentProvider):
             return PaymentResult(success=False, error=str(e))
 
         try:
-            price = float(sale.get("price", 0)) / 100
-        except (ValueError, TypeError):
-            price = 0.0
+            price = _to_decimal(sale.get("price", 0)) / 100
+        except (Exception,):
+            price = _to_decimal(0)
         refunded = sale.get("refunded", False)
 
         if refunded:
@@ -140,13 +141,14 @@ class GumroadProvider(PaymentProvider):
             sales = result.get("sales", [])
 
             total_sales = sum(
-                float(s.get("seller_price", s.get("price", 0))) / 100
-                for s in sales
-                if not s.get("refunded", False)
+                (_to_decimal(s.get("seller_price", s.get("price", 0))) / 100
+                 for s in sales
+                 if not s.get("refunded", False)),
+                _to_decimal(0),
             )
 
             # Subtract payouts already received (tracked in local DB or via API)
-            total_payouts = 0.0
+            total_payouts = _to_decimal(0)
             try:
                 # Gumroad doesn't have a payouts API; use locally tracked payouts
                 if hasattr(self, "db") and self.db:
@@ -154,11 +156,11 @@ class GumroadProvider(PaymentProvider):
                         "SELECT COALESCE(SUM(amount), 0) as total "
                         "FROM provider_payouts WHERE provider = 'gumroad'"
                     )
-                    total_payouts = float(rows[0]["total"]) if rows else 0.0
+                    total_payouts = _to_decimal(rows[0]["total"]) if rows else _to_decimal(0)
             except Exception:
                 logger.debug("Could not fetch payout history for Gumroad balance calc")
 
-            available = max(total_sales - total_payouts, 0.0)
+            available = max(total_sales - total_payouts, _to_decimal(0))
 
             return ProviderBalance(
                 available=available,
@@ -225,13 +227,13 @@ class GumroadProvider(PaymentProvider):
         # Gumroad sends price in cents as integer string (e.g. "500" = $5.00)
         raw_price = data.get("price", "0")
         try:
-            price_val = float(raw_price)
-        except (ValueError, TypeError):
+            price_val = _to_decimal(raw_price)
+        except Exception:
             logger.warning(f"Gumroad webhook with unparseable price: {raw_price!r}")
             return None
         # Gumroad always sends cents — divide by 100
         price = price_val / 100
-        if price < 0 or price != price:  # reject negative or NaN
+        if price < 0:  # reject negative
             logger.warning(f"Gumroad webhook with invalid price: {price}")
             return None
         currency = data.get("currency", "usd").upper()

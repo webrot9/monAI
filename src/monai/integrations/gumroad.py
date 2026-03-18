@@ -9,6 +9,7 @@ Each strategy agent gets its own connection with independent rate limiting.
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
 from typing import Any
 
 from monai.config import Config
@@ -164,12 +165,12 @@ class GumroadIntegration(PlatformIntegration):
     def get_revenue_summary(self, agent_name: str) -> dict[str, Any]:
         """Get a revenue summary across all products."""
         products = self.list_products(agent_name)
-        total_revenue = 0
+        total_revenue = Decimal("0")
         total_sales = 0
         product_stats = []
 
         for product in products:
-            revenue = product.get("sales_usd_cents", 0) / 100
+            revenue = Decimal(str(product.get("sales_usd_cents", 0))) / 100
             sales = product.get("sales_count", 0)
             total_revenue += revenue
             total_sales += sales
@@ -178,7 +179,7 @@ class GumroadIntegration(PlatformIntegration):
                 "id": product.get("id", ""),
                 "revenue_usd": revenue,
                 "sales": sales,
-                "price_usd": product.get("price", 0) / 100,
+                "price_usd": Decimal(str(product.get("price", 0))) / 100,
             })
 
         return {

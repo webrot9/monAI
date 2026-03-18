@@ -4,6 +4,7 @@ Uses mocked RPC responses — no actual monero-wallet-rpc needed.
 """
 
 import json
+from decimal import Decimal
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -82,7 +83,7 @@ class TestMoneroProvider:
         mock_resp = mock_rpc_response({
             "transfer": {
                 "txid": tx_hash,
-                "amount": int(1.5 * ATOMIC_UNITS_PER_XMR),
+                "amount": int(Decimal("1.5") * ATOMIC_UNITS_PER_XMR),
                 "confirmations": 15,
                 "height": 3000000,
             },
@@ -98,7 +99,7 @@ class TestMoneroProvider:
             result = await provider.verify_payment(tx_hash)
 
         assert result.success is True
-        assert result.amount == 1.5
+        assert result.amount == Decimal("1.5")
         assert result.status == PaymentStatus.COMPLETED
         assert result.raw["confirmations"] == 15
 
@@ -108,7 +109,7 @@ class TestMoneroProvider:
         mock_resp = mock_rpc_response({
             "transfer": {
                 "txid": tx_hash,
-                "amount": int(0.5 * ATOMIC_UNITS_PER_XMR),
+                "amount": int(Decimal("0.5") * ATOMIC_UNITS_PER_XMR),
                 "confirmations": 3,  # Less than min_confirmations (10)
             },
         })
@@ -128,8 +129,8 @@ class TestMoneroProvider:
     @pytest.mark.asyncio
     async def test_get_balance(self, provider):
         mock_resp = mock_rpc_response({
-            "balance": int(5.0 * ATOMIC_UNITS_PER_XMR),
-            "unlocked_balance": int(4.5 * ATOMIC_UNITS_PER_XMR),
+            "balance": int(Decimal("5.0") * ATOMIC_UNITS_PER_XMR),
+            "unlocked_balance": int(Decimal("4.5") * ATOMIC_UNITS_PER_XMR),
         })
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -141,8 +142,8 @@ class TestMoneroProvider:
 
             balance = await provider.get_balance()
 
-        assert balance.available == 4.5
-        assert balance.pending == 0.5
+        assert balance.available == Decimal("4.5")
+        assert balance.pending == Decimal("0.5")
         assert balance.currency == "XMR"
 
     @pytest.mark.asyncio
@@ -151,8 +152,8 @@ class TestMoneroProvider:
         mock_resp = mock_rpc_response({
             "tx_hash": tx_hash,
             "tx_key": "key123",
-            "fee": int(0.00005 * ATOMIC_UNITS_PER_XMR),
-            "amount": int(2.0 * ATOMIC_UNITS_PER_XMR),
+            "fee": int(Decimal("0.00005") * ATOMIC_UNITS_PER_XMR),
+            "amount": int(Decimal("2.0") * ATOMIC_UNITS_PER_XMR),
         })
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -164,7 +165,7 @@ class TestMoneroProvider:
 
             result = await provider.send_payout(
                 to_address="4" + "D" * 94,
-                amount=2.0,
+                amount=Decimal("2.0"),
             )
 
         assert result.success is True
@@ -191,7 +192,7 @@ class TestMoneroProvider:
 
             result = await provider.send_payout(
                 to_address="4" + "E" * 94,
-                amount=999.0,
+                amount=Decimal("999.0"),
             )
 
         assert result.success is False
@@ -227,7 +228,7 @@ class TestMoneroProvider:
             "in": [
                 {
                     "txid": "aa" * 32,
-                    "amount": int(1.0 * ATOMIC_UNITS_PER_XMR),
+                    "amount": int(Decimal("1.0") * ATOMIC_UNITS_PER_XMR),
                     "address": "4" + "F" * 94,
                     "confirmations": 20,
                     "height": 2999999,
@@ -249,7 +250,7 @@ class TestMoneroProvider:
             transfers = await provider.poll_incoming()
 
         assert len(transfers) == 1
-        assert transfers[0]["amount"] == 1.0
+        assert transfers[0]["amount"] == Decimal("1.0")
         assert transfers[0]["confirmations"] == 20
         assert transfers[0]["category"] == "in"
 

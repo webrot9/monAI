@@ -294,7 +294,7 @@ class WebhookServer:
                     "provider": event.provider,
                     "event_type": event.event_type.value,
                     "payment_ref": event.payment_ref,
-                    "amount": event.amount,
+                    "amount": str(event.amount),
                     "currency": event.currency,
                 },
                 brand=event.metadata.get("brand", ""),

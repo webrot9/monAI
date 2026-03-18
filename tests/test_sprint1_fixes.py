@@ -87,11 +87,11 @@ class TestPaymentIntentValidation:
 
     def test_accepts_min_amount(self):
         intent = PaymentIntent(amount=0.01)
-        assert intent.amount == 0.01
+        assert intent.amount == Decimal("0.01")
 
     def test_accepts_max_amount(self):
         intent = PaymentIntent(amount=100_000.0)
-        assert intent.amount == 100_000.0
+        assert intent.amount == Decimal("100000.0")
 
     def test_amount_cents_precision(self):
         """amount_cents should not suffer from float precision."""

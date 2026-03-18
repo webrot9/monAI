@@ -33,6 +33,8 @@ import threading
 from datetime import datetime, timedelta
 from typing import Any
 
+from decimal import Decimal
+
 from monai.business.brand_payments import BrandPayments
 from monai.config import Config
 from monai.db.database import Database
@@ -41,6 +43,7 @@ from monai.payments.types import (
     SweepRequest,
     SweepResult,
     SweepStatus,
+    _to_decimal,
 )
 
 logger = logging.getLogger(__name__)
@@ -335,7 +338,7 @@ class SweepEngine:
         }
 
     async def sweep_brand(self, brand: str,
-                          amount: float | None = None) -> SweepResult:
+                          amount: Decimal | float | None = None) -> SweepResult:
         """Manually trigger a sweep for a specific brand."""
         # Validate amount if provided
         if amount is not None and amount <= 0:
@@ -501,7 +504,7 @@ class SweepEngine:
         }
 
     async def _crypto_sweep_brand(self, brand: str,
-                                  amount: float | None = None) -> SweepResult:
+                                  amount: Decimal | float | None = None) -> SweepResult:
         """Execute a crypto sweep for a single brand.
 
         Acquires a per-brand lock to prevent race conditions with concurrent
@@ -512,7 +515,7 @@ class SweepEngine:
             return await self._crypto_sweep_brand_locked(brand, amount)
 
     async def _crypto_sweep_brand_locked(self, brand: str,
-                                         amount: float | None = None) -> SweepResult:
+                                         amount: Decimal | float | None = None) -> SweepResult:
         """Actual sweep logic — must be called under brand lock."""
         from monai.payments.monero_provider import MoneroRPCError
 
@@ -523,7 +526,7 @@ class SweepEngine:
                 status=SweepStatus.FAILED,
             )
 
-        sweepable = amount or self.brand_payments.get_sweepable_balance(brand)
+        sweepable = _to_decimal(amount) if amount is not None else _to_decimal(self.brand_payments.get_sweepable_balance(brand))
         if sweepable <= 0:
             return SweepResult(
                 success=False, error=f"Nothing to sweep for brand {brand}",
@@ -537,7 +540,7 @@ class SweepEngine:
                 "WHERE brand = ? AND status = 'outstanding'",
                 (brand,),
             )
-            deficit_total = deficits[0]["total"] if deficits else 0
+            deficit_total = _to_decimal(deficits[0]["total"]) if deficits else _to_decimal(0)
             if deficit_total > 0:
                 sweepable -= deficit_total
                 logger.info(

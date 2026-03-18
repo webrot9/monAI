@@ -335,10 +335,12 @@ class TestTaskRouter:
 
     def test_classify_marketing_task(self, config, db, mock_llm):
         router = TaskRouter(config, db, mock_llm)
+        # Classifier still recognizes marketing keywords even without dedicated agents
         assert router._classify_task("Promote our product on social media") == "marketing"
 
     def test_classify_research_task(self, config, db, mock_llm):
         router = TaskRouter(config, db, mock_llm)
+        # Classifier still recognizes research keywords even without dedicated agents
         assert router._classify_task("Research market trends") == "research"
 
     def test_classify_design_task(self, config, db, mock_llm):
@@ -349,16 +351,16 @@ class TestTaskRouter:
         router = TaskRouter(config, db, mock_llm)
         assert router._classify_task("Analyze budget and ROI") == "finance"
 
-    def test_route_research_task_to_agent(self, config, db, mock_llm):
+    def test_route_design_task_to_agent(self, config, db, mock_llm):
         router = TaskRouter(config, db, mock_llm)
-        result = router.route("Research market trends", task_type="research")
+        result = router.route("Create an ebook template", task_type="design")
         assert result["routed_to"] is not None
-        assert result["task_type"] == "research"
+        assert result["task_type"] == "design"
 
     def test_route_auto_classify(self, config, db, mock_llm):
         router = TaskRouter(config, db, mock_llm)
-        result = router.route("Research market trends for digital products")
-        assert result["task_type"] == "research"
+        result = router.route("Design an ebook template for digital products")
+        assert result["task_type"] == "design"
         assert result["routed_to"] is not None
 
     def test_update_performance(self, config, db, mock_llm):

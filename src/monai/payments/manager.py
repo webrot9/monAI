@@ -317,15 +317,17 @@ class UnifiedPaymentManager:
             return
 
         # Validate webhook amount — raise so webhook server returns 500 and saves to DLQ
+        # NaN check FIRST — Decimal NaN raises InvalidOperation on comparison operators
+        if isinstance(event.amount, Decimal) and event.amount.is_nan():
+            raise ValueError("Webhook with NaN amount rejected")
+        elif not isinstance(event.amount, Decimal) and event.amount != event.amount:
+            raise ValueError("Webhook with NaN amount rejected")
         if event.amount < 0:
             raise ValueError(f"Webhook with negative amount rejected: {event.amount}")
         if event.amount == 0 and event.event_type == WebhookEventType.PAYMENT_COMPLETED:
             raise ValueError("Webhook with zero amount rejected for payment.completed")
         if event.amount > 1_000_000:  # €1M safety cap per single webhook
             raise ValueError(f"Webhook with suspicious amount rejected: {event.amount}")
-        # NaN check
-        if event.amount != event.amount:
-            raise ValueError("Webhook with NaN amount rejected")
 
         # ATOMIC: idempotency check + event log in single transaction
         with self.db.transaction() as conn:
@@ -347,7 +349,7 @@ class UnifiedPaymentManager:
                     event.provider,
                     event.event_type.value,
                     event.payment_ref,
-                    event.amount,
+                    float(event.amount),
                     event.currency,
                     event.metadata.get("brand", ""),
                     json.dumps(event.raw) if event.raw else None,
@@ -390,7 +392,8 @@ class UnifiedPaymentManager:
                 lead_id = None
 
         # Use Decimal for precise fee calculation, round to 2 decimals before storage
-        gross_dec = Decimal(str(event.amount))
+        # event.amount is already Decimal (auto-converted in __post_init__)
+        gross_dec = event.amount if isinstance(event.amount, Decimal) else Decimal(str(event.amount))
         rates = self.brand_payments.PLATFORM_FEE_RATES.get(event.provider)
         if rates:
             fee_dec = gross_dec * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"]))
@@ -429,12 +432,13 @@ class UnifiedPaymentManager:
         self._record_payment_gl(brand, event, fee_amount)
 
     def _record_payment_gl(self, brand: str, event: WebhookEvent,
-                           fee_amount: float) -> None:
+                           fee_amount: float | Decimal) -> None:
         """Record a payment in the general ledger (double-entry)."""
         if not self.ledger:
             return
-        # Round to 2 decimal places to avoid floating-point balance mismatches
-        fee_amount = round(fee_amount, 2)
+        # Ensure float for ledger API and round to 2 decimal places
+        fee_amount = round(float(fee_amount), 2)
+        event_amount = round(float(event.amount), 2)
         try:
             # Map provider to cash account
             cash_accounts = {
@@ -460,7 +464,7 @@ class UnifiedPaymentManager:
 
             if fee_amount > 0:
                 self.ledger.record_platform_fee(
-                    gross=event.amount,
+                    gross=event_amount,
                     fee=fee_amount,
                     revenue_account=revenue_acct,
                     cash_account=cash_acct,
@@ -472,7 +476,7 @@ class UnifiedPaymentManager:
                 )
             else:
                 self.ledger.record_revenue(
-                    amount=event.amount,
+                    amount=event_amount,
                     revenue_account=revenue_acct,
                     cash_account=cash_acct,
                     description=f"Payment via {event.provider}: {event.product or 'sale'}",

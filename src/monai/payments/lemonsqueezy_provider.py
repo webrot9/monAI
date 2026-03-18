@@ -24,6 +24,7 @@ from monai.payments.types import (
     ProviderBalance,
     WebhookEvent,
     WebhookEventType,
+    _to_decimal,
 )
 
 logger = logging.getLogger(__name__)
@@ -165,7 +166,7 @@ class LemonSqueezyProvider(PaymentProvider):
         else:
             status = PaymentStatus.PENDING
 
-        amount = float(attrs.get("total", 0)) / 100
+        amount = _to_decimal(attrs.get("total", 0)) / 100
         currency = attrs.get("currency", "USD").upper()
 
         return PaymentResult(
@@ -189,11 +190,11 @@ class LemonSqueezyProvider(PaymentProvider):
                 {"filter[store_id]": self.store_id, "page[size]": "100"},
             )
             orders = result.get("data", [])
-            paid_total = 0.0
-            refunded_total = 0.0
+            paid_total = _to_decimal(0)
+            refunded_total = _to_decimal(0)
             for o in orders:
                 attrs = o.get("attributes", {})
-                amount = float(attrs.get("total", 0)) / 100
+                amount = _to_decimal(attrs.get("total", 0)) / 100
                 status = attrs.get("status", "")
                 if status == "paid":
                     paid_total += amount
@@ -202,8 +203,8 @@ class LemonSqueezyProvider(PaymentProvider):
 
             net = paid_total - refunded_total
             return ProviderBalance(
-                available=max(net, 0.0),
-                pending=0.0,
+                available=max(net, _to_decimal(0)),
+                pending=_to_decimal(0),
                 currency="USD",
                 provider=self.provider_name,
                 account_id=account_id or self.store_id,
@@ -243,7 +244,7 @@ class LemonSqueezyProvider(PaymentProvider):
 
         attrs = data.get("data", {}).get("attributes", {})
         order_id = str(data.get("data", {}).get("id", ""))
-        amount = float(attrs.get("total", 0)) / 100
+        amount = _to_decimal(attrs.get("total", 0)) / 100
         currency = attrs.get("currency", "USD").upper()
         customer_email = attrs.get("user_email", "")
 

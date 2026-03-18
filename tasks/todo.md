@@ -3,25 +3,29 @@
 ## Strategy: Digital Products on Gumroad (ONE strategy, end-to-end)
 
 ## Phase 1: Split Orchestrator (2500 lines → 5-6 focused classes)
-- [ ] Extract `InfrastructureManager` (provisioning, identity, LLC, phone, API)
-- [ ] Extract `FinanceController` (ledger, finance, commercialista, exchange rates, tax, reconciliation, reporting)
-- [ ] Extract `StrategyRunner` (strategy registration, lifecycle, execution, auto-pause/scale)
-- [ ] Extract `OperationsManager` (audit, alerting, backup, spending guard, risk)
-- [ ] Extract `TeamCoordinator` (research, marketing, engineering, workflow engine)
-- [ ] Slim `Orchestrator` to thin coordinator (~200 lines)
+- [x] Extract `InfrastructureManager` (provisioning, identity, LLC, phone, API)
+- [x] Extract `FinanceController` (ledger, finance, commercialista, exchange rates, tax, reconciliation, reporting)
+- [x] Extract `StrategyRunner` (strategy registration, lifecycle, execution, auto-pause/scale)
+- [x] Extract `OperationsManager` (audit, alerting, backup, spending guard, risk)
+- [x] ~~Extract `TeamCoordinator`~~ — removed, team agents deleted as dead code
+- [x] Slim `Orchestrator` to thin coordinator (~720 lines)
 
 ## Phase 2: Remove Dead Weight
-- [ ] Delete 12 unused strategies (keep only `digital_products`)
-- [ ] Delete unused team agents (marketing_team, research_team, eng_team) — not needed for MVP
-- [ ] Delete unused agents (social_presence, kofi_manager, domain_flipping, etc.)
-- [ ] Remove dead imports and wiring from orchestrator
-- [ ] Delete corresponding test files
+- [x] Delete 12 unused strategies (keep only `digital_products`)
+- [x] Delete unused team agents (marketing_team, research_team, eng_team) — ~3000 lines removed
+- [x] Delete unused agents (social_presence, web_presence) — moved BRAND_PLATFORMS to strategy_lifecycle
+- [x] Remove dead imports and wiring from orchestrator
+- [x] Delete corresponding test files (6 test files removed)
+- [x] Clean up task router (removed dead capabilities + task types)
 
 ## Phase 3: Fix Financial Vulnerabilities
-- [ ] Audit all float usage in money paths → convert to Decimal
-- [ ] Fix refund-after-sweep race condition (lock + deficit tracking)
+- [x] Audit all float usage in money paths → convert to Decimal
+  - Core types (PaymentIntent, PaymentResult, WebhookEvent, ProviderBalance, SweepRequest, SweepResult)
+  - All 6 payment providers (Stripe, BTCPay, Gumroad, LemonSqueezy, Monero, Ko-fi)
+  - Sweep engine, brand_payments, integrations/gumroad
+- [x] Fix refund-after-sweep race condition (lock + deficit tracking) — already done
 - [ ] Add DB transaction wrapping for payment state changes
-- [ ] Validate concurrent sweep/refund locks work correctly
+- [x] Validate concurrent sweep/refund locks work correctly — already done
 
 ## Phase 4: Test Overhaul
 - [ ] Identify tests with real assertions vs smoke tests
@@ -30,8 +34,8 @@
 - [ ] Add E2E test: Gumroad product creation → listing → sale → payment → sweep
 
 ## Phase 5: Make Digital Products Work E2E
-- [ ] Verify Gumroad integration is complete and real
-- [ ] Wire digital_products into slim orchestrator
+- [x] Verify Gumroad integration is complete and real
+- [x] Wire digital_products into slim orchestrator
 - [ ] Test full pipeline: research → create → review → list → sell → collect
 - [ ] Prove it works with real Gumroad API calls
 

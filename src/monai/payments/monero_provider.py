@@ -22,6 +22,8 @@ from typing import Any
 
 import httpx
 
+from decimal import Decimal
+
 from monai.payments.base import CryptoProvider
 from monai.payments.types import (
     PaymentIntent,
@@ -30,12 +32,13 @@ from monai.payments.types import (
     ProviderBalance,
     WebhookEvent,
     WebhookEventType,
+    _to_decimal,
 )
 
 logger = logging.getLogger(__name__)
 
 # Monero has 12 decimal places (piconero)
-ATOMIC_UNITS_PER_XMR = 1_000_000_000_000
+ATOMIC_UNITS_PER_XMR = Decimal("1000000000000")
 
 # Minimum confirmations before considering payment settled
 DEFAULT_MIN_CONFIRMATIONS = 10
@@ -141,7 +144,7 @@ class MoneroProvider(CryptoProvider):
         transfer = result.get("transfer", {})
         return transfer.get("confirmations", 0)
 
-    async def estimate_fee(self, amount: float, priority: str = "normal") -> float:
+    async def estimate_fee(self, amount: Decimal, priority: str = "normal") -> Decimal:
         """Estimate fee for sending XMR.
 
         Priority levels: unimportant(1), normal(2), elevated(3), priority(4)
@@ -153,7 +156,7 @@ class MoneroProvider(CryptoProvider):
             "priority": 4, "urgent": 4,
         }
         p = priority_map.get(priority, 2)
-        amount_atomic = int(amount * ATOMIC_UNITS_PER_XMR)
+        amount_atomic = int(_to_decimal(amount) * ATOMIC_UNITS_PER_XMR)
 
         # Use a dummy address to estimate — we won't actually send
         result = await self._rpc_call("get_address", {"account_index": 0})
@@ -169,10 +172,10 @@ class MoneroProvider(CryptoProvider):
                 "get_tx_metadata": False,
             })
             fee_atomic = result.get("fee", 0)
-            return fee_atomic / ATOMIC_UNITS_PER_XMR
+            return _to_decimal(fee_atomic) / ATOMIC_UNITS_PER_XMR
         except MoneroRPCError:
             # Fallback estimate: ~0.00005 XMR typical fee
-            return 0.00005
+            return Decimal("0.00005")
 
     # ── PaymentProvider interface ───────────────────────────────
 
@@ -217,7 +220,7 @@ class MoneroProvider(CryptoProvider):
         transfer = result.get("transfer", {})
         amount_atomic = transfer.get("amount", 0)
         confirmations = transfer.get("confirmations", 0)
-        amount_xmr = amount_atomic / ATOMIC_UNITS_PER_XMR
+        amount_xmr = _to_decimal(amount_atomic) / ATOMIC_UNITS_PER_XMR
 
         if confirmations >= self.min_confirmations:
             status = PaymentStatus.COMPLETED
@@ -245,11 +248,11 @@ class MoneroProvider(CryptoProvider):
             "subaddr_indices": [],  # All subaddresses
         })
 
-        total = 0
-        confirmed = 0
+        total = _to_decimal(0)
+        confirmed = _to_decimal(0)
         for tx in result.get("in", []) + result.get("pending", []) + result.get("pool", []):
             if tx.get("address") == address:
-                amount = tx.get("amount", 0) / ATOMIC_UNITS_PER_XMR
+                amount = _to_decimal(tx.get("amount", 0)) / ATOMIC_UNITS_PER_XMR
                 total += amount
                 if tx.get("confirmations", 0) >= self.min_confirmations:
                     confirmed += amount
@@ -270,8 +273,8 @@ class MoneroProvider(CryptoProvider):
     async def get_balance(self, account_id: str = "") -> ProviderBalance:
         """Get wallet balance."""
         result = await self._rpc_call("get_balance", {"account_index": 0})
-        balance = result.get("balance", 0) / ATOMIC_UNITS_PER_XMR
-        unlocked = result.get("unlocked_balance", 0) / ATOMIC_UNITS_PER_XMR
+        balance = _to_decimal(result.get("balance", 0)) / ATOMIC_UNITS_PER_XMR
+        unlocked = _to_decimal(result.get("unlocked_balance", 0)) / ATOMIC_UNITS_PER_XMR
 
         return ProviderBalance(
             available=unlocked,
@@ -309,7 +312,7 @@ class MoneroProvider(CryptoProvider):
             return False
         return True
 
-    async def send_payout(self, to_address: str, amount: float,
+    async def send_payout(self, to_address: str, amount: Decimal,
                           currency: str = "XMR",
                           priority: str = "normal",
                           **kwargs: Any) -> PaymentResult:
@@ -331,7 +334,7 @@ class MoneroProvider(CryptoProvider):
             "low": 1, "normal": 2, "elevated": 3, "priority": 4,
         }
         p = priority_map.get(priority, 2)
-        amount_atomic = int(amount * ATOMIC_UNITS_PER_XMR)
+        amount_atomic = int(_to_decimal(amount) * ATOMIC_UNITS_PER_XMR)
 
         try:
             result = await self._rpc_call("transfer", {
@@ -351,7 +354,7 @@ class MoneroProvider(CryptoProvider):
 
         tx_hash = result.get("tx_hash", "")
         fee_atomic = result.get("fee", 0)
-        fee_xmr = fee_atomic / ATOMIC_UNITS_PER_XMR
+        fee_xmr = _to_decimal(fee_atomic) / ATOMIC_UNITS_PER_XMR
 
         logger.info(
             f"XMR sent: {amount:.12f} XMR to {to_address[:12]}... "
@@ -396,7 +399,7 @@ class MoneroProvider(CryptoProvider):
             for tx in result.get(category, []):
                 transfers.append({
                     "tx_hash": tx.get("txid", ""),
-                    "amount": tx.get("amount", 0) / ATOMIC_UNITS_PER_XMR,
+                    "amount": _to_decimal(tx.get("amount", 0)) / ATOMIC_UNITS_PER_XMR,
                     "address": tx.get("address", ""),
                     "confirmations": tx.get("confirmations", 0),
                     "height": tx.get("height", 0),

@@ -1,5 +1,7 @@
 """Tests for payment types and base abstractions."""
 
+from decimal import Decimal
+
 import pytest
 
 from monai.payments.types import (
@@ -30,7 +32,7 @@ class TestPaymentStatus:
 class TestPaymentIntent:
     def test_defaults(self):
         intent = PaymentIntent(amount=100.0)
-        assert intent.amount == 100.0
+        assert intent.amount == Decimal("100")
         assert intent.currency == "EUR"
         assert intent.product == ""
         assert intent.brand == ""
@@ -45,7 +47,7 @@ class TestPaymentIntent:
             brand="micro_saas",
             metadata={"lead_id": 42},
         )
-        assert intent.amount == 49.99
+        assert intent.amount == Decimal("49.99")
         assert intent.currency == "USD"
         assert intent.brand == "micro_saas"
         assert intent.metadata["lead_id"] == 42
@@ -69,7 +71,7 @@ class TestPaymentIntent:
 
     def test_minimum_amount_accepted(self):
         intent = PaymentIntent(amount=0.01)
-        assert intent.amount == 0.01
+        assert intent.amount == Decimal("0.01")
 
 
 class TestPaymentResult:
@@ -111,20 +113,20 @@ class TestWebhookEvent:
         )
         assert event.event_type == WebhookEventType.PAYMENT_COMPLETED
         assert event.provider == "stripe"
-        assert event.amount == 50.0
+        assert event.amount == Decimal("50")
 
 
 class TestProviderBalance:
     def test_defaults(self):
         bal = ProviderBalance()
-        assert bal.available == 0.0
-        assert bal.pending == 0.0
+        assert bal.available == Decimal("0")
+        assert bal.pending == Decimal("0")
         assert bal.currency == "EUR"
 
     def test_with_values(self):
         bal = ProviderBalance(available=1.5, pending=0.3, currency="XMR")
-        assert bal.available == 1.5
-        assert bal.pending == 0.3
+        assert bal.available == Decimal("1.5")
+        assert bal.pending == Decimal("0.3")
         assert bal.currency == "XMR"
 
 
@@ -150,7 +152,7 @@ class TestSweepTypes:
         )
         assert result.success is True
         assert result.status == SweepStatus.COMPLETED
-        assert result.amount_crypto == 0.5
+        assert result.amount_crypto == Decimal("0.5")
 
     def test_sweep_result_failure(self):
         result = SweepResult(

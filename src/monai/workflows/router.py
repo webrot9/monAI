@@ -51,16 +51,10 @@ CREATE TABLE IF NOT EXISTS agent_capabilities (
 DEFAULT_CAPABILITIES: dict[str, list[str]] = {
     "digital_products": ["ebooks", "templates", "guides", "digital_assets"],
     "finance_expert": ["finance", "investment", "roi_analysis", "forecasting", "budgeting"],
-    "research_team": ["market_research", "trend_analysis", "competitor_analysis", "niche_discovery"],
-    "marketing_team": ["marketing", "campaigns", "growth", "content_marketing", "outreach"],
-    "social_presence": ["social_posts", "brand_building", "community_engagement", "social_media"],
-    "web_presence": ["websites", "landing_pages", "seo", "web_analytics", "domains"],
 }
 
 # Task type → capabilities needed
 TASK_TYPE_CAPABILITIES: dict[str, list[str]] = {
-    "marketing": ["social_posts", "outreach", "engagement", "content_marketing"],
-    "research": ["market_research", "trend_analysis", "competitor_analysis", "niche_discovery"],
     "design": ["templates", "digital_assets", "guides", "ebooks"],
     "finance": ["finance", "investment", "roi_analysis", "forecasting", "budgeting"],
 }

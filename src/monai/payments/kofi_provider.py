@@ -26,6 +26,7 @@ from monai.payments.types import (
     ProviderBalance,
     WebhookEvent,
     WebhookEventType,
+    _to_decimal,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,9 +99,9 @@ class KofiProvider(PaymentProvider):
         )
 
         try:
-            amount = float(parsed.amount)
-        except (ValueError, TypeError):
-            amount = 0.0
+            amount = _to_decimal(parsed.amount)
+        except Exception:
+            amount = _to_decimal(0)
 
         return WebhookEvent(
             event_type=event_type,

@@ -7,6 +7,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from decimal import Decimal
 
 from monai.payments.stripe_provider import StripeProvider, StripeAPIError
 from monai.payments.types import PaymentIntent, PaymentStatus, WebhookEventType
@@ -99,7 +100,7 @@ class TestStripeProvider:
             result = await provider.verify_payment("cs_test_abc")
 
         assert result.success is True
-        assert result.amount == 29.99
+        assert result.amount == Decimal("29.99")
         assert result.currency == "EUR"
         assert result.status == PaymentStatus.COMPLETED
 
@@ -123,7 +124,7 @@ class TestStripeProvider:
             result = await provider.verify_payment("pi_test_xyz")
 
         assert result.status == PaymentStatus.COMPLETED
-        assert result.amount == 50.0
+        assert result.amount == Decimal("50")
 
     @pytest.mark.asyncio
     async def test_get_balance(self, provider):
@@ -142,8 +143,8 @@ class TestStripeProvider:
 
             balance = await provider.get_balance()
 
-        assert balance.available == 100.0
-        assert balance.pending == 25.0
+        assert balance.available == Decimal("100")
+        assert balance.pending == Decimal("25")
         assert balance.currency == "EUR"
 
 
@@ -178,7 +179,7 @@ class TestStripeWebhook:
 
         assert event is not None
         assert event.event_type == WebhookEventType.PAYMENT_COMPLETED
-        assert event.amount == 49.99
+        assert event.amount == Decimal("49.99")
         assert event.customer_email == "buyer@example.com"
         assert event.metadata["brand"] == "micro_saas"
 

@@ -20,8 +20,12 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from monai.agents.social_presence import BRAND_PLATFORMS
 from monai.db.database import Database
+
+# Brand-specific platform recommendations (which platforms suit which business)
+BRAND_PLATFORMS = {
+    "digital_products": ["twitter", "indie_hackers", "reddit"],
+}
 
 logger = logging.getLogger(__name__)
 

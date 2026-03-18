@@ -14,6 +14,7 @@ import hmac
 import json
 import logging
 import time
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -26,6 +27,7 @@ from monai.payments.types import (
     ProviderBalance,
     WebhookEvent,
     WebhookEventType,
+    _to_decimal,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,18 +136,18 @@ class StripeProvider(PaymentProvider):
             if payment_ref.startswith("cs_"):
                 data = await self._api_call("GET", f"checkout/sessions/{payment_ref}")
                 status = self._map_session_status(data.get("payment_status", ""))
-                amount = (data.get("amount_total", 0) or 0) / 100
+                amount = _to_decimal(data.get("amount_total", 0) or 0) / 100
                 currency = (data.get("currency", "eur") or "eur").upper()
             elif payment_ref.startswith("pi_"):
                 data = await self._api_call("GET", f"payment_intents/{payment_ref}")
                 status = self._map_intent_status(data.get("status", ""))
-                amount = (data.get("amount", 0) or 0) / 100
+                amount = _to_decimal(data.get("amount", 0) or 0) / 100
                 currency = (data.get("currency", "eur") or "eur").upper()
             else:
                 # Try as charge ID
                 data = await self._api_call("GET", f"charges/{payment_ref}")
                 status = PaymentStatus.COMPLETED if data.get("paid") else PaymentStatus.FAILED
-                amount = (data.get("amount", 0) or 0) / 100
+                amount = _to_decimal(data.get("amount", 0) or 0) / 100
                 currency = (data.get("currency", "eur") or "eur").upper()
         except StripeAPIError as e:
             return PaymentResult(success=False, error=str(e))
@@ -166,16 +168,16 @@ class StripeProvider(PaymentProvider):
         except StripeAPIError as e:
             return ProviderBalance(provider=self.provider_name, account_id=account_id)
 
-        available = 0.0
-        pending = 0.0
+        available = Decimal("0")
+        pending = Decimal("0")
         currency = "EUR"
 
         for bal in data.get("available", []):
-            available += bal.get("amount", 0) / 100
+            available += _to_decimal(bal.get("amount", 0)) / 100
             currency = bal.get("currency", "eur").upper()
 
         for bal in data.get("pending", []):
-            pending += bal.get("amount", 0) / 100
+            pending += _to_decimal(bal.get("amount", 0)) / 100
 
         return ProviderBalance(
             available=available,
@@ -219,11 +221,11 @@ class StripeProvider(PaymentProvider):
 
         # Extract amount based on event type
         if event_type == "checkout.session.completed":
-            amount = (obj.get("amount_total", 0) or 0) / 100
+            amount = _to_decimal(obj.get("amount_total", 0) or 0) / 100
             payment_ref = obj.get("id", "")
             customer_email = obj.get("customer_email", "") or ""
         else:
-            amount = (obj.get("amount", 0) or 0) / 100
+            amount = _to_decimal(obj.get("amount", 0) or 0) / 100
             payment_ref = obj.get("id", "")
             customer_email = ""
 

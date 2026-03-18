@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -51,7 +52,7 @@ class TestWebhookAuditIntegration:
                     "provider": event.provider,
                     "event_type": event.event_type.value,
                     "payment_ref": event.payment_ref,
-                    "amount": event.amount,
+                    "amount": str(event.amount),
                     "currency": event.currency,
                 },
                 brand=event.metadata.get("brand", ""),

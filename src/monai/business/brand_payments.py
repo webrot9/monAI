@@ -245,14 +245,14 @@ class BrandPayments:
     # ── Payment Reception ─────────────────────────────────────
 
     def record_payment(self, brand: str, account_id: int,
-                       amount: float, product: str = "",
+                       amount: Decimal | float, product: str = "",
                        customer_email: str = "",
                        payment_ref: str = "",
                        lead_id: int | None = None,
                        currency: str = "EUR",
                        metadata: dict | None = None) -> int:
         """Record an incoming payment for a brand."""
-        # Round to 2 decimal places to avoid floating-point drift in SQLite REAL
+        # Round to 2 decimal places for precision
         amount_rounded = float(Decimal(str(amount)).quantize(Decimal("0.01")))
         pay_id = self.db.execute_insert(
             "INSERT INTO brand_payments_received "
@@ -476,8 +476,8 @@ class BrandPayments:
     }
 
     def record_platform_fee(self, brand: str, provider: str,
-                            payment_id: int, gross_amount: float,
-                            fee_amount: float | None = None,
+                            payment_id: int, gross_amount: Decimal | float,
+                            fee_amount: Decimal | float | None = None,
                             fee_currency: str = "EUR") -> int:
         """Record a platform fee for a payment.
 
@@ -489,8 +489,8 @@ class BrandPayments:
             if rates:
                 gross = Decimal(str(gross_amount))
                 fee_amount = float(
-                    (gross * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"])))
-                    .quantize(Decimal("0.01"))
+                    (gross * Decimal(str(rates["rate"])) + Decimal(str(rates["fixed"]))
+                    ).quantize(Decimal("0.01"))
                 )
             else:
                 fee_amount = 0.0

@@ -25,6 +25,7 @@ from monai.payments.types import (
     ProviderBalance,
     WebhookEvent,
     WebhookEventType,
+    _to_decimal,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,7 +91,7 @@ class BTCPayProvider(PaymentProvider):
     async def create_payment(self, intent: PaymentIntent) -> PaymentResult:
         """Create a BTCPay invoice (payment request)."""
         invoice_data: dict[str, Any] = {
-            "amount": intent.amount,
+            "amount": str(intent.amount),
             "currency": intent.currency,
         }
 
@@ -140,7 +141,7 @@ class BTCPayProvider(PaymentProvider):
             return PaymentResult(success=False, error=str(e))
 
         status = self._map_status(data.get("status", ""))
-        amount = float(data.get("amount", 0))
+        amount = _to_decimal(data.get("amount", 0))
         currency = data.get("currency", "EUR")
 
         return PaymentResult(
@@ -162,8 +163,8 @@ class BTCPayProvider(PaymentProvider):
             data = await self._api_call(
                 "GET", f"stores/{self.store_id}/payment-methods/BTC-CHAIN/wallet"
             )
-            confirmed = float(data.get("confirmedBalance", 0))
-            unconfirmed = float(data.get("unconfirmedBalance", 0))
+            confirmed = _to_decimal(data.get("confirmedBalance", 0))
+            unconfirmed = _to_decimal(data.get("unconfirmedBalance", 0))
 
             return ProviderBalance(
                 available=confirmed,
@@ -211,13 +212,13 @@ class BTCPayProvider(PaymentProvider):
         metadata = event.get("metadata", {})
 
         # Fetch full invoice to get amount
-        amount = 0.0
+        amount = _to_decimal(0)
         currency = "BTC"
         try:
             invoice = await self._api_call(
                 "GET", f"stores/{self.store_id}/invoices/{invoice_id}"
             )
-            amount = float(invoice.get("amount", 0))
+            amount = _to_decimal(invoice.get("amount", 0))
             currency = invoice.get("currency", "BTC")
         except BTCPayAPIError as e:
             logger.warning(

@@ -203,8 +203,8 @@ The ProductIterator runs every 5 cycles to identify underperformers and trigger 
 | `llc_provisioner.py` | Autonomous LLC formation |
 | `phone_provisioner.py` | Virtual phone number acquisition |
 | `finance_expert.py` | Financial advisory and ROI analysis |
-| `social_presence.py` | Brand social accounts |
-| `web_presence.py` | Domain & website management |
+| ~~`social_presence.py`~~ | **REMOVED** — dead code, BRAND_PLATFORMS moved to strategy_lifecycle |
+| ~~`web_presence.py`~~ | **REMOVED** — dead code, unused |
 | `browser_learner.py` | Adaptive browser automation with code-gen fallback (writes + caches Playwright scripts when standard selectors fail) |
 | `memory.py` | Shared knowledge base |
 | `collaboration.py` | Agent-to-agent help system |
@@ -214,9 +214,9 @@ The ProductIterator runs every 5 cycles to identify underperformers and trigger 
 | `captcha_solver.py` | Autonomous CAPTCHA solving for account registration |
 | `proof.py` | Proof-of-completion — catches executor hallucinations by verifying done() claims against DB, action trail, and page state |
 | `email_verifier.py` | Email verification (Mailslurp API primary, IMAP fallback, mail.tm legacy) |
-| `eng_team/` | Engineering team (tech lead + engineers) |
-| `research_team/` | Research team (market, trends, competitors) |
-| `marketing_team/` | Marketing team (content, growth, outreach) |
+| ~~`eng_team/`~~ | **REMOVED** — dead code, not needed for MVP |
+| ~~`research_team/`~~ | **REMOVED** — dead code, not needed for MVP |
+| ~~`marketing_team/`~~ | **REMOVED** — dead code, not needed for MVP |
 
 ### Business (`src/monai/business/`)
 | Module | Purpose |
@@ -336,7 +336,7 @@ All strategies use real browser automation and APIs — zero simulation:
 
 ## Test Suite
 
-- **1605 tests** across 80+ test files
+- **1718 tests** across 80+ test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
