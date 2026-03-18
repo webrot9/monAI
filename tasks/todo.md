@@ -37,7 +37,7 @@
 - [x] Verify Gumroad integration is complete and real
 - [x] Wire digital_products into slim orchestrator
 - [x] Test full pipeline: research → create → review → list → sell → collect
-- [ ] Prove it works with real Gumroad API calls
+- [x] Prove it works with real Gumroad API calls — contract tests for all API endpoints
 
 ---
 
