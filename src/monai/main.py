@@ -12,6 +12,7 @@ import concurrent.futures
 import json
 import logging
 import asyncio
+import os
 import signal
 import sys
 import threading
@@ -164,13 +165,27 @@ def run_daemon(config: Config, cycle_interval: int = 300):
     Args:
         cycle_interval: Seconds between cycles (default 5 min)
     """
+    from monai.infra.daemon_state import (
+        CycleMetrics, DaemonState, acquire_pid, release_pid,
+    )
+
+    # Prevent duplicate daemons
+    if not acquire_pid():
+        logger.error("Another monAI daemon is already running. Exiting.")
+        sys.exit(1)
+
+    state = DaemonState.load()
+    state.pid = os.getpid()
+    state.started_at = time.time()
+    state.save()
+
     orchestrator, db = create_orchestrator(config)
     identity = IdentityManager(config, db, LLM(config))
 
     agent_name = identity.get_identity().get("name", "monAI")
     logger.info(f"{'='*60}")
     logger.info(f"  {agent_name} starting in autonomous daemon mode")
-    logger.info(f"  Cycle interval: {cycle_interval}s")
+    logger.info(f"  Cycle interval: {cycle_interval}s | PID: {os.getpid()}")
     logger.info(f"{'='*60}")
 
     # Start webhook server in background thread
@@ -183,12 +198,13 @@ def run_daemon(config: Config, cycle_interval: int = 300):
         logger.error(f"Webhook server failed to start: {e}")
         logger.warning("Continuing without webhook server — payments will NOT be received")
 
-    cycle = 0
-    consecutive_failures = 0
+    cycle = state.cycles_completed  # Resume count across restarts
+    consecutive_failures = state.consecutive_failures
     max_backoff_multiplier = 12  # Cap at 12x base interval (1 hour at 300s base)
 
     while not _shutdown:
         cycle += 1
+        cycle_start = time.time()
         logger.info(f"\n{'='*60}")
         logger.info(f"  CYCLE {cycle} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"{'='*60}")
@@ -236,6 +252,23 @@ def run_daemon(config: Config, cycle_interval: int = 300):
         except Exception as e:
             logger.error(f"Cycle {cycle} failed: {e}", exc_info=True)
             cycle_failed = True
+            result = None
+
+        # Record cycle metrics
+        cycle_end = time.time()
+        api = result.get("api_costs_session", {}) if result else {}
+        metrics = CycleMetrics(
+            cycle=cycle,
+            started_at=cycle_start,
+            duration_secs=round(cycle_end - cycle_start, 1),
+            success=not cycle_failed,
+            error=str(result.get("status", "")) if cycle_failed and result else "",
+            api_calls=api.get("total_calls", 0),
+            api_cost_eur=api.get("total_cost_eur", 0),
+            strategies_run=result.get("health", {}).get("active_strategies", 0) if result else 0,
+            net_profit=result.get("net_profit", 0) if result else 0,
+        )
+        state.record_cycle(metrics)
 
         if _shutdown:
             break
@@ -267,7 +300,6 @@ def run_daemon(config: Config, cycle_interval: int = 300):
     # Shut down webhook server cleanly
     if webhook_server and webhook_loop:
         try:
-            # Stop the server first (closes listening socket), then stop the loop
             future = asyncio.run_coroutine_threadsafe(webhook_server.stop(), webhook_loop)
             future.result(timeout=5)
         except Exception as e:
@@ -275,6 +307,9 @@ def run_daemon(config: Config, cycle_interval: int = 300):
         finally:
             webhook_loop.call_soon_threadsafe(webhook_loop.stop)
 
+    # Clean up daemon state
+    state.save()
+    release_pid()
     logger.info("monAI shut down gracefully.")
 
 

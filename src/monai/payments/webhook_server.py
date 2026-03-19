@@ -199,10 +199,18 @@ class WebhookServer:
             if method == "POST" and path.startswith("/webhooks/"):
                 await self._handle_webhook(writer, path, headers, body)
             elif method == "GET" and path == "/health":
-                await self._send_response(writer, 200, json.dumps({
+                health_data: dict[str, Any] = {
                     "status": "ok",
                     "providers": list(self._providers.keys()),
-                }))
+                }
+                # Include daemon state if available
+                try:
+                    from monai.infra.daemon_state import DaemonState
+                    daemon = DaemonState.load()
+                    health_data.update(daemon.to_health())
+                except Exception:
+                    pass
+                await self._send_response(writer, 200, json.dumps(health_data))
             else:
                 await self._send_response(writer, 404, "Not Found")
 

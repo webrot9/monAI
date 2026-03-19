@@ -336,7 +336,7 @@ All strategies use real browser automation and APIs — zero simulation:
 
 ## Test Suite
 
-- **1718 tests** across 80+ test files
+- **1770 tests** across 80+ test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
@@ -363,7 +363,7 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 **Sprint 7 completed 2026-03-11**: APIProvisioner already fully implemented — 49 tests added covering schema init, plan generation, encrypted key storage/retrieval, key rotation, provider dispatching, webhook URL building, brand email resolution, result key parsing, BTCPay provisioning, provision_all orchestration. Fixed 3 production bugs (sqlite3.Row .get() → bracket access).
 
 ### What's Next
-1. **First real deployment test** (end-to-end with a real Ko-fi page)
+1. **First real deployment** — configure Gumroad credentials, run daemon, verify end-to-end
 
 ### Key Design Decisions Made
 - **OpenAI, not Claude**: All LLM calls use OpenAI SDK (gpt-4o / gpt-4o-mini / gpt-4.1-nano)
@@ -440,6 +440,26 @@ Everything listed above is implemented, tested, and passing. The codebase is fun
 - **Auto-scale strategies**: Phase 6.97 boosts budget +20% for growing strategies (capped, allocation-limited)
 - **ReconciliationEngine**: Matches GL entries (by `reference`) to `webhook_events` (by `payment_ref`), flags mismatches/orphans
 - **Weekly reconciliation**: Runs every Monday, sends Telegram alert only if discrepancies found
+
+### Production Daemon (2026-03-19)
+- **Persistent daemon state**: `DaemonState` class persists cycle metrics, uptime, error history to `~/.monai/daemon_state.json`. Survives restarts — resumes cycle count and failure tracking.
+- **PID file**: `~/.monai/monai.pid` prevents duplicate daemon instances. Stale PIDs (dead process) auto-cleaned.
+- **Health endpoint**: `GET /health` on webhook server returns daemon health (uptime, cycle count, consecutive failures, last error). Status: `healthy` or `degraded`.
+- **Systemd integration**: `deploy/monai.service` — auto-restart on failure, PID tracking, security hardening (NoNewPrivileges, ProtectSystem, MemoryMax).
+- **Cycle metrics**: Each cycle records: duration, API calls/cost, strategies run, net profit, success/failure.
+- **DB transaction wrapping**: 3 multi-statement payment operations now atomic (refund+deficit, webhook replay, checkout revenue).
+- **Comprehensive E2E tests**: Gumroad webhook→payment→GL→sweep→refund lifecycle (12 tests), digital products pipeline research→list (12 tests), Gumroad API contract tests (15 tests).
+
+### Infra (`src/monai/infra/`)
+| Module | Purpose |
+|--------|---------|
+| `auto_setup.py` | Zero-touch infrastructure provisioning (Tor, Monero RPC, LLM) |
+| `daemon_state.py` | Persistent daemon state, cycle metrics, PID file management |
+
+### Deploy (`deploy/`)
+| File | Purpose |
+|------|---------|
+| `monai.service` | systemd unit file for daemon auto-restart |
 
 ### Earlier Changes
 - **Webhook idempotency**: `processed_webhooks` table prevents double-processing

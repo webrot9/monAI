@@ -39,6 +39,13 @@
 - [x] Test full pipeline: research → create → review → list → sell → collect
 - [x] Prove it works with real Gumroad API calls — contract tests for all API endpoints
 
+## Phase 6: Production Daemon
+- [x] Add persistent daemon state (cycle metrics, uptime, errors)
+- [x] Add health endpoint to webhook server
+- [x] Add PID file to prevent duplicate daemons
+- [x] Create systemd unit file
+- [x] Update ARCHITECTURE.md
+
 ---
 
 ## Previous Completed Work (archived)

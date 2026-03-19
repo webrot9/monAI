@@ -9,8 +9,11 @@ User=monai
 Group=monai
 WorkingDirectory=/opt/monai
 ExecStart=/usr/local/bin/monai daemon
-Restart=always
-RestartSec=10
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
+PIDFile=/home/monai/.monai/monai.pid
 
 # Watchdog: systemd kills process if no sd_notify within 900s
 # (monAI cycles are max 600s + 300s buffer)
