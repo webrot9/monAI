@@ -28,6 +28,7 @@ from monai.business.risk import RiskManager
 from monai.config import Config
 from monai.db.database import Database
 from monai.strategies.digital_products import DigitalProductsAgent
+from monai.strategies.telegram_affiliate import TelegramAffiliateAgent
 from monai.utils.llm import LLM
 
 logging.basicConfig(
@@ -74,6 +75,7 @@ def init_strategies(db: Database):
 
     strategies = [
         ("digital_products", "products", "Ebooks, templates, prompt packs, guides on Gumroad", 50.0),
+        ("telegram_affiliate", "affiliate", "Telegram deals channel with affiliate commissions", 25.0),
     ]
     for name, category, description, budget in strategies:
         db.execute_insert(
@@ -99,10 +101,14 @@ def create_orchestrator(config: Config) -> tuple[Orchestrator, Database]:
 
     orchestrator = Orchestrator(config, db, llm)
 
-    # Register the one strategy we're focusing on
+    # Register strategies
     dp_llm = LLM(config, caller="digital_products")
     dp_llm.set_db(db)
     orchestrator.register_strategy(DigitalProductsAgent(config, db, dp_llm))
+
+    ta_llm = LLM(config, caller="telegram_affiliate")
+    ta_llm.set_db(db)
+    orchestrator.register_strategy(TelegramAffiliateAgent(config, db, ta_llm))
 
     # ── Startup strategy validation ──────────────────────────────
     # 1. Demote any 'active' strategies that have no registered agent

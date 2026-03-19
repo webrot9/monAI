@@ -1,6 +1,6 @@
 # monAI - Opzione A: Salvare il Salvabile
 
-## Strategy: Digital Products on Gumroad (ONE strategy, end-to-end)
+## Strategies: Digital Products (Gumroad) + Telegram Affiliate (Amazon deals)
 
 ## Phase 1: Split Orchestrator (2500 lines → 5-6 focused classes)
 - [x] Extract `InfrastructureManager` (provisioning, identity, LLC, phone, API)
@@ -44,6 +44,13 @@
 - [x] Add health endpoint to webhook server
 - [x] Add PID file to prevent duplicate daemons
 - [x] Create systemd unit file
+- [x] Update ARCHITECTURE.md
+
+## Phase 7: Telegram Affiliate Strategy
+- [x] Build `TelegramChannelClient` integration (post messages, photos, pinning, stats)
+- [x] Build `TelegramAffiliateAgent` strategy (deal sourcing, scoring, posting, growth engine)
+- [x] Wire into orchestrator (`main.py` — seed strategy + register agent)
+- [x] Write tests: 15 for TelegramChannelClient, 39 for TelegramAffiliateAgent (54 total)
 - [x] Update ARCHITECTURE.md
 
 ---

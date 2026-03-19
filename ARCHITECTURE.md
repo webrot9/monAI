@@ -34,8 +34,9 @@ The creator provides initial seed capital (via anonymous crowdfunding donation).
 └─────────┬───────────────────────────────────────────────────┘
           │
     ┌─────┴──────────────────────────────────────────┐
-    │           STRATEGY AGENTS (MVP: 1)              │
+    │           STRATEGY AGENTS (MVP: 2)              │
     │  digital_products (Gumroad)                     │
+    │  telegram_affiliate (Telegram channel deals)    │
     │  [12 others: paused/removed for MVP]            │
     └─────────────────────────────────────────────────┘
           │
@@ -282,6 +283,7 @@ All strategies use real browser automation and APIs — zero simulation:
 | `domain_flipping` | Browses real expired domain sites, checks real metrics, lists on Sedo/Dan.com |
 | `print_on_demand` | Researches real POD trends, generates designs, lists on Redbubble/TeeSpring |
 | `telegram_bots` | Researches real bot market, builds bots, deploys via BotFather |
+| `telegram_affiliate` | Runs a Telegram deals channel — sources Amazon/Pepper deals, posts with affiliate links, grows audience via social cross-posting and landing pages |
 
 ### Web (`src/monai/web/`)
 | Module | Purpose |
@@ -300,6 +302,7 @@ All strategies use real browser automation and APIs — zero simulation:
 |--------|---------|
 | `base.py` | PlatformConnection + PlatformIntegration ABC (per-agent connections, rate limiting, retry) |
 | `gumroad.py` | Gumroad API (products CRUD, sales, subscribers, revenue) |
+| `telegram_channel.py` | Telegram Bot API channel client (posting, photos, pinning, stats) |
 
 ### Utils (`src/monai/utils/`)
 | Module | Purpose |
@@ -336,7 +339,7 @@ All strategies use real browser automation and APIs — zero simulation:
 
 ## Test Suite
 
-- **1770 tests** across 80+ test files
+- **1827 tests** across 80+ test files
 - All modules have corresponding test files
 - Tests verify actual behavior with real assertions
 - Run: `python -m pytest --tb=short`
